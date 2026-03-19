@@ -1,0 +1,21 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Node.js
+node_modules/
+
+# VitePress
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

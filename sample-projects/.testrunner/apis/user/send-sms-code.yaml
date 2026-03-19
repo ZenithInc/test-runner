@@ -1,0 +1,7 @@
+name: Send SMS verification code
+method: POST
+path: /send-sms-code
+headers:
+  content-type: application/json
+  accept: application/json
+query: {}

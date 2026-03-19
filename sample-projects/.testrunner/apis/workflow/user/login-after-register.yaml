@@ -1,0 +1,7 @@
+name: Workflow login after register
+method: POST
+path: /login
+headers:
+  content-type: application/json
+  accept: application/json
+query: {}

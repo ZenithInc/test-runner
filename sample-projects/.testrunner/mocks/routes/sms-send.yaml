@@ -1,0 +1,23 @@
+method: POST
+path: /sms/send
+when:
+  - contains: ["request.json.message", "verification code"]
+extract:
+  phone: request.json.phone
+steps:
+  - if: "${request.json.phone == '13800000000'}"
+    then:
+      - set:
+          request_id: mock-sms-001
+    else:
+      - set:
+          request_id: mock-sms-fallback
+respond:
+  status: 200
+  headers:
+    content-type: application/json
+    x-mock-phone: "{{ vars.phone }}"
+  body:
+    accepted: true
+    provider: mock-sms
+    request_id: "{{ vars.request_id }}"

@@ -1,0 +1,6 @@
+name: Health check
+method: GET
+path: /health
+headers:
+  accept: application/json
+query: {}

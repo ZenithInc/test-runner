@@ -1,0 +1,36 @@
+name: register happy path
+api: user/register
+tags:
+  - smoke
+  - db
+setup:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from users where email = 'smoke.register@example.com'"
+steps:
+  - request:
+      api: user/register
+      base_url: "${env.variables.service_base_url}"
+      body:
+        name: Smoke Runner
+        email: smoke.register@example.com
+        password: P@ssw0rd123
+    extract:
+      created_id: response.json.id
+    assert:
+      - eq: ["response.status", 201]
+      - not_empty: ["created_id"]
+      - eq: ["response.json.name", "Smoke Runner"]
+      - eq: ["response.json.email", "smoke.register@example.com"]
+  - query_db:
+      datasource: mysql.main
+      sql: "select name, email, password_hash from users where email = 'smoke.register@example.com'"
+    assert:
+      - eq: ["result.row_count", 1]
+      - eq: ["result.rows[0].name", "Smoke Runner"]
+      - eq: ["result.rows[0].email", "smoke.register@example.com"]
+      - not_empty: ["result.rows[0].password_hash"]
+teardown:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from users where email = 'smoke.register@example.com'"

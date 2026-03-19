@@ -1,0 +1,7 @@
+name: Register user
+method: POST
+path: /register
+headers:
+  content-type: application/json
+  accept: application/json
+query: {}

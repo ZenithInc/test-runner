@@ -1,0 +1,48 @@
+name: login invalid sms code
+api: user/login
+tags:
+  - auth
+  - negative
+  - redis
+setup:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from users where email = 'smoke.login@example.com'"
+  - sql:
+      datasource: mysql.main
+      sql: "insert into users (name, email, password_hash) values ('Login Runner', 'smoke.login@example.com', '$argon2id$v=19$m=19456,t=2,p=1$c2FtcGxlLWxvZ2luLXNhbHQ$KfzEIjldXSW/qzqrm9OxGSXE7BwEewabPZJ+/jSgdZ0')"
+  - redis:
+      datasource: redis.main
+      command: SETEX
+      args:
+        - sms:code:13800000001
+        - 300
+        - "654321"
+steps:
+  - request:
+      api: user/login
+      base_url: "${env.variables.service_base_url}"
+      body:
+        email: smoke.login@example.com
+        password: P@ssw0rd123
+        phone: "13800000001"
+        sms_code: "000000"
+    assert:
+      - eq: ["response.status", 401]
+      - eq: ["response.json.error", "invalid or expired sms code"]
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - sms:code:13800000001
+    assert:
+      - eq: ["result.value", "654321"]
+teardown:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - sms:code:13800000001
+  - sql:
+      datasource: mysql.main
+      sql: "delete from users where email = 'smoke.login@example.com'"

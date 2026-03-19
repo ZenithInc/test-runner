@@ -1,0 +1,288 @@
+{
+  "project": "health-service",
+  "environment": "docker",
+  "workflow_id": "register-login-create-order",
+  "workflow_name": "register login create order",
+  "started_at": "2026-03-11T10:37:13.753791+00:00",
+  "finished_at": "2026-03-11T10:37:13.851527+00:00",
+  "status": "passed",
+  "summary": {
+    "executed_steps": 4,
+    "passed_steps": 4,
+    "failed_steps": 0,
+    "duration_ms": 97
+  },
+  "steps": [
+    {
+      "id": "register",
+      "case_id": "user/register/happy-path",
+      "status": "passed",
+      "passed": true,
+      "duration_ms": 55,
+      "exports": {},
+      "case_steps": [
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 20,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 0
+            }
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 33,
+          "details": {
+            "api": "user/register",
+            "status": 201
+          },
+          "error": null
+        },
+        {
+          "kind": "query_db",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "datasource": "mysql.main",
+            "sql": "select name, email, password_hash from users where email = 'smoke.register@example.com'"
+          },
+          "error": null
+        }
+      ],
+      "deferred_teardown_steps": [
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 2,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 1
+            }
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "send-sms",
+      "case_id": "user/send-sms-code/happy-path",
+      "status": "passed",
+      "passed": true,
+      "duration_ms": 7,
+      "exports": {
+        "sms_code": "433813"
+      },
+      "case_steps": [
+        {
+          "kind": "redis",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "command": "DEL",
+            "datasource": "redis.main",
+            "result": 0
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 4,
+          "details": {
+            "api": "user/send-sms-code",
+            "status": 200
+          },
+          "error": null
+        },
+        {
+          "kind": "query_redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "args": [
+              "sms:code:13800000000"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
+          },
+          "error": null
+        }
+      ],
+      "deferred_teardown_steps": [
+        {
+          "kind": "redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "command": "DEL",
+            "datasource": "redis.main",
+            "result": 0
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "login",
+      "case_id": "workflow/user/login-after-register",
+      "status": "passed",
+      "passed": true,
+      "duration_ms": 20,
+      "exports": {
+        "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI1IiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3MzIyOTAzMywiaWF0IjoxNzczMjI1NDMzfQ.uQEVcn7lm2M6vjyGJTUN1q69k0lBbv_QsctRPj7MfZ8",
+        "buyer_email": "smoke.register@example.com"
+      },
+      "case_steps": [
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_user == true}",
+            "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_sms == true}",
+            "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 17,
+          "details": {
+            "api": "workflow/user/login-after-register",
+            "status": 200
+          },
+          "error": null
+        },
+        {
+          "kind": "query_redis",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "args": [
+              "auth:token:eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI1IiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3MzIyOTAzMywiaWF0IjoxNzczMjI1NDMzfQ.uQEVcn7lm2M6vjyGJTUN1q69k0lBbv_QsctRPj7MfZ8"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
+          },
+          "error": null
+        },
+        {
+          "kind": "query_redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "args": [
+              "sms:code:13800000000"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
+          },
+          "error": null
+        }
+      ],
+      "deferred_teardown_steps": [
+        {
+          "kind": "redis",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "command": "DEL",
+            "datasource": "redis.main",
+            "result": 1
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_sms == true}",
+            "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_user == true}",
+            "value": false
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "create-order",
+      "case_id": "workflow/order/create-after-login",
+      "status": "passed",
+      "passed": true,
+      "duration_ms": 2,
+      "exports": {},
+      "case_steps": [
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_token == true}",
+            "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "query_redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "args": [
+              "auth:token:eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI1IiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3MzIyOTAzMywiaWF0IjoxNzczMjI1NDMzfQ.uQEVcn7lm2M6vjyGJTUN1q69k0lBbv_QsctRPj7MfZ8"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "api": "workflow/order/create-after-login",
+            "status": 201
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_token == true}",
+            "value": false
+          },
+          "error": null
+        }
+      ],
+      "deferred_teardown_steps": []
+    }
+  ]
+}

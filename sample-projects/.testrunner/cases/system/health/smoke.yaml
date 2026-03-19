@@ -1,0 +1,13 @@
+name: health smoke
+api: system/health
+tags:
+  - smoke
+steps:
+  - request:
+      api: system/health
+      base_url: "${env.variables.service_base_url}"
+    assert:
+      - eq: [response.status, 200]
+      - eq: [response.json.status, ok]
+      - eq: [response.json.service, health-service]
+      - contains: [response.headers.content-type, application/json]

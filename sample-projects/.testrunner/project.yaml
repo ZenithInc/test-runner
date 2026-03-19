@@ -1,0 +1,11 @@
+version: 1
+project:
+  name: health-service
+defaults:
+  env: docker
+  execution_mode: serial
+  timeout_ms: 30000
+mock:
+  enabled: true
+  host: 0.0.0.0
+  port: 18081

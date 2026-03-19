@@ -1,0 +1,79 @@
+name: workflow login after register
+api: workflow/user/login-after-register
+tags:
+  - workflow
+  - auth
+  - redis
+vars:
+  email: smoke.register@example.com
+  password: P@ssw0rd123
+  phone: "13800000000"
+  sms_code: "654321"
+  seed_user: true
+  seed_sms: true
+setup:
+  - if: "${seed_user == true}"
+    then:
+      - sql:
+          datasource: mysql.main
+          sql: "delete from users where email = '{{ email }}'"
+      - sql:
+          datasource: mysql.main
+          sql: "insert into users (name, email, password_hash) values ('Workflow Login Runner', '{{ email }}', '$argon2id$v=19$m=19456,t=2,p=1$c2FtcGxlLWxvZ2luLXNhbHQ$KfzEIjldXSW/qzqrm9OxGSXE7BwEewabPZJ+/jSgdZ0')"
+  - if: "${seed_sms == true}"
+    then:
+      - redis:
+          datasource: redis.main
+          command: SETEX
+          args:
+            - "sms:code:{{ phone }}"
+            - 300
+            - "{{ sms_code }}"
+steps:
+  - request:
+      api: workflow/user/login-after-register
+      base_url: "${env.variables.service_base_url}"
+      body:
+        email: "{{ email }}"
+        password: "{{ password }}"
+        phone: "{{ phone }}"
+        sms_code: "{{ sms_code }}"
+    extract:
+      access_token: response.json.access_token
+    assert:
+      - eq: ["response.status", 200]
+      - not_empty: ["access_token"]
+      - eq: ["response.json.token_type", "Bearer"]
+      - eq: ["response.json.expires_in", 3600]
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - "auth:token:{{ access_token }}"
+    assert:
+      - eq: ["result.value", "email"]
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - "sms:code:{{ phone }}"
+    assert:
+      - eq: ["result.value", null]
+teardown:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - "auth:token:{{ access_token }}"
+  - if: "${seed_sms == true}"
+    then:
+      - redis:
+          datasource: redis.main
+          command: DEL
+          args:
+            - "sms:code:{{ phone }}"
+  - if: "${seed_user == true}"
+    then:
+      - sql:
+          datasource: mysql.main
+          sql: "delete from users where email = '{{ email }}'"

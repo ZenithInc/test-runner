@@ -1,0 +1,15 @@
+:root {
+  --vp-c-brand-1: #2563eb;
+  --vp-c-brand-2: #1d4ed8;
+  --vp-c-brand-3: #1e40af;
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(120deg, #2563eb 30%, #16a34a);
+}
+
+.VPFeature {
+  border: 1px solid var(--vp-c-divider);
+}
+
+.vp-doc code {
+  white-space: pre-wrap;
+}

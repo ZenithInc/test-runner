@@ -1,0 +1,15 @@
+[package]
+name = "health-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+argon2 = "0.5"
+axum = "0.7"
+jsonwebtoken = "9.3"
+redis = { version = "0.25.4", features = ["aio", "tokio-comp"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "mysql"] }
+tokio = { version = "1.43", features = ["macros", "net", "rt-multi-thread", "time"] }

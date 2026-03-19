@@ -1,0 +1,109 @@
+name: create order expression happy path
+api: order/create
+tags:
+  - smoke
+  - dsl
+  - expressions
+steps:
+  - set:
+      buyer_email: "  BUYER@example.com "
+      coupon_code: SAVE10
+      first_quantity: 2
+      second_quantity: 1
+      optional_note: null
+  - request:
+      api: order/create
+      base_url: "${env.variables.service_base_url}"
+      body:
+        customer:
+          name: " DSL Runner "
+          email: buyer_email
+          tier: vip
+        items:
+          - sku: SKU-BOOK
+            quantity: first_quantity
+            unit_price: 4500
+          - sku: SKU-PEN
+            quantity: second_quantity
+            unit_price: 1200
+        coupon_code: coupon_code
+        note: optional_note
+    extract:
+      order_id: response.json.order_id
+      normalized_email: response.json.customer.email
+      order_items: response.json.items
+      item_count: response.json.pricing.item_count
+      subtotal: response.json.pricing.subtotal
+      discount: response.json.pricing.discount
+      payable_total: response.json.pricing.payable_total
+      first_item_sku: response.json.items[0].sku
+      second_line_total: response.json.items[1].line_total
+      has_discount: response.json.flags.has_discount
+      note_value: response.json.metadata.note
+    assert:
+      - eq: ["response.status", 201]
+      - not_empty: ["order_id"]
+      - eq: ["response.json.status", "created"]
+      - eq: ["response.json.customer.name", "DSL Runner"]
+      - eq: ["normalized_email", "buyer@example.com"]
+      - contains: ["response.json.customer", "tier"]
+      - exists: ["response.json.customer.tier"]
+      - eq: ["len(response.json.items)", 2]
+      - eq: ["response.json.pricing.sku_count", 2]
+      - eq: ["item_count", 3]
+      - eq: ["subtotal", 10200]
+      - eq: ["discount", 1020]
+      - eq: ["response.json.pricing.shipping_fee", 0]
+      - eq: ["payable_total", 9180]
+      - gt: ["subtotal", "discount"]
+      - ge: ["payable_total", 0]
+      - eq: ["has_discount", true]
+      - eq: ["response.json.flags.has_free_shipping", true]
+      - eq: ["note_value", null]
+      - contains: ["response.json.items[0].sku", "SKU-"]
+  - set:
+      discount_ratio_ok: "${subtotal > discount}"
+      premium_order: "${payable_total >= 9000}"
+      rendered_summary: "order {{ order_id }} for {{ normalized_email }}"
+  - if: "${premium_order == true}"
+    then:
+      - request:
+          api: system/health
+          base_url: "${env.variables.service_base_url}"
+          headers:
+            x-order-id: "{{ order_id }}"
+        extract:
+          branch_status: response.status
+        assert:
+          - eq: ["response.status", 200]
+          - eq: ["discount_ratio_ok", true]
+          - contains: ["rendered_summary", "buyer@example.com"]
+    else:
+      - request:
+          api: system/health
+          base_url: "${env.variables.service_base_url}"
+        assert:
+          - eq: ["response.status", 500]
+  - foreach: order_items
+    as: item
+    steps:
+      - request:
+          api: system/health
+          base_url: "${env.variables.service_base_url}"
+          headers:
+            x-item-sku: "{{ item.sku }}"
+        assert:
+          - eq: ["response.status", 200]
+          - gt: ["item.quantity", 0]
+          - gt: ["item.line_total", 0]
+          - ge: ["item.line_total", "item.unit_price"]
+          - contains: ["item.sku", "SKU-"]
+          - le: ["len(item.sku)", 8]
+  - request:
+      api: system/health
+      base_url: "${env.variables.service_base_url}"
+    assert:
+      - eq: ["response.status", 200]
+      - eq: ["branch_status", 200]
+      - eq: ["first_item_sku", "SKU-BOOK"]
+      - eq: ["second_line_total", 1200]

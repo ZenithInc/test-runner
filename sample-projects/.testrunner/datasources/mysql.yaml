@@ -1,0 +1,4 @@
+datasources:
+  mysql.main:
+    kind: mysql
+    url: mysql://app:app@127.0.0.1:13306/app

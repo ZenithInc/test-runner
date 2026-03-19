@@ -1,0 +1,7 @@
+name: docker
+base_url: http://127.0.0.1:18080
+headers:
+  x-test-env: docker
+variables:
+  service_base_url: http://127.0.0.1:18080
+  sms_provider_base_url: http://host.docker.internal:18081

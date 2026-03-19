@@ -1,0 +1,41 @@
+name: register login create order
+description: >
+  Registers a user, reuses the created user and SMS side effects to log in,
+  then creates an order while asserting the login token is still available.
+steps:
+  - run_case:
+      id: register
+      case: user/register/happy-path
+      cleanup: defer
+  - run_case:
+      id: send-sms
+      case: user/send-sms-code/happy-path
+      cleanup: defer
+      exports:
+        sms_code: vars.sms_code
+  - run_case:
+      id: login
+      case: workflow/user/login-after-register
+      cleanup: defer
+      inputs:
+        seed_user: false
+        seed_sms: false
+        sms_code: "${workflow.steps.send-sms.exports.sms_code}"
+      exports:
+        access_token: vars.access_token
+        buyer_email: vars.email
+  - if: "${workflow.steps.login.passed}"
+    then:
+      - run_case:
+          id: create-order
+          case: workflow/order/create-after-login
+          cleanup: immediate
+          inputs:
+            seed_token: false
+            buyer_email: "${workflow.steps.login.exports.buyer_email}"
+            access_token: "${workflow.steps.login.exports.access_token}"
+    else:
+      - run_case:
+          id: health-fallback
+          case: system/health/smoke
+          cleanup: immediate

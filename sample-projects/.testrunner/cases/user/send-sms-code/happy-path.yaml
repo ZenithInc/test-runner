@@ -1,0 +1,40 @@
+name: send-sms-code happy path
+api: user/send-sms-code
+tags:
+  - smoke
+  - mock
+  - redis
+setup:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - sms:code:13800000000
+steps:
+  - request:
+      api: user/send-sms-code
+      base_url: "${env.variables.service_base_url}"
+      body:
+        phone: "13800000000"
+        provider_base_url: "${env.variables.sms_provider_base_url}"
+    extract:
+      sms_code: response.json.code
+    assert:
+      - eq: ["response.status", 200]
+      - eq: ["response.json.phone", "13800000000"]
+      - not_empty: ["sms_code"]
+      - eq: ["response.json.provider", "mock-sms"]
+      - eq: ["response.json.provider_request_id", "mock-sms-001"]
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - sms:code:13800000000
+    assert:
+      - eq: ["result.value", "sms_code"]
+teardown:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - sms:code:13800000000

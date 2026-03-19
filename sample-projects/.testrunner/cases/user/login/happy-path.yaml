@@ -1,0 +1,82 @@
+name: login happy path
+api: user/login
+tags:
+  - smoke
+  - auth
+  - redis
+setup:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from users where email = 'smoke.login@example.com'"
+  - sql:
+      datasource: mysql.main
+      sql: "insert into users (name, email, password_hash) values ('Login Runner', 'smoke.login@example.com', '$argon2id$v=19$m=19456,t=2,p=1$c2FtcGxlLWxvZ2luLXNhbHQ$KfzEIjldXSW/qzqrm9OxGSXE7BwEewabPZJ+/jSgdZ0')"
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - sms:code:13800000000
+steps:
+  - request:
+      api: user/send-sms-code
+      base_url: "${env.variables.service_base_url}"
+      body:
+        phone: "13800000000"
+        provider_base_url: "${env.variables.sms_provider_base_url}"
+    extract:
+      sms_code: response.json.code
+    assert:
+      - eq: ["response.status", 200]
+      - not_empty: ["sms_code"]
+      - eq: ["response.json.provider", "mock-sms"]
+      - eq: ["response.json.provider_request_id", "mock-sms-001"]
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - sms:code:13800000000
+    assert:
+      - eq: ["result.value", "sms_code"]
+  - request:
+      api: user/login
+      base_url: "${env.variables.service_base_url}"
+      body:
+        email: smoke.login@example.com
+        password: P@ssw0rd123
+        phone: "13800000000"
+        sms_code: "{{ sms_code }}"
+    extract:
+      access_token: response.json.access_token
+    assert:
+      - eq: ["response.status", 200]
+      - not_empty: ["access_token"]
+      - eq: ["response.json.token_type", "Bearer"]
+      - eq: ["response.json.expires_in", 3600]
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - "auth:token:{{ access_token }}"
+    assert:
+      - eq: ["result.value", "smoke.login@example.com"]
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - sms:code:13800000000
+    assert:
+      - eq: ["result.value", null]
+teardown:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - "auth:token:{{ access_token }}"
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - sms:code:13800000000
+  - sql:
+      datasource: mysql.main
+      sql: "delete from users where email = 'smoke.login@example.com'"

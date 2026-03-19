@@ -1,0 +1,7 @@
+name: Create order
+method: POST
+path: /orders
+headers:
+  content-type: application/json
+  accept: application/json
+query: {}

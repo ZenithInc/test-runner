@@ -1,0 +1,7 @@
+name: Workflow create order after login
+method: POST
+path: /orders
+headers:
+  content-type: application/json
+  accept: application/json
+query: {}

@@ -1,0 +1,481 @@
+{
+  "project": "health-service",
+  "environment": "docker",
+  "target": "all cases",
+  "started_at": "2026-03-11T06:31:00.131591+00:00",
+  "finished_at": "2026-03-11T06:31:00.241376+00:00",
+  "summary": {
+    "total": 6,
+    "passed": 6,
+    "failed": 0,
+    "duration_ms": 109
+  },
+  "cases": [
+    {
+      "id": "order/create/expression-happy-path",
+      "name": "create order expression happy path",
+      "api": "order/create",
+      "status": "passed",
+      "duration_ms": 6,
+      "error": null,
+      "steps": [
+        {
+          "kind": "set",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "keys": [
+              "buyer_email",
+              "coupon_code",
+              "first_quantity",
+              "second_quantity",
+              "optional_note"
+            ]
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 2,
+          "details": {
+            "api": "order/create",
+            "status": 201
+          },
+          "error": null
+        },
+        {
+          "kind": "set",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "keys": [
+              "discount_ratio_ok",
+              "premium_order",
+              "rendered_summary"
+            ]
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${premium_order == true}",
+            "value": true
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "api": "system/health",
+            "status": 200
+          },
+          "error": null
+        },
+        {
+          "kind": "foreach",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "expression": "order_items",
+            "items": 2
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "api": "system/health",
+            "status": 200
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "api": "system/health",
+            "status": 200
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "api": "system/health",
+            "status": 200
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "system/health/smoke",
+      "name": "health smoke",
+      "api": "system/health",
+      "status": "passed",
+      "duration_ms": 1,
+      "error": null,
+      "steps": [
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "api": "system/health",
+            "status": 200
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "user/login/happy-path",
+      "name": "login happy path",
+      "api": "user/login",
+      "status": "passed",
+      "duration_ms": 51,
+      "error": null,
+      "steps": [
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 12,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 0
+            }
+          },
+          "error": null
+        },
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 6,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 1
+            }
+          },
+          "error": null
+        },
+        {
+          "kind": "redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "command": "DEL",
+            "datasource": "redis.main",
+            "result": 0
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "api": "user/send-sms-code",
+            "status": 200
+          },
+          "error": null
+        },
+        {
+          "kind": "query_redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "args": [
+              "sms:code:13800000000"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 23,
+          "details": {
+            "api": "user/login",
+            "status": 200
+          },
+          "error": null
+        },
+        {
+          "kind": "query_redis",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "args": [
+              "auth:token:eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJzbW9rZS5sb2dpbkBleGFtcGxlLmNvbSIsImV4cCI6MTc3MzIxNDI2MCwiaWF0IjoxNzczMjEwNjYwfQ.tOV4XlvK0E8lSNQtrvDdRFv5esk4aK8oJJUbHvmWvzM"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
+          },
+          "error": null
+        },
+        {
+          "kind": "query_redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "args": [
+              "sms:code:13800000000"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
+          },
+          "error": null
+        },
+        {
+          "kind": "redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "command": "DEL",
+            "datasource": "redis.main",
+            "result": 1
+          },
+          "error": null
+        },
+        {
+          "kind": "redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "command": "DEL",
+            "datasource": "redis.main",
+            "result": 0
+          },
+          "error": null
+        },
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 1
+            }
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "user/login/invalid-sms-code",
+      "name": "login invalid sms code",
+      "api": "user/login",
+      "status": "passed",
+      "duration_ms": 24,
+      "error": null,
+      "steps": [
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 0
+            }
+          },
+          "error": null
+        },
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 1
+            }
+          },
+          "error": null
+        },
+        {
+          "kind": "redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "command": "SETEX",
+            "datasource": "redis.main",
+            "result": "OK"
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 18,
+          "details": {
+            "api": "user/login",
+            "status": 401
+          },
+          "error": null
+        },
+        {
+          "kind": "query_redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "args": [
+              "sms:code:13800000001"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
+          },
+          "error": null
+        },
+        {
+          "kind": "redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "command": "DEL",
+            "datasource": "redis.main",
+            "result": 1
+          },
+          "error": null
+        },
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 1
+            }
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "user/register/happy-path",
+      "name": "register happy path",
+      "api": "user/register",
+      "status": "passed",
+      "duration_ms": 21,
+      "error": null,
+      "steps": [
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 0
+            }
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 18,
+          "details": {
+            "api": "user/register",
+            "status": 201
+          },
+          "error": null
+        },
+        {
+          "kind": "query_db",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "datasource": "mysql.main",
+            "sql": "select name, email, password_hash from users where email = 'smoke.register@example.com'"
+          },
+          "error": null
+        },
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 1
+            }
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "user/send-sms-code/happy-path",
+      "name": "send-sms-code happy path",
+      "api": "user/send-sms-code",
+      "status": "passed",
+      "duration_ms": 4,
+      "error": null,
+      "steps": [
+        {
+          "kind": "redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "command": "DEL",
+            "datasource": "redis.main",
+            "result": 0
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "api": "user/send-sms-code",
+            "status": 200
+          },
+          "error": null
+        },
+        {
+          "kind": "query_redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "args": [
+              "sms:code:13800000000"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
+          },
+          "error": null
+        },
+        {
+          "kind": "redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "command": "DEL",
+            "datasource": "redis.main",
+            "result": 1
+          },
+          "error": null
+        }
+      ]
+    }
+  ]
+}

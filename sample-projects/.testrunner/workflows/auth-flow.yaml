@@ -1,0 +1,25 @@
+name: auth flow
+description: >
+  Sends an SMS code (with deferred cleanup), then completes login using the
+  code obtained from the first step. If SMS sending fails the workflow falls
+  back to a simple health check so the else-branch is also exercised.
+vars:
+  phone: "13800000000"
+steps:
+  - run_case:
+      id: send-sms
+      case: user/send-sms-code/happy-path
+      cleanup: defer
+      exports:
+        sms_code: vars.sms_code
+  - if: "${workflow.steps.send-sms.passed}"
+    then:
+      - run_case:
+          id: login
+          case: user/login/happy-path
+          cleanup: immediate
+    else:
+      - run_case:
+          id: health-fallback
+          case: system/health/smoke
+          cleanup: immediate
