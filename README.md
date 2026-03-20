@@ -94,6 +94,29 @@ npm run docs:preview
 ```
 
 
+### 1.6 GitHub 自动化
+
+仓库现在包含 3 条 GitHub Actions 工作流：
+
+- `CI`：在推送到 `main` 或发起 Pull Request 时执行 `cargo build -p test-runner --locked`、`cargo test --workspace --locked` 和 `npm run docs:build`。
+- `Release`：在推送形如 `v0.1.0` 的 tag 时，构建 Linux / macOS 二进制包并自动发布到 GitHub Releases。
+- `Docs`：在推送到 `main` 时自动构建 VitePress 站点并发布到 GitHub Pages。
+
+首次启用 GitHub Pages 时，请到仓库 `Settings -> Pages` 确认发布源为 **GitHub Actions**。
+
+默认情况下不需要自定义域名，文档会发布到以下地址之一：
+
+- 项目页仓库：`https://<owner>.github.io/<repo>/`
+- 用户或组织主页仓库（仓库名为 `<owner>.github.io`）：`https://<owner>.github.io/`
+
+发布一个新版本时，创建并推送语义化版本 tag 即可：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+
 ## 2. 命令行说明
 
 CLI 当前的顶层命令如下：

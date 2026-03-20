@@ -1,6 +1,18 @@
 import { defineConfig } from 'vitepress'
 
+const repositoryName = process.env.GITHUB_REPOSITORY?.split('/')[1]
+const shouldUseProjectPagesBase =
+  repositoryName !== undefined && !repositoryName.toLowerCase().endsWith('.github.io')
+const base =
+  process.env.DOCS_BASE_PATH ??
+  (process.env.GITHUB_ACTIONS === 'true' && repositoryName
+    ? shouldUseProjectPagesBase
+      ? `/${repositoryName}/`
+      : '/'
+    : '/')
+
 export default defineConfig({
+  base,
   title: 'test-runner',
   description: '面向 HTTP 服务的 Rust 集成测试 CLI 文档',
   lang: 'zh-CN',
