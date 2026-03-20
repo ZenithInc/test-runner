@@ -99,7 +99,7 @@ npm run docs:preview
 仓库现在包含 3 条 GitHub Actions 工作流：
 
 - `CI`：在推送到 `main` 或发起 Pull Request 时执行 `cargo build -p test-runner --locked`、`cargo test --workspace --locked` 和 `npm run docs:build`。
-- `Release`：在推送形如 `v0.1.0` 的 tag 时，构建 Linux / macOS 二进制包并自动发布到 GitHub Releases。
+- `Release`：在推送形如 `v0.1.0` 的 tag 时，构建 Linux / macOS 二进制包并自动发布到 GitHub Releases；也支持手动指定一个已存在的 tag 重新补发二进制包。
 - `Docs`：在推送到 `main` 时自动构建 VitePress 站点并发布到 GitHub Pages。
 
 首次启用 GitHub Pages 时，请到仓库 `Settings -> Pages` 确认发布源为 **GitHub Actions**。
@@ -115,6 +115,8 @@ npm run docs:preview
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+如果某个 tag 在 `Release` workflow 加入仓库之前就已经存在，那么它不会自动补跑。此时可以到 GitHub 仓库的 `Actions -> Release -> Run workflow`，手动填入已有 tag（例如 `v0.1.0`）来补发对应的二进制资源。
 
 
 ## 2. 命令行说明
