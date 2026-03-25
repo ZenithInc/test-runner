@@ -183,15 +183,20 @@ test-runner test workflow payment-callback-flow --root sample-projects --env doc
 
 ## 启动仓库内样例服务
 
-`sample-projects/.testrunner/env/docker.yaml` 现在已经声明了 Docker Compose 生命周期，因此直接运行 `test-runner` 即可自动完成环境启动、readiness 检查、日志采集和回收：
+`sample-projects/.testrunner/env/docker.yaml` 和 `containers.yaml` 现在已经声明了容器生命周期，因此直接运行 `test-runner` 即可自动完成环境启动、readiness 检查、日志采集和回收：
 
 ```bash
+# Docker Compose 模式
 test-runner test api system/health --root sample-projects --env docker
 test-runner test api order/create --root sample-projects --env docker
 test-runner test api user/register --root sample-projects --env docker
 test-runner test api user/login --root sample-projects --env docker
 test-runner test api user/send-sms-code --root sample-projects --env docker
 test-runner test workflow register-login-create-order --root sample-projects --env docker
+
+# Testcontainers 模式（通过 Docker API 直接管理容器，自动构建应用镜像）
+test-runner test api system/health --root sample-projects --env containers
+test-runner test workflow register-login-create-order --root sample-projects --env containers
 ```
 
 如果你只是想看看执行计划，不想真的启动环境，也可以继续使用：

@@ -5,11 +5,13 @@
 当前版本已经实现了下面这些基础能力：
 
 - `init`：在目标项目根目录生成 `.testrunner/` 测试目录和样例文件
-- `test`：按 `api` / `dir` / `all` 选择测试范围
-- YAML DSL：描述变量、前置步骤、请求步骤、分支、循环、数据库查询、Redis 查询和断言
-- 断言能力：HTTP、数据库查询结果、Redis 查询结果
-- Mock：内嵌 HTTP Mock 服务，支持静态路由和轻量动态 DSL
-- 报告：终端摘要输出，外加 `.testrunner/reports/last-run.json`
+- `test`：按 `api` / `dir` / `all` / `workflow` 选择测试范围
+- YAML DSL：描述变量、前置步骤、请求、callback、sleep、分支、循环、数据库查询、Redis 查询和断言
+- Workflow：在 case 之上编排跨用例的顺序、分支、输入输出和 deferred cleanup
+- 环境 DSL：在 `env/*.yaml` 中声明 Docker Compose runtime、readiness 和日志采集
+- Callback：既可以在 case 里直接安排，也可以在 mock route 里模拟“第三方稍后主动回调”
+- Mock：内嵌 HTTP Mock 服务，支持静态路由、动态 DSL 和 callback 调度
+- 报告：终端摘要 / JSON 输出，外加 `.testrunner/reports/*.json`、`callbacks` 和 `environment_artifacts`
 
 > 当前实现以 **串行执行** 为主，优先保证数据一致性和可重复性。
 
@@ -18,6 +20,13 @@
 - `cli/`：`test-runner` CLI 本体
 - `sample-projects/`：用于验证 CLI 的 Rust 样例服务
 - `docs/`：基于 VitePress 的用户文档站点
+
+如果你想直接看更完整的用户文档，可以从这些入口开始：
+
+- [快速开始](docs/guide/getting-started.md)
+- [环境 DSL](docs/guide/environment-dsl.md)
+- [Callback](docs/guide/callbacks.md)
+- [工作流](docs/workflow/index.md)
 
 
 ## 1. 快速开始
@@ -79,6 +88,15 @@ cargo run -p test-runner -- test dir user --root /path/to/your-project
 cargo run -p test-runner -- test all --root /path/to/your-project
 ```
 
+运行 workflow：
+
+```bash
+cargo run -p test-runner -- test workflow register-login-create-order --root sample-projects --env docker
+cargo run -p test-runner -- test workflow payment-callback-flow --root sample-projects --env docker --no-mock
+```
+
+如果环境文件里声明了 `runtime` / `readiness` / `logs`，`test-runner` 会在执行前后自动托管环境，而不需要你手工先跑 `docker compose up/down`。
+
 ### 1.5 预览文档站点
 
 ```bash
@@ -92,6 +110,13 @@ npm run docs:dev
 npm run docs:build
 npm run docs:preview
 ```
+
+推荐的文档阅读入口：
+
+- `docs/guide/environment-dsl.md`：环境托管、readiness、环境日志
+- `docs/guide/callbacks.md`：callback step、mock-triggered callback、callback workflow
+- `docs/guide/dsl.md`：case DSL 语法
+- `docs/workflow/index.md`：工作流 DSL 和 cleanup 策略
 
 
 ### 1.6 GitHub 自动化
@@ -223,9 +248,10 @@ test-runner test workflow auth-flow --dry-run --root /path/to/your-project
 
 说明：
 
-- `summary`：终端输出摘要。
-- `json`：终端输出 JSON，同时仍然会把报告写入 `.testrunner/reports/last-run.json`。
+- `summary`：终端输出阶段、进度和汇总；在 TTY 下会自动做 ANSI 强调（可通过 `NO_COLOR` 关闭）。
+- `json`：终端输出 JSON，同时仍然会把报告写入 `.testrunner/reports/last-run.json` 或 `.testrunner/reports/last-workflow-run.json`。
 - `junit`：**当前已预留参数，但尚未实现**，执行时会报错。
+- `--dry-run` 只展示执行计划，不会真正发请求、不会启动环境 runtime，也不会写报告文件。
 
 
 ## 3. 初始化后生成的目录
@@ -275,14 +301,14 @@ test-runner test workflow auth-flow --dry-run --root /path/to/your-project
 每个目录的职责：
 
 - `project.yaml`：项目级默认配置
-- `env/`：不同环境的 base URL、header、变量
+- `env/`：不同环境的 base URL、header、变量，以及可选的 runtime / readiness / logs
 - `datasources/`：MySQL / PostgreSQL / Redis 连接配置
 - `apis/`：接口定义
 - `cases/`：测试用例 DSL
 - `data/`：JSON / YAML 数据文件、SQL 文件
-- `mocks/`：Mock 路由和响应体
+- `mocks/`：Mock 路由、动态响应 DSL 和可选 callback 调度
 - `workflows/`：工作流定义（V1，需通过 `test workflow` 单独触发）
-- `reports/`：测试报告输出目录
+- `reports/`：测试报告输出目录；如果启用了环境日志采集，还会包含 `reports/env/`
 
 
 ## 4. 配置文件说明
@@ -333,6 +359,66 @@ variables:
 - `base_url`：默认请求基地址。
 - `headers`：所有请求共享的 header。
 - `variables`：注入 DSL 上下文的环境变量，路径为 `env.variables.*`。
+
+如果你希望 `test-runner` 自动托管 Docker Compose 环境，可以继续声明：
+
+```yaml
+name: docker
+base_url: http://127.0.0.1:18080
+headers:
+  x-test-env: docker
+variables:
+  service_base_url: http://127.0.0.1:18080
+
+runtime:
+  kind: docker_compose
+  project_directory: .
+  files:
+    - docker-compose.yml
+  project_name: test-runner-sample
+  up:
+    - --build
+    - -d
+    - --wait
+  down:
+    - -v
+    - --remove-orphans
+  cleanup: always
+
+readiness:
+  - kind: http
+    url: "{{ env.variables.service_base_url }}/health"
+    expect_status: 200
+    timeout_ms: 60000
+    interval_ms: 1000
+  - kind: tcp
+    host: 127.0.0.1
+    port: 13306
+    timeout_ms: 60000
+    interval_ms: 1000
+
+logs:
+  - kind: compose_service
+    service: app
+    output: env/app.log
+  - kind: container_file
+    service: mysql
+    path: /var/lib/mysql/general.log
+    output: env/mysql-query.log
+  - kind: container_file
+    service: mysql
+    path: /var/lib/mysql/slow.log
+    output: env/mysql-slow.log
+```
+
+补充说明：
+
+- `runtime`：负责环境生命周期；当前实现支持 `docker_compose`
+- `readiness`：负责启动后的 HTTP / TCP 就绪检查
+- `logs`：负责把 `docker compose logs` 或容器内文件收集到 `.testrunner/reports/env/`
+- 环境相关元数据会进入最终 JSON 报告的 `environment_artifacts`
+
+如果你想看完整专题说明和 `sample-projects/` 的真实示例，可以继续阅读 [`docs/guide/environment-dsl.md`](docs/guide/environment-dsl.md)。
 
 
 ### 4.3 `datasources/*.yaml`
@@ -447,9 +533,32 @@ respond:
 - 精确匹配 `method + path`
 - 支持静态响应和动态 `respond`
 - `when` 复用 case DSL 的断言语义
-- `extract`、`set`、`if` 可用于生成响应上下文
+- `extract`、`set`、`if`、`callback` 可用于生成响应上下文
 - 支持 `body` 或 `body_file`
 - 仍然不支持在 Mock 内执行 `request` / `sql` / `redis` / `query_*`
+
+如果你要模拟“第三方先同步返回、稍后再主动回调被测系统”，也可以直接在 mock route 里安排 callback：
+
+```yaml
+method: POST
+path: /payments/create
+extract:
+  order_no: request.json.order_no
+steps:
+  - callback:
+      after_ms: 120
+      request:
+        api: callback/payment/status
+        body:
+          order_no: "{{ vars.order_no }}"
+          status: SUCCESS
+respond:
+  status: 202
+  body:
+    accepted: true
+```
+
+callback 在 mock 中的语义和 case 中一致：step 成功表示“成功入队”，真正的投递结果会出现在最终报告的 `callbacks` 列表里。
 
 
 ## 5. DSL 概览
@@ -487,14 +596,14 @@ teardown: []
 
 执行过程中可以访问这些对象：
 
-- `env`：环境信息
+- `env`：环境信息（包含 `name`、`base_url`、`headers`、`variables`，以及可选的 `runtime` / `readiness` / `logs`）
 - `project`：项目信息
 - `case`：当前用例信息
 - `api`：当前 API 信息
 - `vars`：运行中变量
 - `data`：`.testrunner/data/` 下加载的数据
 - `response`：最近一次 `request` 的结果
-- `result`：最近一次 `sql` / `redis` / `query_db` / `query_redis` / `request` 的结果
+- `result`：最近一次 `sql` / `redis` / `query_db` / `query_redis` / `request` / `callback` / `sleep` 的结果
 
 常见路径示例：
 
@@ -713,8 +822,56 @@ response:
 - header key 在运行结果里会被统一转成小写。
 - 如果响应体不是合法 JSON，`response.json` 会是 `null`，但 `response.body` 仍然保留原始文本。
 
+### 7.6 `callback`
 
-### 7.6 `query_db`
+安排一次“稍后由 test-runner / mock 主动去调用被测系统”的 HTTP callback：
+
+```yaml
+- callback:
+    after_ms: 120
+    request:
+      api: callback/payment/status
+      body:
+        order_no: "{{ order_no }}"
+        status: SUCCESS
+```
+
+说明：
+
+- `after_ms` 可选，默认 `0`
+- `request.api` 必填；callback 会先把模板解析成具体请求，再交给异步调度器
+- callback step 成功表示“已成功入队”，真正的投递结果会出现在最终报告里的 `callbacks` 列表中
+
+step 结束后，`result` 会写成一条 enqueue 记录，例如：
+
+```yaml
+result:
+  id: 1
+  after_ms: 120
+  request:
+    api: callback/payment/status
+    method: POST
+    url: http://127.0.0.1:3000/callbacks/payments/status
+```
+
+### 7.7 `sleep`
+
+做一次最小等待，常和 `callback` 组合使用：
+
+```yaml
+- sleep:
+    ms: 200
+```
+
+执行后，`result` 形如：
+
+```yaml
+result:
+  ms: 200
+```
+
+
+### 7.8 `query_db`
 
 查询数据库，并对查询结果做提取与断言。
 
@@ -748,7 +905,7 @@ result:
 ```
 
 
-### 7.7 `query_redis`
+### 7.9 `query_redis`
 
 查询 Redis，并对结果做提取与断言。
 
@@ -780,7 +937,7 @@ result:
 - Bulk -> array
 
 
-### 7.8 `if`
+### 7.10 `if`
 
 条件分支。
 
@@ -800,7 +957,7 @@ result:
 - `else` 可选
 
 
-### 7.9 `foreach`
+### 7.11 `foreach`
 
 遍历数组。
 
@@ -1035,6 +1192,8 @@ teardown:
 
 - **串行**执行 case
 - 单个 case 的 `setup -> steps -> teardown` 也按顺序执行
+- 如果环境文件声明了 `runtime` / `readiness` / `logs`，运行器会在 case / workflow 之外统一托管环境生命周期
+- callback 队列会在 case / workflow 执行结束后统一刷新
 - 每次运行结束后写入：
 
 ```text
@@ -1052,6 +1211,19 @@ PASS [2/2] user/get-user/smoke (34ms)
   Cases: 2 passed, 0 failed, 2 total
   Duration: 46ms
   Report: /path/to/.testrunner/reports/last-run.json
+```
+
+如果本次运行里包含 callback，终端摘要还会额外出现：
+
+```text
+==> Callbacks
+  PASS #1 case:workflow/payment/schedule-callback -> http://127.0.0.1:18080/callbacks/payments/status (104ms)
+```
+
+如果环境文件里声明了 `runtime` / `readiness` / `logs`，JSON 报告会额外带上 `environment_artifacts`，对应的日志文件会落到：
+
+```text
+.testrunner/reports/env/
 ```
 
 工作流运行结果写入 `.testrunner/reports/last-workflow-run.json`，终端摘要示例：
@@ -1155,6 +1327,8 @@ steps:
 - 运行 DB / Redis 相关步骤时，CLI 会直接连接真实数据源；请优先使用专用测试库 / 测试前缀。
 - 工作流 V1 **不包含在 `test all` 中**，必须通过 `test workflow <id>` 单独触发。
 - `--tag` 和 `--case` 过滤参数不适用于 `test workflow`，传入时会报错。
+- 环境 runtime 当前只支持 `docker_compose`，且只支持外部 Compose 文件引用。
+- 环境生命周期是“按一次命令运行”管理的，不是“每个 case 各自管理一套环境”。
 
 
 ## 15. 推荐使用流程
@@ -1174,11 +1348,13 @@ steps:
 
 仓库里现在提供了一个可运行的 Rust 示例项目：`sample-projects/`。
 
-它包含五个接口：
+它包含七个接口：
 
 ```text
 GET  /health
 POST /orders
+POST /payments/provider/create
+POST /callbacks/payments/status
 POST /register
 POST /login
 POST /send-sms-code
@@ -1188,27 +1364,37 @@ POST /send-sms-code
 
 - `/health`：最小健康检查
 - `/orders`：一个无外部依赖的下单接口，返回嵌套数组/对象/布尔/null/数值结构，适合验证 DSL 表达式
+- `/payments/provider/create`：模拟被测系统向第三方支付服务发起请求
+- `/callbacks/payments/status`：模拟第三方稍后回调被测系统后的落点
 - `/register`：把用户写入 MySQL，并返回新建用户信息
 - `/login`：校验 MySQL 中的密码哈希和短信验证码，签发 JWT，并把 token 写入 Redis
 - `/send-sms-code`：调用一个被 Mock 的短信 HTTP 服务，并把短信验证码写入 Redis
 
-### 15.1 推荐方式：用 Docker Compose 启动整个样例
+### 16.1 推荐方式：让 `test-runner` 自动托管样例环境
+
+`sample-projects/.testrunner/env/docker.yaml` 已经声明了：
+
+- Docker Compose 生命周期
+- readiness 检查
+- 服务日志 / MySQL query log / MySQL slow log 采集
+
+因此最推荐的方式不是先手工 `docker compose up`，而是直接运行：
 
 ```bash
-cd sample-projects
-docker compose up --build -d
+cargo run -p test-runner -- test api system/health --root sample-projects --env docker
+cargo run -p test-runner -- test api order/create --root sample-projects --env docker
+cargo run -p test-runner -- test api payment/provider/create --root sample-projects --env docker
+cargo run -p test-runner -- test workflow register-login-create-order --root sample-projects --env docker
+cargo run -p test-runner -- test workflow payment-callback-flow --root sample-projects --env docker --no-mock
 ```
 
-启动后，可以直接在仓库根目录运行：
+执行时，`test-runner` 会自动：
 
-```bash
-cargo run -p test-runner -- test api system/health --root sample-projects
-cargo run -p test-runner -- test api order/create --root sample-projects
-cargo run -p test-runner -- test api user/register --root sample-projects
-cargo run -p test-runner -- test api user/login --root sample-projects
-cargo run -p test-runner -- test api user/send-sms-code --root sample-projects
-cargo run -p test-runner -- test workflow register-login-create-order --root sample-projects
-```
+- 拉起 Compose
+- 等待 HTTP / TCP readiness
+- 执行 case 或 workflow
+- 收集环境日志产物
+- 回收容器
 
 其中 `user/login` 的 happy-path 用例现在会先调用 `/send-sms-code` 获取验证码，再带着 `email + password + phone + sms_code` 去登录；同时还会断言验证码先写入 Redis、登录成功后再被消费掉。
 
@@ -1226,16 +1412,21 @@ cargo run -p test-runner -- test workflow register-login-create-order --root sam
 - login 产生的 token 副作用在 create-order 前仍可见
 - workflow 结束后，deferred teardown 会把这些副作用清理掉
 
-停止并清理：
+`payment-callback-flow` 则展示了另一条链路：
 
-```bash
-cd sample-projects
-docker compose down -v
+- 第一个 case 用 `callback + sleep` 安排并等待一次支付状态回调
+- 第二个 case 用 Redis 断言 callback 产生的最终副作用
+- 整条 workflow 通过 `exports + inputs` 在两个 case 间传递 `order_no` / `expected_status`
+
+如果环境文件里配置了 `logs:`，对应产物会写到：
+
+```text
+sample-projects/.testrunner/reports/env/
 ```
 
-默认会把应用暴露在 `127.0.0.1:18080`，把 MySQL 暴露在 `127.0.0.1:13306`，把 Redis 暴露在 `127.0.0.1:16379`。另外，`test-runner` 的内嵌 Mock Server 会在 `18081` 启动，样例项目的默认 `docker`/`local` 环境已经分别把短信服务地址指向 `host.docker.internal:18081` 和 `127.0.0.1:18081`，所以上面的 `test-runner` 命令可以直接执行。
+默认会把应用暴露在 `127.0.0.1:18080`，把 MySQL 暴露在 `127.0.0.1:13306`，把 Redis 暴露在 `127.0.0.1:16379`。另外，`test-runner` 的内嵌 Mock Server 会在 `18081` 启动，样例项目的默认 `docker` / `local` 环境已经分别把短信服务地址指向 `host.docker.internal:18081` 和 `127.0.0.1:18081`。
 
-### 15.2 仅本地启动 Rust 服务
+### 16.2 仅本地启动 Rust 服务
 
 如果你只是想快速验证健康检查，也可以直接启动 Rust 服务：
 
@@ -1243,7 +1434,7 @@ docker compose down -v
 cargo run -p health-service
 ```
 
-这时如果没有设置 `DATABASE_URL`，服务仍然会启动，但 `/register` 和 `/login` 会返回 `503`；如果没有设置 `REDIS_URL`，`/login` 和 `/send-sms-code` 也会返回 `503`；如果没有可访问的短信服务地址，`/send-sms-code` 会返回 `503` 或 `502`。不过 `/health` 和 `/orders` 这两个接口不依赖外部服务，适合直接本地验证。要完整跑注册/登录/短信链路，请优先使用上面的 Docker Compose 方式，或自行准备 MySQL 与 Redis，并在需要时设置短信服务地址：
+这时如果没有设置 `DATABASE_URL`，服务仍然会启动，但 `/register` 和 `/login` 会返回 `503`；如果没有设置 `REDIS_URL`，`/login` 和 `/send-sms-code` 也会返回 `503`；如果没有可访问的短信服务地址，`/send-sms-code` 会返回 `503` 或 `502`。不过 `/health` 和 `/orders` 这两个接口不依赖外部服务，适合直接本地验证。要完整跑注册/登录/短信链路，请优先使用上面的 `test-runner` 托管方式，或自行准备 MySQL 与 Redis，并在需要时设置短信服务地址：
 
 ```bash
 DATABASE_URL=mysql://app:app@127.0.0.1:13306/app \

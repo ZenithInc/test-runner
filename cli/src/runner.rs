@@ -131,6 +131,7 @@ pub async fn run(command: TestCommand) -> Result<()> {
             if manages_environment {
                 runner.console.environment_ready(&runner.project.environment_name);
             }
+            inject_port_mappings(&environment_session, &mut runner.project.environment);
             runner.execute(&selected_cases, &options, &target).await
         }
         Err(error) => {
@@ -262,6 +263,7 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
             if manages_environment {
                 runner.console.environment_ready(&runner.project.environment_name);
             }
+            inject_port_mappings(&environment_session, &mut runner.project.environment);
             runner.execute_workflow(&workflow, &args, options).await
         }
         Err(error) => {
@@ -537,8 +539,12 @@ impl SummaryConsole {
         }
 
         let mut parts = Vec::new();
-        if environment.runtime.is_some() {
-            parts.push("docker compose".to_string());
+        if let Some(runtime) = &environment.runtime {
+            let label = match runtime.kind {
+                crate::config::EnvironmentRuntimeKind::DockerCompose => "docker compose",
+                crate::config::EnvironmentRuntimeKind::Containers => "containers",
+            };
+            parts.push(label.to_string());
         }
         if !environment.readiness.is_empty() {
             parts.push(format!(
@@ -2012,6 +2018,29 @@ fn print_workflow_report(
 
 fn manages_environment(environment: &EnvironmentConfig) -> bool {
     environment.runtime.is_some() || !environment.readiness.is_empty() || !environment.logs.is_empty()
+}
+
+/// Inject dynamic port mappings from the containers runtime into environment variables.
+/// This makes ports accessible in DSL via `{{ env.variables.runtime_ports.<service>.<container_port> }}`.
+fn inject_port_mappings(
+    session: &EnvironmentSession,
+    environment: &mut EnvironmentConfig,
+) {
+    if session.port_mappings.is_empty() {
+        return;
+    }
+    let mut ports_map = serde_json::Map::new();
+    for (service, mapping) in &session.port_mappings {
+        let mut service_map = serde_json::Map::new();
+        for (container_port, host_port) in mapping {
+            service_map.insert(container_port.to_string(), json!(host_port));
+        }
+        ports_map.insert(service.clone(), Value::Object(service_map));
+    }
+    environment.variables.insert(
+        "runtime_ports".to_string(),
+        Value::Object(ports_map),
+    );
 }
 
 fn count_run_case_steps(steps: &[WorkflowStep]) -> usize {

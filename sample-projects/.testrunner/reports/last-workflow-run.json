@@ -1,16 +1,16 @@
 {
   "project": "health-service",
-  "environment": "docker",
+  "environment": "containers",
   "workflow_id": "payment-callback-flow",
   "workflow_name": "payment callback flow",
-  "started_at": "2026-03-25T06:54:02.057924+00:00",
-  "finished_at": "2026-03-25T06:54:02.254894+00:00",
+  "started_at": "2026-03-25T09:02:30.525452+00:00",
+  "finished_at": "2026-03-25T09:02:30.716657+00:00",
   "status": "passed",
   "summary": {
     "executed_steps": 2,
     "passed_steps": 2,
     "failed_steps": 0,
-    "duration_ms": 196
+    "duration_ms": 191
   },
   "callback_summary": {
     "total": 1,
@@ -25,46 +25,31 @@
       "method": "POST",
       "url": "http://127.0.0.1:18080/callbacks/payments/status",
       "after_ms": 100,
-      "scheduled_at": "2026-03-25T06:54:02.060934+00:00",
+      "scheduled_at": "2026-03-25T09:02:30.528208+00:00",
       "status": "passed",
-      "duration_ms": 105,
+      "duration_ms": 104,
       "response_status": 204
     }
   ],
   "environment_artifacts": {
     "runtime": {
-      "kind": "docker_compose",
-      "project_name": "test-runner-sample",
-      "project_directory": "/Volumes/Dev/codes/youse/test-runner/sample-projects",
+      "kind": "containers",
+      "project_name": "test-runner-health-service-health-service-38420-1774429287131",
+      "project_directory": "",
       "files": [
-        "docker-compose.yml"
+        "mysql:mysql:8.4",
+        "redis:redis:7.2-alpine",
+        "app:"
       ],
       "startup_status": "passed",
-      "startup_duration_ms": 13483,
+      "startup_duration_ms": 63390,
       "startup_command": [
-        "docker",
-        "compose",
-        "-p",
-        "test-runner-sample",
-        "-f",
-        "/Volumes/Dev/codes/youse/test-runner/sample-projects/docker-compose.yml",
-        "up",
-        "--build",
-        "-d",
-        "--wait"
+        "bollard::containers"
       ],
       "shutdown_status": "passed",
-      "shutdown_duration_ms": 11568,
+      "shutdown_duration_ms": 663,
       "shutdown_command": [
-        "docker",
-        "compose",
-        "-p",
-        "test-runner-sample",
-        "-f",
-        "/Volumes/Dev/codes/youse/test-runner/sample-projects/docker-compose.yml",
-        "down",
-        "-v",
-        "--remove-orphans"
+        "bollard::containers::stop+remove"
       ]
     },
     "readiness": [
@@ -85,28 +70,28 @@
     ],
     "logs": [
       {
-        "kind": "compose_service",
+        "kind": "containers",
         "service": "app",
         "stream": "combined",
         "output": "env/app.log",
         "status": "passed",
-        "size_bytes": 88
+        "size_bytes": 79
       },
       {
-        "kind": "container_file",
+        "kind": "containers",
         "service": "mysql",
-        "source_path": "/var/lib/mysql/general.log",
-        "output": "env/mysql-query.log",
+        "stream": "combined",
+        "output": "env/mysql.log",
         "status": "passed",
-        "size_bytes": 13258849
+        "size_bytes": 6621
       },
       {
-        "kind": "container_file",
-        "service": "mysql",
-        "source_path": "/var/lib/mysql/slow.log",
-        "output": "env/mysql-slow.log",
+        "kind": "containers",
+        "service": "redis",
+        "stream": "combined",
+        "output": "env/redis.log",
         "status": "passed",
-        "size_bytes": 6507847
+        "size_bytes": 705
       }
     ]
   },
@@ -116,7 +101,7 @@
       "case_id": "workflow/payment/schedule-callback",
       "status": "passed",
       "passed": true,
-      "duration_ms": 188,
+      "duration_ms": 183,
       "exports": {
         "expected_status": "SUCCESS",
         "order_no": "workflow-callback-001"
@@ -146,7 +131,7 @@
               "headers": {
                 "accept": "application/json",
                 "content-type": "application/json",
-                "x-test-env": "docker"
+                "x-test-env": "containers"
               },
               "method": "POST",
               "url": "http://127.0.0.1:18080/callbacks/payments/status"
@@ -157,7 +142,7 @@
         {
           "kind": "sleep",
           "status": "passed",
-          "duration_ms": 185,
+          "duration_ms": 180,
           "details": {
             "ms": 180
           },

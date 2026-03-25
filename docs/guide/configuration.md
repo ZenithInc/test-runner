@@ -89,7 +89,12 @@ logs:
 
 ### `runtime`
 
-- `kind`：当前实现支持 `docker_compose`。
+环境运行时支持两种模式：
+
+#### `kind: docker_compose`
+
+通过外部 Compose 文件管理容器。
+
 - `project_directory`：执行 `docker compose` 的目录，通常写项目根目录的 `.`。
 - `files`：Compose 文件列表，至少提供一个。
 - `project_name`：Compose project name；不写时运行器会自动生成。
@@ -97,9 +102,32 @@ logs:
 - `down`：追加在 `docker compose down` 后面的参数。
 - `cleanup`：环境回收策略，支持 `always`、`on_success`、`never`。
 
+#### `kind: containers`
+
+通过 Docker API 直接管理容器（Testcontainers 模式），无需 `docker-compose.yml` 和 `docker compose` CLI。
+
+- `services`：容器定义数组，每个元素包含：
+  - `name`：服务名称，同时作为 Docker 网络内的 DNS 别名。
+  - `image`：Docker 镜像（与 `build` 二选一，或同时指定）。
+  - `build`：从 Dockerfile 构建镜像。
+    - `context`：构建上下文目录（相对于项目根目录）。
+    - `dockerfile`：可选，Dockerfile 路径（相对于 context）。
+  - `ports`：端口映射（`"host:container"` 或 `"container"`）。
+  - `env`：环境变量。
+  - `command`：覆盖容器启动命令。
+  - `volumes`：卷挂载。
+  - `extra_hosts`：额外 hosts 映射（如 `"host.docker.internal:host-gateway"`）。
+  - `wait_for`：容器就绪等待策略（`log_message`、`tcp`、`http`）。
+- `network_name`：可选，自定义 Docker 网络名。
+- `cleanup`：同上。
+
+> 动态端口映射会注入到 `env.variables.runtime_ports`，可在 DSL 中引用，如 <code v-pre>{{ env.variables.runtime_ports.mysql.3306 }}</code>。
+
 ### `readiness`
 
-运行器在 `docker compose up ...` 之后会按顺序执行 readiness 检查；任一检查失败都会中止本次运行。
+运行器在容器启动之后会按顺序执行 readiness 检查；任一检查失败都会中止本次运行。
+
+> 使用 `containers` 模式时，容器级的 `wait_for` 会先于全局 `readiness` 执行。对于已在 `wait_for` 里检查过的服务，通常不需要重复声明 readiness。
 
 - `kind: http`
   - `url`
@@ -131,10 +159,10 @@ logs:
 
 如果你要在不同环境间切换 `base_url`、租户信息、下游服务地址或 Mock 地址，优先放进 `env/*.yaml`，而不是在 case 里硬编码。
 
-如果某个环境本身就是通过 Compose 拉起的，也推荐把启动、readiness 和日志采集声明放在这里，这样 `test-runner test ... --env <name>` 就能一次性完成环境托管和测试执行。
+如果某个环境本身就是通过 Compose 或 Testcontainers 拉起的，也推荐把启动、readiness 和日志采集声明放在这里，这样 `test-runner test ... --env <name>` 就能一次性完成环境托管和测试执行。
 
 ::: tip 环境托管专题
-如果你想看完整的 Docker Compose 托管示例、执行顺序、报告结构，以及 `sample-projects/` 里的真实命令，请继续阅读 [环境 DSL](/guide/environment-dsl)。
+如果你想看完整的 Docker Compose / Testcontainers 托管示例、执行顺序、报告结构，以及 `sample-projects/` 里的真实命令，请继续阅读 [环境 DSL](/guide/environment-dsl)。
 :::
 
 ## `datasources/*.yaml`

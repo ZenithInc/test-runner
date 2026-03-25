@@ -21,7 +21,7 @@ features:
   - title: Workflow 编排
     details: 在 case 之上增加 workflow 层，用 YAML 编排跨 case 的顺序、分支、输入输出和 cleanup 策略。
   - title: 环境 DSL
-    details: 在 `env/*.yaml` 里声明 Docker Compose 生命周期、readiness 和日志采集，让测试命令自动托管环境。
+    details: 在 `env/*.yaml` 里声明 Docker Compose 或 Testcontainers 容器的生命周期、readiness 和日志采集，让测试命令自动托管环境。
   - title: Callback 与副作用验证
     details: 支持在 case 和 mock route 里安排异步 callback，再通过 Redis / 数据库断言验证最终副作用。
   - title: 可追踪结果
@@ -34,7 +34,7 @@ features:
 
 - 如何初始化 `.testrunner/` 目录
 - 如何使用命令行选择和执行用例
-- 如何用环境 DSL 托管 Docker Compose、readiness 和环境日志
+- 如何用环境 DSL 托管 Docker Compose 或 Testcontainers 容器、readiness 和环境日志
 - 如何安排 callback，并在 case / mock / workflow 里验证异步副作用
 - 如何在 case 之上编排 workflow 流程
 - `.testrunner/` 的目录约定与配置文件

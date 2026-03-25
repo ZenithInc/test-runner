@@ -3,13 +3,13 @@
 `test-runner` 不只把 `env/*.yaml` 当成静态的 `base_url` 切换器。  
 现在环境文件还可以声明 `runtime`、`readiness` 和 `logs`，让一次 `test-runner test ... --env <name>` 自动完成：
 
-- 启动 Docker Compose 环境
+- 启动 Docker Compose 环境 **或** Testcontainers 容器
 - 等待服务 ready
 - 执行 case / workflow
 - 收集环境日志产物
 - 根据 cleanup 策略回收容器
 
-如果你已经在用 `sample-projects/`，这套能力对应的就是 `sample-projects/.testrunner/env/docker.yaml`。
+如果你已经在用 `sample-projects/`，这套能力对应的就是 `sample-projects/.testrunner/env/docker.yaml`（Docker Compose 模式）或 `sample-projects/.testrunner/env/containers.yaml`（Testcontainers 模式）。
 
 ## 什么时候应该用环境 DSL
 
@@ -98,6 +98,118 @@ docker compose down -v --remove-orphans
 ```
 
 改成由环境 DSL 托管。
+
+#### Testcontainers 模式（`kind: containers`）
+
+如果你不想维护 `docker-compose.yml` 文件，可以直接在环境配置里声明容器：
+
+```yaml
+runtime:
+  kind: containers
+  services:
+    - name: mysql
+      image: mysql:8.4
+      ports:
+        - "13306:3306"
+      env:
+        MYSQL_DATABASE: app
+        MYSQL_ROOT_PASSWORD: root
+      command:
+        - --general_log=1
+      wait_for:
+        kind: log_message
+        pattern: "ready for connections.*port: 3306"
+        timeout_ms: 60000
+
+    - name: redis
+      image: redis:7.2-alpine
+      ports:
+        - "16379:6379"
+      wait_for:
+        kind: tcp
+        port: 6379
+        timeout_ms: 15000
+        interval_ms: 500
+
+  network_name: my-test-network
+  cleanup: always
+```
+
+运行器会通过 Docker Engine API 直接管理容器生命周期：
+
+1. 自动拉取镜像（或从 Dockerfile 构建镜像）
+2. 创建隔离的 Docker 网络（容器间可通过服务名互访）
+3. 依次创建并启动容器
+4. 按 `wait_for` 策略等待每个容器就绪
+5. 测试完成后按 `cleanup` 策略清理
+
+**`services` 字段说明：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `name` | string | 服务名称，同时作为网络内的 DNS 名 |
+| `image` | string | Docker 镜像（与 `build` 二选一，或同时指定——`image` 作为构建后的 tag） |
+| `build` | object | 从 Dockerfile 构建镜像（见下文） |
+| `ports` | string[] | 端口映射，格式：`"host:container"` 或 `"container"`（自动分配 host 端口） |
+| `env` | map | 环境变量 |
+| `command` | string[] | 覆盖容器启动命令 |
+| `volumes` | string[] | 卷挂载（Docker bind mount 格式） |
+| `extra_hosts` | string[] | 额外 hosts 映射（如 `"host.docker.internal:host-gateway"`） |
+| `wait_for` | object | 容器就绪等待策略（见下文） |
+
+**`build` 构建配置：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `context` | string | 构建上下文目录（相对于项目根目录） |
+| `dockerfile` | string? | Dockerfile 路径（相对于 context，默认 `Dockerfile`） |
+
+示例——从本地源码构建应用镜像：
+
+```yaml
+services:
+  - name: app
+    build:
+      context: .           # 项目根目录
+    ports:
+      - "8080:3000"
+    env:
+      DATABASE_URL: "mysql://app:app@mysql:3306/app"
+```
+
+> 如果同时指定了 `image` 和 `build`，构建完成后会以 `image` 的值作为镜像 tag；若省略 `image`，则自动命名为 `testrunner-{name}`。
+
+**`wait_for` 等待策略：**
+
+| kind | 说明 | 专属字段 |
+|------|------|----------|
+| `log_message` | 监听容器日志流，匹配到正则就视为就绪 | `pattern`（正则）、`timeout_ms` |
+| `tcp` | 轮询 TCP 端口直到可连接 | `port`、`timeout_ms`、`interval_ms` |
+| `http` | 轮询 HTTP 端点直到返回预期状态码 | `port`、`path`、`expect_status`、`timeout_ms`、`interval_ms` |
+
+> `log_message` 是 Testcontainers 模式的核心优势——不需要额外的 readiness 声明，直接通过容器日志判断服务是否真的可用。
+
+**动态端口映射：**
+
+当端口格式写成 `"3306"`（只有容器端口）时，Docker 会自动分配空闲的 host 端口。运行器会将实际映射注入到 `env.variables.runtime_ports` 中，你可以在 DSL 里引用：
+
+```yaml
+variables:
+  db_port: "{{ env.variables.runtime_ports.mysql.3306 }}"
+```
+
+**两种模式对比：**
+
+| 特性 | `docker_compose` | `containers` |
+|------|-----------------|--------------|
+| 需要 docker-compose.yml | ✅ | ❌ |
+| 需要 docker compose CLI | ✅ | ❌（直接调用 Docker API） |
+| 服务依赖顺序 | Compose 管理 | 按 `services` 声明顺序 |
+| 从 Dockerfile 构建 | Compose 管理 | ✅ `build.context` |
+| 日志等待（log_message） | ❌ | ✅ |
+| 自动网络隔离 | Compose 管理 | ✅ 自动创建 |
+| 动态端口注入 | ❌ | ✅ |
+| 适合场景 | 已有 Compose 文件 | 纯声明式、CI 环境 |
 
 ### `readiness`
 
@@ -210,10 +322,11 @@ test-runner test workflow payment-callback-flow --root sample-projects --env doc
 
 这套环境 DSL 当前有几个明确边界：
 
-- MVP 只支持外部 Compose 文件引用，不支持内联 Compose YAML
-- 生命周期是“按一次命令运行”管理，而不是“每个 case 各起一套环境”
+- 支持两种运行时：`docker_compose`（外部 Compose 文件）和 `containers`（直接 Docker API 管理）
+- 生命周期是"按一次命令运行"管理，而不是"每个 case 各起一套环境"
 - MySQL query log / slow log 是否开启，仍然由环境作者在 Compose / 容器配置里负责；运行器只负责采集
 - 如果你想在失败后保留容器排查，可以把 `cleanup` 调成 `never`
+- `containers` 模式需要本机安装 Docker Engine（但不需要 `docker compose` CLI）
 
 ## 继续阅读
 

@@ -2,13 +2,13 @@
   "project": "health-service",
   "environment": "docker",
   "target": "api `system/health`",
-  "started_at": "2026-03-25T06:47:46.100724+00:00",
-  "finished_at": "2026-03-25T06:47:46.102692+00:00",
+  "started_at": "2026-03-25T08:14:26.246507+00:00",
+  "finished_at": "2026-03-25T08:14:26.248544+00:00",
   "summary": {
     "total": 1,
     "passed": 1,
     "failed": 0,
-    "duration_ms": 1
+    "duration_ms": 2
   },
   "callback_summary": {
     "total": 0,
@@ -24,7 +24,7 @@
         "docker-compose.yml"
       ],
       "startup_status": "passed",
-      "startup_duration_ms": 14720,
+      "startup_duration_ms": 19787,
       "startup_command": [
         "docker",
         "compose",
@@ -38,7 +38,7 @@
         "--wait"
       ],
       "shutdown_status": "passed",
-      "shutdown_duration_ms": 11717,
+      "shutdown_duration_ms": 11535,
       "shutdown_command": [
         "docker",
         "compose",
@@ -82,7 +82,7 @@
         "source_path": "/var/lib/mysql/general.log",
         "output": "env/mysql-query.log",
         "status": "passed",
-        "size_bytes": 13258849
+        "size_bytes": 13265395
       },
       {
         "kind": "container_file",
@@ -90,7 +90,7 @@
         "source_path": "/var/lib/mysql/slow.log",
         "output": "env/mysql-slow.log",
         "status": "passed",
-        "size_bytes": 6507630
+        "size_bytes": 6514393
       }
     ]
   },
@@ -100,7 +100,7 @@
       "name": "health smoke",
       "api": "system/health",
       "status": "passed",
-      "duration_ms": 1,
+      "duration_ms": 2,
       "error": null,
       "steps": [
         {

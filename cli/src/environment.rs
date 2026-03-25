@@ -1,15 +1,27 @@
 use anyhow::{Context, Result, bail};
+use bollard::Docker;
+use bollard::container::{
+    Config as ContainerConfig, CreateContainerOptions, LogOutput, LogsOptions,
+    RemoveContainerOptions, StartContainerOptions, InspectContainerOptions,
+};
+use bollard::image::CreateImageOptions;
+use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
 use chrono::Utc;
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use tokio::process::Command;
 use tokio::time::{Duration, Instant, sleep};
 
 use crate::config::{
-    ComposeLogStream, EnvironmentLogSource, EnvironmentReadinessCheck, EnvironmentRuntimeCleanupPolicy,
-    LoadedProject, environment_context_value,
+    ComposeLogStream, ContainerBuildConfig, ContainerServiceConfig, ContainerWaitFor,
+    EnvironmentLogSource, EnvironmentReadinessCheck, EnvironmentRuntimeCleanupPolicy,
+    EnvironmentRuntimeKind, LoadedProject, environment_context_value,
 };
 use crate::runtime::{RuntimeContext, value_to_string};
 
@@ -91,11 +103,19 @@ pub struct EnvironmentLogArtifactReport {
 
 pub struct EnvironmentSession {
     runner_root: PathBuf,
-    runtime: Option<ResolvedDockerComposeRuntime>,
+    runtime: Option<ResolvedRuntime>,
     readiness: Vec<ResolvedReadinessCheck>,
     logs: Vec<ResolvedLogSpec>,
     runtime_invoked: bool,
     report: EnvironmentArtifactsReport,
+    /// Port mappings exposed by the containers runtime: service_name -> { container_port -> host_port }
+    pub port_mappings: HashMap<String, HashMap<u16, u16>>,
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedRuntime {
+    DockerCompose(ResolvedDockerComposeRuntime),
+    Containers(ResolvedContainersRuntime),
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +127,15 @@ struct ResolvedDockerComposeRuntime {
     up_args: Vec<String>,
     down_args: Vec<String>,
     cleanup: EnvironmentRuntimeCleanupPolicy,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedContainersRuntime {
+    services: Vec<ContainerServiceConfig>,
+    network_name: String,
+    cleanup: EnvironmentRuntimeCleanupPolicy,
+    /// Container IDs created during prepare(), populated at runtime
+    container_ids: Vec<(String, String)>, // (service_name, container_id)
 }
 
 #[derive(Debug, Clone)]
@@ -161,7 +190,9 @@ impl EnvironmentSession {
             .environment
             .runtime
             .as_ref()
-            .map(|runtime| resolve_runtime(project, runtime, &render_context, &run_id))
+            .map(|runtime_config| {
+                resolve_runtime(project, runtime_config, &render_context, &run_id)
+            })
             .transpose()?;
         let readiness = project
             .environment
@@ -175,27 +206,51 @@ impl EnvironmentSession {
             .iter()
             .map(|log| resolve_log_spec(log, &render_context))
             .collect::<Result<Vec<_>>>()?;
-        let report = runtime.as_ref().map(|runtime| EnvironmentRuntimeReport {
-            kind: "docker_compose".to_string(),
-            project_name: runtime.project_name.clone(),
-            project_directory: runtime.project_directory.display().to_string(),
-            files: runtime
-                .file_displays
-                .iter()
-                .map(|path| display_relative_to_root(&project.root, path))
-                .collect(),
-            startup_status: None,
-            startup_duration_ms: None,
-            startup_error: None,
-            startup_command: None,
-            startup_stdout: None,
-            startup_stderr: None,
-            shutdown_status: None,
-            shutdown_duration_ms: None,
-            shutdown_error: None,
-            shutdown_command: None,
-            shutdown_stdout: None,
-            shutdown_stderr: None,
+        let report = runtime.as_ref().map(|resolved| match resolved {
+            ResolvedRuntime::DockerCompose(dc) => EnvironmentRuntimeReport {
+                kind: "docker_compose".to_string(),
+                project_name: dc.project_name.clone(),
+                project_directory: dc.project_directory.display().to_string(),
+                files: dc
+                    .file_displays
+                    .iter()
+                    .map(|path| display_relative_to_root(&project.root, path))
+                    .collect(),
+                startup_status: None,
+                startup_duration_ms: None,
+                startup_error: None,
+                startup_command: None,
+                startup_stdout: None,
+                startup_stderr: None,
+                shutdown_status: None,
+                shutdown_duration_ms: None,
+                shutdown_error: None,
+                shutdown_command: None,
+                shutdown_stdout: None,
+                shutdown_stderr: None,
+            },
+            ResolvedRuntime::Containers(ct) => EnvironmentRuntimeReport {
+                kind: "containers".to_string(),
+                project_name: ct.network_name.clone(),
+                project_directory: String::new(),
+                files: ct
+                    .services
+                    .iter()
+                    .map(|s| format!("{}:{}", s.name, s.image))
+                    .collect(),
+                startup_status: None,
+                startup_duration_ms: None,
+                startup_error: None,
+                startup_command: None,
+                startup_stdout: None,
+                startup_stderr: None,
+                shutdown_status: None,
+                shutdown_duration_ms: None,
+                shutdown_error: None,
+                shutdown_command: None,
+                shutdown_stdout: None,
+                shutdown_stderr: None,
+            },
         });
 
         Ok(Self {
@@ -209,35 +264,64 @@ impl EnvironmentSession {
                 readiness: Vec::new(),
                 logs: Vec::new(),
             },
+            port_mappings: HashMap::new(),
         })
     }
 
     pub async fn prepare(&mut self) -> Result<()> {
-        if let Some(runtime) = self.runtime.clone() {
-            ensure_docker_compose_available().await?;
-            let started = Instant::now();
-            let output = run_compose_command(&runtime, "up", &runtime.up_args).await?;
-            self.runtime_invoked = true;
-            if let Some(report) = self.report.runtime.as_mut() {
-                report.startup_duration_ms = Some(started.elapsed().as_millis());
-                report.startup_command = Some(output.command.clone());
-            }
-            if output.success() {
+        match self.runtime.clone() {
+            Some(ResolvedRuntime::DockerCompose(runtime)) => {
+                ensure_docker_compose_available().await?;
+                let started = Instant::now();
+                let output = run_compose_command(&runtime, "up", &runtime.up_args).await?;
+                self.runtime_invoked = true;
                 if let Some(report) = self.report.runtime.as_mut() {
-                    report.startup_status = Some("passed".to_string());
-                    report.startup_stdout = None;
-                    report.startup_stderr = None;
+                    report.startup_duration_ms = Some(started.elapsed().as_millis());
+                    report.startup_command = Some(output.command.clone());
                 }
-            } else {
-                if let Some(report) = self.report.runtime.as_mut() {
-                    report.startup_status = Some("failed".to_string());
-                    report.startup_stdout = non_empty(output.stdout.clone());
-                    report.startup_stderr = non_empty(output.stderr.clone());
-                    report.startup_error =
-                        Some(format_command_failure("docker compose up", &output));
+                if output.success() {
+                    if let Some(report) = self.report.runtime.as_mut() {
+                        report.startup_status = Some("passed".to_string());
+                        report.startup_stdout = None;
+                        report.startup_stderr = None;
+                    }
+                } else {
+                    if let Some(report) = self.report.runtime.as_mut() {
+                        report.startup_status = Some("failed".to_string());
+                        report.startup_stdout = non_empty(output.stdout.clone());
+                        report.startup_stderr = non_empty(output.stderr.clone());
+                        report.startup_error =
+                            Some(format_command_failure("docker compose up", &output));
+                    }
+                    bail!(format_command_failure("docker compose up", &output));
                 }
-                bail!(format_command_failure("docker compose up", &output));
             }
+            Some(ResolvedRuntime::Containers(ref containers_config)) => {
+                let started = Instant::now();
+                match start_containers(containers_config, &self.runner_root).await {
+                    Ok((container_ids, port_mappings)) => {
+                        self.runtime_invoked = true;
+                        self.port_mappings = port_mappings;
+                        if let Some(ResolvedRuntime::Containers(ref mut ct)) = self.runtime {
+                            ct.container_ids = container_ids;
+                        }
+                        if let Some(report) = self.report.runtime.as_mut() {
+                            report.startup_duration_ms = Some(started.elapsed().as_millis());
+                            report.startup_status = Some("passed".to_string());
+                            report.startup_command = Some(vec!["bollard::containers".to_string()]);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(report) = self.report.runtime.as_mut() {
+                            report.startup_duration_ms = Some(started.elapsed().as_millis());
+                            report.startup_status = Some("failed".to_string());
+                            report.startup_error = Some(error.to_string());
+                        }
+                        bail!(error);
+                    }
+                }
+            }
+            None => {}
         }
 
         for check in self.readiness.clone() {
@@ -266,21 +350,48 @@ impl EnvironmentSession {
             return;
         };
         for spec in self.logs.clone() {
-            let artifact = match spec {
-                ResolvedLogSpec::ComposeService {
-                    service,
-                    stream,
-                    output,
-                } => {
-                    collect_compose_service_logs(&self.runner_root, &runtime, &service, stream, &output)
+            let artifact = match (&spec, &runtime) {
+                (
+                    ResolvedLogSpec::ComposeService {
+                        service,
+                        stream,
+                        output,
+                    },
+                    ResolvedRuntime::DockerCompose(dc),
+                ) => {
+                    collect_compose_service_logs(&self.runner_root, dc, service, *stream, output)
                         .await
                 }
-                ResolvedLogSpec::ContainerFile {
-                    service,
-                    path,
-                    output,
-                } => {
-                    collect_container_file(&self.runner_root, &runtime, &service, &path, &output).await
+                (
+                    ResolvedLogSpec::ContainerFile {
+                        service,
+                        path,
+                        output,
+                    },
+                    ResolvedRuntime::DockerCompose(dc),
+                ) => {
+                    collect_container_file(&self.runner_root, dc, service, path, output).await
+                }
+                (
+                    ResolvedLogSpec::ComposeService {
+                        service,
+                        output,
+                        ..
+                    },
+                    ResolvedRuntime::Containers(ct),
+                ) => {
+                    collect_container_logs_bollard(&self.runner_root, ct, service, output).await
+                }
+                (
+                    ResolvedLogSpec::ContainerFile {
+                        service,
+                        path,
+                        output,
+                    },
+                    ResolvedRuntime::Containers(ct),
+                ) => {
+                    collect_container_file_bollard(&self.runner_root, ct, service, path, output)
+                        .await
                 }
             };
             self.report.logs.push(artifact);
@@ -295,7 +406,11 @@ impl EnvironmentSession {
             return;
         };
 
-        let should_cleanup = match runtime.cleanup {
+        let cleanup_policy = match &runtime {
+            ResolvedRuntime::DockerCompose(dc) => dc.cleanup,
+            ResolvedRuntime::Containers(ct) => ct.cleanup,
+        };
+        let should_cleanup = match cleanup_policy {
             EnvironmentRuntimeCleanupPolicy::Always => true,
             EnvironmentRuntimeCleanupPolicy::OnSuccess => success,
             EnvironmentRuntimeCleanupPolicy::Never => false,
@@ -309,27 +424,47 @@ impl EnvironmentSession {
             return;
         }
 
-        let started = Instant::now();
-        match run_compose_command(&runtime, "down", &runtime.down_args).await {
-            Ok(output) => {
-                report.shutdown_duration_ms = Some(started.elapsed().as_millis());
-                report.shutdown_command = Some(output.command.clone());
-                if output.success() {
-                    report.shutdown_status = Some("passed".to_string());
-                    report.shutdown_stdout = None;
-                    report.shutdown_stderr = None;
-                } else {
-                    report.shutdown_status = Some("failed".to_string());
-                    report.shutdown_stdout = non_empty(output.stdout.clone());
-                    report.shutdown_stderr = non_empty(output.stderr.clone());
-                    report.shutdown_error =
-                        Some(format_command_failure("docker compose down", &output));
+        match runtime {
+            ResolvedRuntime::DockerCompose(dc) => {
+                let started = Instant::now();
+                match run_compose_command(&dc, "down", &dc.down_args).await {
+                    Ok(output) => {
+                        report.shutdown_duration_ms = Some(started.elapsed().as_millis());
+                        report.shutdown_command = Some(output.command.clone());
+                        if output.success() {
+                            report.shutdown_status = Some("passed".to_string());
+                            report.shutdown_stdout = None;
+                            report.shutdown_stderr = None;
+                        } else {
+                            report.shutdown_status = Some("failed".to_string());
+                            report.shutdown_stdout = non_empty(output.stdout.clone());
+                            report.shutdown_stderr = non_empty(output.stderr.clone());
+                            report.shutdown_error =
+                                Some(format_command_failure("docker compose down", &output));
+                        }
+                    }
+                    Err(error) => {
+                        report.shutdown_duration_ms = Some(started.elapsed().as_millis());
+                        report.shutdown_status = Some("failed".to_string());
+                        report.shutdown_error = Some(error.to_string());
+                    }
                 }
             }
-            Err(error) => {
-                report.shutdown_duration_ms = Some(started.elapsed().as_millis());
-                report.shutdown_status = Some("failed".to_string());
-                report.shutdown_error = Some(error.to_string());
+            ResolvedRuntime::Containers(ct) => {
+                let started = Instant::now();
+                match stop_containers(&ct).await {
+                    Ok(()) => {
+                        report.shutdown_duration_ms = Some(started.elapsed().as_millis());
+                        report.shutdown_status = Some("passed".to_string());
+                        report.shutdown_command =
+                            Some(vec!["bollard::containers::stop+remove".to_string()]);
+                    }
+                    Err(error) => {
+                        report.shutdown_duration_ms = Some(started.elapsed().as_millis());
+                        report.shutdown_status = Some("failed".to_string());
+                        report.shutdown_error = Some(error.to_string());
+                    }
+                }
             }
         }
     }
@@ -359,6 +494,24 @@ fn build_render_context(project: &LoadedProject, run_id: &str) -> Result<Runtime
 }
 
 fn resolve_runtime(
+    project: &LoadedProject,
+    runtime: &crate::config::EnvironmentRuntimeConfig,
+    context: &RuntimeContext,
+    run_id: &str,
+) -> Result<ResolvedRuntime> {
+    match runtime.kind {
+        EnvironmentRuntimeKind::DockerCompose => {
+            resolve_docker_compose_runtime(project, runtime, context, run_id)
+                .map(ResolvedRuntime::DockerCompose)
+        }
+        EnvironmentRuntimeKind::Containers => {
+            resolve_containers_runtime(project, runtime, context, run_id)
+                .map(ResolvedRuntime::Containers)
+        }
+    }
+}
+
+fn resolve_docker_compose_runtime(
     project: &LoadedProject,
     runtime: &crate::config::EnvironmentRuntimeConfig,
     context: &RuntimeContext,
@@ -425,6 +578,34 @@ fn resolve_runtime(
         up_args: runtime.up.clone(),
         down_args: runtime.down.clone(),
         cleanup: runtime.cleanup,
+    })
+}
+
+fn resolve_containers_runtime(
+    project: &LoadedProject,
+    runtime: &crate::config::EnvironmentRuntimeConfig,
+    context: &RuntimeContext,
+    run_id: &str,
+) -> Result<ResolvedContainersRuntime> {
+    let network_name = runtime
+        .network_name
+        .as_ref()
+        .map(|value| resolve_string(context, value))
+        .transpose()?
+        .map(|value| sanitize_project_name(&value))
+        .unwrap_or_else(|| {
+            sanitize_project_name(&format!(
+                "test-runner-{}-{}",
+                project.project.project.name,
+                run_id
+            ))
+        });
+
+    Ok(ResolvedContainersRuntime {
+        services: runtime.services.clone(),
+        network_name,
+        cleanup: runtime.cleanup,
+        container_ids: Vec::new(),
     })
 }
 
@@ -853,6 +1034,737 @@ async fn run_command(
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         exit_code: output.status.code(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Containers runtime (bollard-based)
+// ---------------------------------------------------------------------------
+
+fn connect_docker() -> Result<Docker> {
+    Docker::connect_with_local_defaults().context("failed to connect to Docker daemon")
+}
+
+fn parse_port_mapping(spec: &str) -> Result<(u16, Option<u16>)> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    match parts.len() {
+        1 => {
+            let container_port = parts[0].parse::<u16>()
+                .with_context(|| format!("invalid port `{spec}`"))?;
+            Ok((container_port, None))
+        }
+        2 => {
+            let host_port = parts[0].parse::<u16>()
+                .with_context(|| format!("invalid host port in `{spec}`"))?;
+            let container_port = parts[1].parse::<u16>()
+                .with_context(|| format!("invalid container port in `{spec}`"))?;
+            Ok((container_port, Some(host_port)))
+        }
+        _ => bail!("invalid port mapping `{spec}`"),
+    }
+}
+
+/// Resolve the image for a service: build from Dockerfile or pull from registry.
+async fn resolve_service_image(
+    docker: &Docker,
+    service: &ContainerServiceConfig,
+    runner_root: &Path,
+) -> Result<String> {
+    if let Some(build_config) = &service.build {
+        // Build image from Dockerfile
+        let image_tag = if service.image.is_empty() {
+            format!("testrunner-{}", service.name)
+        } else {
+            service.image.clone()
+        };
+        build_container_image(docker, build_config, &image_tag, runner_root).await?;
+        Ok(image_tag)
+    } else {
+        // Pull pre-built image
+        let mut pull_stream = docker.create_image(
+            Some(CreateImageOptions {
+                from_image: service.image.as_str(),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        while let Some(result) = pull_stream.next().await {
+            result.with_context(|| format!("failed to pull image `{}`", service.image))?;
+        }
+        Ok(service.image.clone())
+    }
+}
+
+/// Build a Docker image from a build context directory.
+async fn build_container_image(
+    docker: &Docker,
+    build_config: &ContainerBuildConfig,
+    tag: &str,
+    runner_root: &Path,
+) -> Result<()> {
+    // The runner_root is .testrunner/, context is relative to its parent (project root)
+    let project_root = runner_root.parent().unwrap_or(runner_root);
+    let context_path = project_root.join(&build_config.context);
+    if !context_path.is_dir() {
+        bail!(
+            "build context directory `{}` does not exist",
+            context_path.display()
+        );
+    }
+
+    // Create a tar archive of the build context
+    let tar_bytes = create_build_context_tar(&context_path)
+        .with_context(|| format!("failed to create tar for build context `{}`", context_path.display()))?;
+
+    let mut build_opts = bollard::image::BuildImageOptions {
+        t: tag.to_string(),
+        rm: true,
+        ..Default::default()
+    };
+    if let Some(dockerfile) = &build_config.dockerfile {
+        build_opts.dockerfile = dockerfile.clone();
+    }
+
+    let mut build_stream = docker.build_image(
+        build_opts,
+        None,
+        Some(tar_bytes.into()),
+    );
+
+    while let Some(result) = build_stream.next().await {
+        let info = result.with_context(|| format!("failed to build image `{tag}`"))?;
+        if let Some(error) = info.error {
+            bail!("image build error for `{tag}`: {error}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Create a gzip-compressed tar archive of the build context directory.
+fn create_build_context_tar(context_path: &Path) -> Result<Vec<u8>> {
+    let buf = Vec::new();
+    let enc = GzEncoder::new(buf, Compression::fast());
+    let mut archive = tar::Builder::new(enc);
+    archive
+        .append_dir_all(".", context_path)
+        .with_context(|| "failed to add files to build context tar")?;
+    let enc = archive
+        .into_inner()
+        .with_context(|| "failed to finalize build context tar")?;
+    enc.finish().with_context(|| "failed to compress build context tar")
+}
+
+/// Start all containers for the containers runtime.
+/// Returns (container_ids, port_mappings).
+async fn start_containers(
+    runtime: &ResolvedContainersRuntime,
+    runner_root: &Path,
+) -> Result<(Vec<(String, String)>, HashMap<String, HashMap<u16, u16>>)> {
+    let docker = connect_docker()?;
+
+    // Create an isolated network
+    let network_name = &runtime.network_name;
+    let network_exists = docker
+        .inspect_network(network_name, None::<InspectNetworkOptions<String>>)
+        .await
+        .is_ok();
+    if !network_exists {
+        docker
+            .create_network(CreateNetworkOptions {
+                name: network_name.as_str(),
+                driver: "bridge",
+                ..Default::default()
+            })
+            .await
+            .with_context(|| format!("failed to create network `{network_name}`"))?;
+    }
+
+    let mut container_ids: Vec<(String, String)> = Vec::new();
+    let mut port_mappings: HashMap<String, HashMap<u16, u16>> = HashMap::new();
+
+    for service in &runtime.services {
+        // Resolve image: build from Dockerfile or pull from registry
+        let image_name = resolve_service_image(&docker, service, runner_root).await?;
+
+        // Build port bindings
+        let mut exposed_ports = HashMap::new();
+        let mut port_bindings: HashMap<String, Option<Vec<bollard::models::PortBinding>>> =
+            HashMap::new();
+        for port_spec in &service.ports {
+            let (container_port, host_port) = parse_port_mapping(port_spec)?;
+            let key = format!("{container_port}/tcp");
+            exposed_ports.insert(key.clone(), HashMap::new());
+            port_bindings.insert(
+                key,
+                Some(vec![bollard::models::PortBinding {
+                    host_ip: Some("0.0.0.0".to_string()),
+                    host_port: host_port.map(|p| p.to_string()),
+                }]),
+            );
+        }
+
+        // Build environment
+        let env_vars: Vec<String> = service
+            .environment
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+
+        // Build volume bindings
+        let binds: Vec<String> = service.volumes.clone();
+
+        // Build command
+        let cmd: Vec<String> = service.command.clone();
+
+        let container_name = format!("{}-{}", runtime.network_name, service.name);
+
+        let host_config = bollard::models::HostConfig {
+            port_bindings: Some(port_bindings),
+            binds: if binds.is_empty() { None } else { Some(binds) },
+            network_mode: Some(network_name.clone()),
+            extra_hosts: if service.extra_hosts.is_empty() {
+                None
+            } else {
+                Some(service.extra_hosts.clone())
+            },
+            ..Default::default()
+        };
+
+        let networking_config = bollard::container::NetworkingConfig {
+            endpoints_config: HashMap::from([(
+                network_name.clone(),
+                bollard::models::EndpointSettings {
+                    aliases: Some(vec![service.name.clone()]),
+                    ..Default::default()
+                },
+            )]),
+        };
+
+        let config = ContainerConfig {
+            image: Some(image_name),
+            exposed_ports: if exposed_ports.is_empty() {
+                None
+            } else {
+                Some(exposed_ports)
+            },
+            env: if env_vars.is_empty() {
+                None
+            } else {
+                Some(env_vars)
+            },
+            cmd: if cmd.is_empty() { None } else { Some(cmd) },
+            host_config: Some(host_config),
+            networking_config: Some(networking_config),
+            ..Default::default()
+        };
+
+        let create_result = docker
+            .create_container(
+                Some(CreateContainerOptions {
+                    name: container_name.as_str(),
+                    platform: None,
+                }),
+                config,
+            )
+            .await
+            .with_context(|| format!("failed to create container `{}`", service.name))?;
+
+        let container_id = create_result.id;
+
+        docker
+            .start_container(&container_id, None::<StartContainerOptions<String>>)
+            .await
+            .with_context(|| format!("failed to start container `{}`", service.name))?;
+
+        // Wait for the container using its wait_for strategy
+        if let Some(wait_for) = &service.wait_for {
+            wait_for_container(&docker, &container_id, &service.name, wait_for).await?;
+        }
+
+        // Inspect to get actual port mappings
+        let inspect = docker
+            .inspect_container(&container_id, None::<InspectContainerOptions>)
+            .await
+            .with_context(|| format!("failed to inspect container `{}`", service.name))?;
+
+        let mut service_ports = HashMap::new();
+        if let Some(network_settings) = &inspect.network_settings {
+            if let Some(ports) = &network_settings.ports {
+                for (container_key, host_bindings) in ports {
+                    // container_key is like "3306/tcp"
+                    if let Some(container_port) = container_key
+                        .split('/')
+                        .next()
+                        .and_then(|p| p.parse::<u16>().ok())
+                    {
+                        if let Some(Some(bindings)) = host_bindings.as_ref().map(Some) {
+                            if let Some(binding) = bindings.first() {
+                                if let Some(host_port) =
+                                    binding.host_port.as_ref().and_then(|p| p.parse::<u16>().ok())
+                                {
+                                    service_ports.insert(container_port, host_port);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        container_ids.push((service.name.clone(), container_id));
+        port_mappings.insert(service.name.clone(), service_ports);
+    }
+
+    Ok((container_ids, port_mappings))
+}
+
+/// Wait for a container to become ready based on the configured strategy.
+async fn wait_for_container(
+    docker: &Docker,
+    container_id: &str,
+    service_name: &str,
+    wait_for: &ContainerWaitFor,
+) -> Result<()> {
+    match wait_for {
+        ContainerWaitFor::LogMessage {
+            pattern,
+            timeout_ms,
+        } => {
+            wait_for_log_message(docker, container_id, service_name, pattern, *timeout_ms).await
+        }
+        ContainerWaitFor::Tcp {
+            port,
+            timeout_ms,
+            interval_ms,
+        } => {
+            // We need to get the host port mapping first
+            let host_port = resolve_host_port(docker, container_id, *port).await?;
+            wait_for_tcp(service_name, host_port, *timeout_ms, *interval_ms).await
+        }
+        ContainerWaitFor::Http {
+            port,
+            path,
+            expect_status,
+            timeout_ms,
+            interval_ms,
+        } => {
+            let host_port = resolve_host_port(docker, container_id, *port).await?;
+            let url = format!("http://127.0.0.1:{host_port}{path}");
+            wait_for_http(service_name, &url, *expect_status, *timeout_ms, *interval_ms).await
+        }
+    }
+}
+
+async fn resolve_host_port(docker: &Docker, container_id: &str, container_port: u16) -> Result<u16> {
+    let inspect = docker
+        .inspect_container(container_id, None::<InspectContainerOptions>)
+        .await
+        .context("failed to inspect container for port resolution")?;
+
+    let key = format!("{container_port}/tcp");
+    let port = inspect
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.ports.as_ref())
+        .and_then(|ports| ports.get(&key))
+        .and_then(|bindings| bindings.as_ref())
+        .and_then(|bindings| bindings.first())
+        .and_then(|binding| binding.host_port.as_ref())
+        .and_then(|p| p.parse::<u16>().ok())
+        .with_context(|| format!("no host port mapping found for container port {container_port}"))?;
+
+    Ok(port)
+}
+
+async fn wait_for_log_message(
+    docker: &Docker,
+    container_id: &str,
+    service_name: &str,
+    pattern: &str,
+    timeout_ms: u64,
+) -> Result<()> {
+    let started = Instant::now();
+    let regex = regex::Regex::new(pattern)
+        .with_context(|| format!("invalid log_message pattern `{pattern}`"))?;
+
+    let mut stream = docker.logs::<String>(
+        container_id,
+        Some(LogsOptions {
+            follow: true,
+            stdout: true,
+            stderr: true,
+            ..Default::default()
+        }),
+    );
+
+    loop {
+        let remaining = Duration::from_millis(timeout_ms)
+            .checked_sub(started.elapsed())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            bail!(
+                "timed out waiting for log message matching `{pattern}` on container `{service_name}` \
+                 after {timeout_ms}ms"
+            );
+        }
+
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(log_output))) => {
+                let line = match &log_output {
+                    LogOutput::StdOut { message } | LogOutput::StdErr { message } => {
+                        String::from_utf8_lossy(message).to_string()
+                    }
+                    _ => continue,
+                };
+                if regex.is_match(&line) {
+                    return Ok(());
+                }
+            }
+            Ok(Some(Err(error))) => {
+                bail!(
+                    "error reading logs from container `{service_name}`: {error}"
+                );
+            }
+            Ok(None) => {
+                bail!(
+                    "container `{service_name}` log stream ended before matching `{pattern}`"
+                );
+            }
+            Err(_) => {
+                bail!(
+                    "timed out waiting for log message matching `{pattern}` on container `{service_name}` \
+                     after {timeout_ms}ms"
+                );
+            }
+        }
+    }
+}
+
+async fn wait_for_tcp(
+    service_name: &str,
+    host_port: u16,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Result<()> {
+    let started = Instant::now();
+    let target = format!("127.0.0.1:{host_port}");
+    let mut last_error = None;
+
+    while started.elapsed().as_millis() < u128::from(timeout_ms) {
+        match tokio::net::TcpStream::connect(&target).await {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+        sleep(Duration::from_millis(interval_ms)).await;
+    }
+
+    bail!(
+        "timed out waiting for TCP readiness on container `{service_name}` port {host_port} \
+         after {timeout_ms}ms: {}",
+        last_error.unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
+async fn wait_for_http(
+    service_name: &str,
+    url: &str,
+    expect_status: u16,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let started = Instant::now();
+    let mut last_error = None;
+
+    while started.elapsed().as_millis() < u128::from(timeout_ms) {
+        match client.get(url).send().await {
+            Ok(response) if response.status().as_u16() == expect_status => return Ok(()),
+            Ok(response) => {
+                last_error = Some(format!(
+                    "expected HTTP {expect_status}, got HTTP {}",
+                    response.status().as_u16()
+                ));
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+        sleep(Duration::from_millis(interval_ms)).await;
+    }
+
+    bail!(
+        "timed out waiting for HTTP readiness on container `{service_name}` at {url} \
+         after {timeout_ms}ms: {}",
+        last_error.unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
+/// Stop and remove all containers, then remove the network.
+async fn stop_containers(runtime: &ResolvedContainersRuntime) -> Result<()> {
+    let docker = connect_docker()?;
+    let mut errors = Vec::new();
+
+    // Stop and remove containers in reverse order
+    for (service_name, container_id) in runtime.container_ids.iter().rev() {
+        if let Err(error) = docker
+            .remove_container(
+                container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            errors.push(format!("failed to remove container `{service_name}`: {error}"));
+        }
+    }
+
+    // Remove network
+    if let Err(error) = docker.remove_network(&runtime.network_name).await {
+        errors.push(format!(
+            "failed to remove network `{}`: {error}",
+            runtime.network_name
+        ));
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("{}", errors.join("; "))
+    }
+}
+
+/// Collect logs from a container using bollard.
+async fn collect_container_logs_bollard(
+    runner_root: &Path,
+    runtime: &ResolvedContainersRuntime,
+    service: &str,
+    output: &str,
+) -> EnvironmentLogArtifactReport {
+    let output_path = match resolve_report_output_path(runner_root, output) {
+        Ok(path) => path,
+        Err(error) => {
+            return EnvironmentLogArtifactReport {
+                kind: "containers".to_string(),
+                service: service.to_string(),
+                stream: Some("combined".to_string()),
+                source_path: None,
+                output: output.to_string(),
+                status: "failed".to_string(),
+                size_bytes: None,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+
+    let container_id = match runtime
+        .container_ids
+        .iter()
+        .find(|(name, _)| name == service)
+        .map(|(_, id)| id.clone())
+    {
+        Some(id) => id,
+        None => {
+            return EnvironmentLogArtifactReport {
+                kind: "containers".to_string(),
+                service: service.to_string(),
+                stream: Some("combined".to_string()),
+                source_path: None,
+                output: output.to_string(),
+                status: "failed".to_string(),
+                size_bytes: None,
+                error: Some(format!("no container found for service `{service}`")),
+            };
+        }
+    };
+
+    let docker = match connect_docker() {
+        Ok(d) => d,
+        Err(error) => {
+            return EnvironmentLogArtifactReport {
+                kind: "containers".to_string(),
+                service: service.to_string(),
+                stream: Some("combined".to_string()),
+                source_path: None,
+                output: output.to_string(),
+                status: "failed".to_string(),
+                size_bytes: None,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+
+    let mut logs = String::new();
+    let mut stream = docker.logs::<String>(
+        &container_id,
+        Some(LogsOptions {
+            follow: false,
+            stdout: true,
+            stderr: true,
+            timestamps: true,
+            ..Default::default()
+        }),
+    );
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(log_output) => match log_output {
+                LogOutput::StdOut { message } | LogOutput::StdErr { message } => {
+                    logs.push_str(&String::from_utf8_lossy(&message));
+                }
+                _ => {}
+            },
+            Err(error) => {
+                return EnvironmentLogArtifactReport {
+                    kind: "containers".to_string(),
+                    service: service.to_string(),
+                    stream: Some("combined".to_string()),
+                    source_path: None,
+                    output: output.to_string(),
+                    status: "failed".to_string(),
+                    size_bytes: None,
+                    error: Some(format!("error reading logs: {error}")),
+                };
+            }
+        }
+    }
+
+    match write_artifact_file(&output_path, &logs) {
+        Ok(size_bytes) => EnvironmentLogArtifactReport {
+            kind: "containers".to_string(),
+            service: service.to_string(),
+            stream: Some("combined".to_string()),
+            source_path: None,
+            output: output.to_string(),
+            status: "passed".to_string(),
+            size_bytes: Some(size_bytes),
+            error: None,
+        },
+        Err(error) => EnvironmentLogArtifactReport {
+            kind: "containers".to_string(),
+            service: service.to_string(),
+            stream: Some("combined".to_string()),
+            source_path: None,
+            output: output.to_string(),
+            status: "failed".to_string(),
+            size_bytes: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+/// Copy a file from a container using the docker cp command.
+async fn collect_container_file_bollard(
+    runner_root: &Path,
+    runtime: &ResolvedContainersRuntime,
+    service: &str,
+    path: &str,
+    output: &str,
+) -> EnvironmentLogArtifactReport {
+    let output_path = match resolve_report_output_path(runner_root, output) {
+        Ok(p) => p,
+        Err(error) => {
+            return EnvironmentLogArtifactReport {
+                kind: "container_file".to_string(),
+                service: service.to_string(),
+                stream: None,
+                source_path: Some(path.to_string()),
+                output: output.to_string(),
+                status: "failed".to_string(),
+                size_bytes: None,
+                error: Some(error.to_string()),
+            };
+        }
+    };
+
+    let container_id = match runtime
+        .container_ids
+        .iter()
+        .find(|(name, _)| name == service)
+        .map(|(_, id)| id.clone())
+    {
+        Some(id) => id,
+        None => {
+            return EnvironmentLogArtifactReport {
+                kind: "container_file".to_string(),
+                service: service.to_string(),
+                stream: None,
+                source_path: Some(path.to_string()),
+                output: output.to_string(),
+                status: "failed".to_string(),
+                size_bytes: None,
+                error: Some(format!("no container found for service `{service}`")),
+            };
+        }
+    };
+
+    if let Some(parent) = output_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if output_path.exists() && output_path.is_file() {
+        let _ = fs::remove_file(&output_path);
+    }
+
+    let source = format!("{container_id}:{path}");
+    match run_command(
+        "docker",
+        &[
+            "cp".to_string(),
+            source,
+            output_path.display().to_string(),
+        ],
+        None,
+    )
+    .await
+    {
+        Ok(command_output) if command_output.success() => match fs::metadata(&output_path) {
+            Ok(metadata) => EnvironmentLogArtifactReport {
+                kind: "container_file".to_string(),
+                service: service.to_string(),
+                stream: None,
+                source_path: Some(path.to_string()),
+                output: output.to_string(),
+                status: "passed".to_string(),
+                size_bytes: Some(metadata.len()),
+                error: None,
+            },
+            Err(error) => EnvironmentLogArtifactReport {
+                kind: "container_file".to_string(),
+                service: service.to_string(),
+                stream: None,
+                source_path: Some(path.to_string()),
+                output: output.to_string(),
+                status: "failed".to_string(),
+                size_bytes: None,
+                error: Some(error.to_string()),
+            },
+        },
+        Ok(command_output) => EnvironmentLogArtifactReport {
+            kind: "container_file".to_string(),
+            service: service.to_string(),
+            stream: None,
+            source_path: Some(path.to_string()),
+            output: output.to_string(),
+            status: "failed".to_string(),
+            size_bytes: None,
+            error: Some(format_command_failure("docker cp", &command_output)),
+        },
+        Err(error) => EnvironmentLogArtifactReport {
+            kind: "container_file".to_string(),
+            service: service.to_string(),
+            stream: None,
+            source_path: Some(path.to_string()),
+            output: output.to_string(),
+            status: "failed".to_string(),
+            size_bytes: None,
+            error: Some(error.to_string()),
+        },
+    }
 }
 
 fn resolve_report_output_path(runner_root: &Path, output: &str) -> Result<PathBuf> {

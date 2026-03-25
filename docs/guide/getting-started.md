@@ -15,7 +15,7 @@ cargo run -p test-runner -- <subcommand>
 - Rust 工具链，用来构建和运行 CLI
 - 一个待测试的 HTTP 服务
 - 如果用例里会访问数据库或 Redis，对应的测试实例也需要先就绪
-- 如果你要直接验证仓库里的样例，`sample-projects/.testrunner/env/docker.yaml` 已经可以让 `test-runner` 自动托管 Docker Compose 环境
+- 如果你要直接验证仓库里的样例，`sample-projects/.testrunner/env/docker.yaml`（Docker Compose 模式）或 `containers.yaml`（Testcontainers 模式）已经可以让 `test-runner` 自动托管容器环境
 
 ## 构建 CLI
 
@@ -85,7 +85,7 @@ test-runner test all --root /path/to/your-project
 
 当你已经跑通最小 smoke case 后，通常会继续进入两个高频主题：
 
-- 如果你要让 `test-runner` 自动拉起 Docker Compose、等待服务 ready、采集 MySQL 查询日志 / 慢日志，请继续阅读 [环境 DSL](/guide/environment-dsl)。
+- 如果你要让 `test-runner` 自动拉起 Docker Compose 或 Testcontainers 容器、等待服务 ready、采集 MySQL 查询日志 / 慢日志，请继续阅读 [环境 DSL](/guide/environment-dsl)。
 - 如果你要模拟“第三方稍后主动回调被测系统”，请继续阅读 [Callback](/guide/callbacks)。
 
 ## 预览这份文档站点

@@ -103,6 +103,10 @@ pub struct EnvironmentRuntimeConfig {
     pub down: Vec<String>,
     #[serde(default)]
     pub cleanup: EnvironmentRuntimeCleanupPolicy,
+    #[serde(default)]
+    pub services: Vec<ContainerServiceConfig>,
+    #[serde(default)]
+    pub network_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -110,6 +114,7 @@ pub struct EnvironmentRuntimeConfig {
 pub enum EnvironmentRuntimeKind {
     #[default]
     DockerCompose,
+    Containers,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -119,6 +124,62 @@ pub enum EnvironmentRuntimeCleanupPolicy {
     Always,
     OnSuccess,
     Never,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerServiceConfig {
+    pub name: String,
+    #[serde(default)]
+    pub image: String,
+    #[serde(default)]
+    pub build: Option<ContainerBuildConfig>,
+    #[serde(default)]
+    pub ports: Vec<String>,
+    #[serde(default, rename = "env")]
+    pub environment: IndexMap<String, String>,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub volumes: Vec<String>,
+    #[serde(default)]
+    pub extra_hosts: Vec<String>,
+    #[serde(default)]
+    pub wait_for: Option<ContainerWaitFor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerBuildConfig {
+    pub context: String,
+    #[serde(default)]
+    pub dockerfile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainerWaitFor {
+    LogMessage {
+        pattern: String,
+        #[serde(default = "default_readiness_timeout_ms")]
+        timeout_ms: u64,
+    },
+    Http {
+        port: u16,
+        #[serde(default = "default_wait_path")]
+        path: String,
+        #[serde(default = "default_http_status")]
+        expect_status: u16,
+        #[serde(default = "default_readiness_timeout_ms")]
+        timeout_ms: u64,
+        #[serde(default = "default_readiness_interval_ms")]
+        interval_ms: u64,
+    },
+    Tcp {
+        port: u16,
+        #[serde(default = "default_readiness_timeout_ms")]
+        timeout_ms: u64,
+        #[serde(default = "default_readiness_interval_ms")]
+        interval_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -527,21 +588,54 @@ fn validate_mock_steps(steps: &[Step]) -> Result<()> {
 
 fn validate_environment_config(environment: &EnvironmentConfig) -> Result<()> {
     if let Some(runtime) = &environment.runtime {
-        if runtime.project_directory.trim().is_empty() {
-            bail!("environment.runtime.project_directory cannot be empty");
-        }
-        if runtime.files.is_empty() {
-            bail!("environment.runtime.files must contain at least one compose file");
-        }
-        for file in &runtime.files {
-            if file.trim().is_empty() {
-                bail!("environment.runtime.files cannot contain empty file paths");
+        match runtime.kind {
+            EnvironmentRuntimeKind::DockerCompose => {
+                if runtime.project_directory.trim().is_empty() {
+                    bail!("environment.runtime.project_directory cannot be empty");
+                }
+                if runtime.files.is_empty() {
+                    bail!("environment.runtime.files must contain at least one compose file");
+                }
+                for file in &runtime.files {
+                    if file.trim().is_empty() {
+                        bail!("environment.runtime.files cannot contain empty file paths");
+                    }
+                }
+                if let Some(project_name) = &runtime.project_name
+                    && project_name.trim().is_empty()
+                {
+                    bail!("environment.runtime.project_name cannot be empty");
+                }
             }
-        }
-        if let Some(project_name) = &runtime.project_name
-            && project_name.trim().is_empty()
-        {
-            bail!("environment.runtime.project_name cannot be empty");
+            EnvironmentRuntimeKind::Containers => {
+                if runtime.services.is_empty() {
+                    bail!("environment.runtime.services must contain at least one container definition");
+                }
+                for service in &runtime.services {
+                    if service.name.trim().is_empty() {
+                        bail!("environment.runtime.services[].name cannot be empty");
+                    }
+                    let has_image = !service.image.trim().is_empty();
+                    let has_build = service.build.is_some();
+                    if !has_image && !has_build {
+                        bail!(
+                            "environment.runtime.services[].image or .build is required for service `{}`",
+                            service.name
+                        );
+                    }
+                    if let Some(build) = &service.build
+                        && build.context.trim().is_empty()
+                    {
+                        bail!(
+                            "environment.runtime.services[].build.context cannot be empty for service `{}`",
+                            service.name
+                        );
+                    }
+                    for port in &service.ports {
+                        validate_port_mapping(port)?;
+                    }
+                }
+            }
         }
     }
 
@@ -614,6 +708,33 @@ fn validate_readiness_timings(timeout_ms: u64, interval_ms: u64) -> Result<()> {
     }
     if interval_ms == 0 {
         bail!("environment.readiness interval_ms must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_port_mapping(port: &str) -> Result<()> {
+    let port = port.trim();
+    if port.is_empty() {
+        bail!("environment.runtime.services[].ports cannot contain empty entries");
+    }
+    // Accepted formats: "3306" (container port only, host auto-assigned)
+    // or "13306:3306" (host:container)
+    let parts: Vec<&str> = port.split(':').collect();
+    match parts.len() {
+        1 => {
+            parts[0].parse::<u16>().with_context(|| {
+                format!("invalid container port `{port}`: must be a valid port number")
+            })?;
+        }
+        2 => {
+            parts[0].parse::<u16>().with_context(|| {
+                format!("invalid host port in `{port}`: must be a valid port number")
+            })?;
+            parts[1].parse::<u16>().with_context(|| {
+                format!("invalid container port in `{port}`: must be a valid port number")
+            })?;
+        }
+        _ => bail!("invalid port mapping `{port}`: expected format `container_port` or `host_port:container_port`"),
     }
     Ok(())
 }
@@ -755,6 +876,10 @@ fn default_readiness_interval_ms() -> u64 {
     1_000
 }
 
+fn default_wait_path() -> String {
+    "/".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -825,5 +950,172 @@ logs:
                 .to_string()
                 .contains("environment.logs requires environment.runtime")
         );
+    }
+
+    #[test]
+    fn environment_config_supports_containers_runtime() {
+        let environment: EnvironmentConfig = serde_yaml::from_str(
+            r#"
+name: containers
+base_url: http://127.0.0.1:18080
+runtime:
+  kind: containers
+  services:
+    - name: mysql
+      image: mysql:8.4
+      ports:
+        - "13306:3306"
+      env:
+        MYSQL_DATABASE: app
+        MYSQL_ROOT_PASSWORD: root
+      command:
+        - --general_log=1
+      wait_for:
+        kind: log_message
+        pattern: "ready for connections"
+        timeout_ms: 30000
+    - name: redis
+      image: redis:7.2-alpine
+      ports:
+        - "16379:6379"
+      wait_for:
+        kind: tcp
+        port: 6379
+        timeout_ms: 15000
+        interval_ms: 500
+  network_name: my-test-network
+  cleanup: on_success
+"#,
+        )
+        .expect("containers environment should deserialize");
+
+        validate_environment_config(&environment).expect("containers environment should validate");
+        let runtime = environment.runtime.as_ref().expect("runtime should exist");
+        assert_eq!(runtime.kind, EnvironmentRuntimeKind::Containers);
+        assert_eq!(runtime.services.len(), 2);
+        assert_eq!(runtime.services[0].name, "mysql");
+        assert_eq!(runtime.services[0].image, "mysql:8.4");
+        assert_eq!(runtime.services[0].ports, vec!["13306:3306"]);
+        assert_eq!(runtime.services[0].environment.get("MYSQL_DATABASE").unwrap(), "app");
+        assert!(matches!(
+            runtime.services[0].wait_for,
+            Some(ContainerWaitFor::LogMessage { .. })
+        ));
+        assert!(matches!(
+            runtime.services[1].wait_for,
+            Some(ContainerWaitFor::Tcp { port: 6379, .. })
+        ));
+        assert_eq!(runtime.network_name.as_deref(), Some("my-test-network"));
+        assert_eq!(runtime.cleanup, EnvironmentRuntimeCleanupPolicy::OnSuccess);
+    }
+
+    #[test]
+    fn containers_runtime_supports_http_wait_for() {
+        let environment: EnvironmentConfig = serde_yaml::from_str(
+            r#"
+name: containers
+base_url: http://127.0.0.1:3000
+runtime:
+  kind: containers
+  services:
+    - name: app
+      image: my-app:latest
+      ports:
+        - "3000"
+      wait_for:
+        kind: http
+        port: 3000
+        path: /health
+        expect_status: 200
+        timeout_ms: 30000
+"#,
+        )
+        .expect("http wait_for should deserialize");
+
+        validate_environment_config(&environment).expect("should validate");
+        let service = &environment.runtime.as_ref().unwrap().services[0];
+        match &service.wait_for {
+            Some(ContainerWaitFor::Http { port, path, expect_status, .. }) => {
+                assert_eq!(*port, 3000);
+                assert_eq!(path, "/health");
+                assert_eq!(*expect_status, 200);
+            }
+            other => panic!("expected Http wait_for, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn containers_runtime_validation_rejects_empty_services() {
+        let environment: EnvironmentConfig = serde_yaml::from_str(
+            r#"
+name: bad
+base_url: http://127.0.0.1:3000
+runtime:
+  kind: containers
+  services: []
+"#,
+        )
+        .expect("should deserialize");
+
+        let error = validate_environment_config(&environment)
+            .expect_err("empty services should fail");
+        assert!(error.to_string().contains("at least one container definition"));
+    }
+
+    #[test]
+    fn containers_runtime_validation_rejects_no_image_or_build() {
+        let environment: EnvironmentConfig = serde_yaml::from_str(
+            r#"
+name: bad
+base_url: http://127.0.0.1:3000
+runtime:
+  kind: containers
+  services:
+    - name: mysql
+      image: ""
+"#,
+        )
+        .expect("should deserialize");
+
+        let error = validate_environment_config(&environment)
+            .expect_err("no image or build should fail");
+        assert!(error.to_string().contains("image or .build is required"));
+    }
+
+    #[test]
+    fn containers_runtime_validation_accepts_build_without_image() {
+        let environment: EnvironmentConfig = serde_yaml::from_str(
+            r#"
+name: build-test
+base_url: http://127.0.0.1:3000
+runtime:
+  kind: containers
+  services:
+    - name: app
+      build:
+        context: .
+      ports:
+        - "8080:3000"
+"#,
+        )
+        .expect("should deserialize");
+
+        validate_environment_config(&environment).expect("build without image should pass");
+        let service = &environment.runtime.as_ref().unwrap().services[0];
+        assert!(service.build.is_some());
+        assert_eq!(service.build.as_ref().unwrap().context, ".");
+    }
+
+    #[test]
+    fn port_mapping_validation_accepts_valid_formats() {
+        validate_port_mapping("3306").expect("single port");
+        validate_port_mapping("13306:3306").expect("host:container");
+    }
+
+    #[test]
+    fn port_mapping_validation_rejects_invalid_formats() {
+        assert!(validate_port_mapping("").is_err());
+        assert!(validate_port_mapping("abc").is_err());
+        assert!(validate_port_mapping("1:2:3").is_err());
     }
 }
