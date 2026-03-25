@@ -1,0 +1,19 @@
+name: payment callback flow
+description: >
+  Schedules a direct callback in one case, keeps the redis side effect alive via
+  deferred cleanup, then verifies the callback result in a follow-up helper case.
+steps:
+  - run_case:
+      id: schedule-callback
+      case: workflow/payment/schedule-callback
+      cleanup: defer
+      exports:
+        order_no: vars.order_no
+        expected_status: vars.callback_status
+  - run_case:
+      id: verify-callback
+      case: workflow/payment/assert-callback
+      cleanup: immediate
+      inputs:
+        order_no: "${workflow.steps.schedule-callback.exports.order_no}"
+        expected_status: "${workflow.steps.schedule-callback.exports.expected_status}"

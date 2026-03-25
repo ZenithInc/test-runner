@@ -136,9 +136,14 @@ Selected 2 case(s) for all cases in env `local`:
 默认摘要输出类似这样：
 
 ```text
-Run finished: 2 passed, 0 failed, 2 total (report: /path/to/.testrunner/reports/last-run.json)
-  [PASSED] user/create-user/happy-path (12)
-  [PASSED] user/get-user/smoke (34)
+==> Running 2 case(s) for all cases in env `local`
+PASS [1/2] user/create-user/happy-path (12ms)
+PASS [2/2] user/get-user/smoke (34ms)
+
+==> Summary
+  Cases: 2 passed, 0 failed, 2 total
+  Duration: 46ms
+  Report: /path/to/.testrunner/reports/last-run.json
 ```
 
 如果任一 case 失败，CLI 会在写完报告后返回非零退出码。

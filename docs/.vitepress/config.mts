@@ -22,6 +22,13 @@ export default defineConfig({
       { text: '快速开始', link: '/guide/getting-started' },
       { text: '命令行', link: '/guide/cli' },
       { text: 'DSL', link: '/guide/dsl' },
+      {
+        text: '专题',
+        items: [
+          { text: '环境 DSL', link: '/guide/environment-dsl' },
+          { text: 'Callback', link: '/guide/callbacks' }
+        ]
+      },
       { text: '工作流', link: '/workflow/' },
       { text: '示例', link: '/guide/examples' }
     ],
@@ -34,7 +41,9 @@ export default defineConfig({
             { text: '命令行使用', link: '/guide/cli' },
             { text: '项目结构', link: '/guide/project-structure' },
             { text: '配置文件', link: '/guide/configuration' },
+            { text: '环境 DSL', link: '/guide/environment-dsl' },
             { text: 'DSL 语法', link: '/guide/dsl' },
+            { text: 'Callback', link: '/guide/callbacks' },
             { text: '示例与最佳实践', link: '/guide/examples' },
             { text: '工作流使用', link: '/workflow/' }
           ]

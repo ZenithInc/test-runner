@@ -1,0 +1,34 @@
+name: workflow assert payment callback
+api: callback/payment/status
+tags:
+  - callback
+  - workflow
+  - redis
+vars:
+  order_no: workflow-callback-001
+  expected_status: SUCCESS
+setup:
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - "payment:status:{{ order_no }}"
+  - if: "${result.value == null}"
+    then:
+      - callback:
+          after_ms: 60
+          request:
+            api: callback/payment/status
+            body:
+              order_no: "{{ order_no }}"
+              status: "{{ expected_status }}"
+      - sleep:
+          ms: 120
+steps:
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - "payment:status:{{ order_no }}"
+    assert:
+      - eq: ["result.value", "expected_status"]

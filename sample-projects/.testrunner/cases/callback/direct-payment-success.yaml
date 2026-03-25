@@ -1,0 +1,36 @@
+name: direct payment callback success
+api: callback/payment/status
+tags:
+  - callback
+  - redis
+vars:
+  order_no: callback-direct-001
+setup:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - "payment:status:{{ order_no }}"
+steps:
+  - callback:
+      after_ms: 100
+      request:
+        api: callback/payment/status
+        body:
+          order_no: "{{ order_no }}"
+          status: SUCCESS
+  - sleep:
+      ms: 200
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - "payment:status:{{ order_no }}"
+    assert:
+      - eq: ["result.value", "SUCCESS"]
+teardown:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - "payment:status:{{ order_no }}"

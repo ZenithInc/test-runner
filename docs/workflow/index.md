@@ -269,11 +269,38 @@ sample-projects/.testrunner/workflows/register-login-create-order.yaml
 运行方式：
 
 ```bash
-cd sample-projects
-docker compose up --build -d
-cd ..
-
 test-runner test workflow register-login-create-order --root sample-projects --env docker
+```
+
+这里的 `docker` 环境已经可以由 `test-runner` 自动管理；执行命令时会先拉起 Compose、等待 readiness 通过，再运行 workflow，最后收集环境日志并回收容器。
+
+如果你想单独了解这套环境文件的写法和报告结构，请继续阅读 [环境 DSL](/guide/environment-dsl)。
+
+## sample-project：payment callback flow
+
+如果你想看“先安排 callback，再由后续 case 验证副作用”的写法，仓库里还提供了：
+
+```text
+sample-projects/.testrunner/workflows/payment-callback-flow.yaml
+```
+
+它会依次执行：
+
+1. `workflow/payment/schedule-callback`
+2. `workflow/payment/assert-callback`
+
+这条流程刻意没有新增 workflow 原生 step，而是复用 case DSL：
+
+- 第一个 case 用 `callback + sleep` 安排并等待一次第三方回调
+- workflow 用 `exports + inputs` 把 `order_no`、`expected_status` 传给下一个 case
+- `cleanup: defer` 让 Redis 里的 payment status 在第二个 case 断言前保持可见
+
+如果你想看 callback 在 case / mock / workflow 三个层面的完整对照，请继续阅读 [Callback](/guide/callbacks)。
+
+运行方式：
+
+```bash
+test-runner test workflow payment-callback-flow --root sample-projects --env docker --no-mock
 ```
 
 ## Dry run 和报告
@@ -290,14 +317,26 @@ test-runner test workflow register-login-create-order --root sample-projects --e
 .testrunner/reports/last-workflow-run.json
 ```
 
+如果环境文件里配置了日志采集，相关产物会写到：
+
+```text
+.testrunner/reports/env/
+```
+
 终端摘要大致类似：
 
 ```text
-Workflow `register-login-create-order` finished: 4 passed, 0 failed, 4 total (report: ...)
-  [PASSED] register → user/register/happy-path (12ms)
-  [PASSED] send-sms → user/send-sms-code/happy-path (18ms)
-  [PASSED] login → workflow/user/login-after-register (25ms)
-  [PASSED] create-order → workflow/order/create-after-login (10ms)
+==> Running workflow `register-login-create-order` in env `docker`
+PASS [1] register -> user/register/happy-path (12ms)
+PASS [2] send-sms -> user/send-sms-code/happy-path (18ms)
+PASS [3] login -> workflow/user/login-after-register (25ms)
+PASS [4] create-order -> workflow/order/create-after-login (10ms)
+
+==> Summary
+  Status: PASS
+  Steps: 4 passed, 0 failed, 4 total
+  Duration: 65ms
+  Report: /path/to/.testrunner/reports/last-workflow-run.json
 ```
 
 ## 推荐写法

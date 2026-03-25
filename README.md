@@ -1044,17 +1044,28 @@ teardown:
 终端摘要示例：
 
 ```text
-Run finished: 2 passed, 0 failed, 2 total (report: /path/to/.testrunner/reports/last-run.json)
-  [PASSED] user/create-user/happy-path (12)
-  [PASSED] user/get-user/smoke (34)
+==> Running 2 case(s) for all cases in env `local`
+PASS [1/2] user/create-user/happy-path (12ms)
+PASS [2/2] user/get-user/smoke (34ms)
+
+==> Summary
+  Cases: 2 passed, 0 failed, 2 total
+  Duration: 46ms
+  Report: /path/to/.testrunner/reports/last-run.json
 ```
 
 工作流运行结果写入 `.testrunner/reports/last-workflow-run.json`，终端摘要示例：
 
 ```text
-Workflow `auth-flow` finished: 2 passed, 0 failed, 2 total (report: ...)
-  [PASSED] send-sms → user/send-sms-code/happy-path (85ms)
-  [PASSED] login → user/login/happy-path (120ms)
+==> Running workflow `auth-flow` in env `local`
+PASS [1] send-sms -> user/send-sms-code/happy-path (85ms)
+PASS [2] login -> user/login/happy-path (120ms)
+
+==> Summary
+  Status: PASS
+  Steps: 2 passed, 0 failed, 2 total
+  Duration: 205ms
+  Report: /path/to/.testrunner/reports/last-workflow-run.json
 ```
 
 

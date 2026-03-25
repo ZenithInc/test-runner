@@ -30,8 +30,10 @@ const REDIS_RETRIES: u32 = 20;
 const SERVICE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const TOKEN_TTL_SECONDS: u64 = 3600;
 const SMS_CODE_TTL_SECONDS: u64 = 300;
+const PAYMENT_STATUS_TTL_SECONDS: u64 = 600;
 const TOKEN_KEY_PREFIX: &str = "auth:token:";
 const SMS_CODE_KEY_PREFIX: &str = "sms:code:";
+const PAYMENT_STATUS_KEY_PREFIX: &str = "payment:status:";
 
 #[derive(Clone)]
 struct AppState {
@@ -39,6 +41,7 @@ struct AppState {
     redis: Option<redis::Client>,
     jwt_secret: String,
     sms_provider_base_url: Option<String>,
+    payment_provider_base_url: Option<String>,
     http_client: reqwest::Client,
 }
 
@@ -82,6 +85,37 @@ struct SendSmsCodeRequest {
     phone: String,
     #[serde(default)]
     provider_base_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatePaymentViaProviderRequest {
+    order_no: String,
+    #[serde(default)]
+    provider_base_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreatePaymentViaProviderResponse {
+    order_no: String,
+    status: String,
+    provider_request_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PaymentProviderRequest {
+    order_no: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaymentProviderResponse {
+    accepted: bool,
+    request_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PaymentStatusCallbackRequest {
+    order_no: String,
+    status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,11 +260,17 @@ async fn main() -> Result<()> {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        payment_provider_base_url: env::var("PAYMENT_PROVIDER_BASE_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
         http_client,
     };
     let app = Router::new()
         .route("/health", get(health))
         .route("/orders", post(create_order))
+        .route("/payments/provider/create", post(create_payment_via_provider))
+        .route("/callbacks/payments/status", post(receive_payment_status_callback))
         .route("/register", post(register))
         .route("/login", post(login))
         .route("/send-sms-code", post(send_sms_code))
@@ -382,6 +422,54 @@ async fn send_sms_code(
             provider_request_id: provider_response.request_id,
         }),
     ))
+}
+
+async fn create_payment_via_provider(
+    State(state): State<AppState>,
+    Json(payload): Json<CreatePaymentViaProviderRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(redis) = state.redis.as_ref() else {
+        return Err(ApiError::service_unavailable(
+            "redis is not configured; start the sample with docker compose or set REDIS_URL",
+        ));
+    };
+
+    let order_no = normalize_order_no(payload.order_no)?;
+    let provider_base_url = resolve_payment_provider_base_url(payload.provider_base_url, &state)?;
+    let provider_response =
+        call_payment_provider(&state.http_client, &provider_base_url, &order_no).await?;
+
+    if !provider_response.accepted {
+        return Err(ApiError::bad_gateway("payment provider rejected the request"));
+    }
+
+    store_payment_status(redis, &order_no, "PENDING").await?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CreatePaymentViaProviderResponse {
+            order_no,
+            status: "PENDING".to_string(),
+            provider_request_id: provider_response.request_id,
+        }),
+    ))
+}
+
+async fn receive_payment_status_callback(
+    State(state): State<AppState>,
+    Json(payload): Json<PaymentStatusCallbackRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(redis) = state.redis.as_ref() else {
+        return Err(ApiError::service_unavailable(
+            "redis is not configured; start the sample with docker compose or set REDIS_URL",
+        ));
+    };
+
+    let order_no = normalize_order_no(payload.order_no)?;
+    let status = normalize_payment_status(payload.status)?;
+    store_payment_status(redis, &order_no, &status).await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn parse_port() -> Result<u16> {
@@ -579,6 +667,30 @@ async fn store_verification_code(
     Ok(())
 }
 
+async fn store_payment_status(
+    client: &redis::Client,
+    order_no: &str,
+    status: &str,
+) -> Result<(), ApiError> {
+    let key = payment_status_key(order_no);
+    let mut connection = client
+        .get_multiplexed_tokio_connection()
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to open redis connection: {error}")))?;
+
+    let result: redis::RedisResult<String> = redis::cmd("SETEX")
+        .arg(&key)
+        .arg(PAYMENT_STATUS_TTL_SECONDS)
+        .arg(status)
+        .query_async(&mut connection)
+        .await;
+    result.map_err(|error| {
+        ApiError::internal(format!("failed to store payment status in redis: {error}"))
+    })?;
+
+    Ok(())
+}
+
 async fn consume_verification_code(
     client: &redis::Client,
     phone: &str,
@@ -657,6 +769,38 @@ async fn call_sms_provider(
         })
 }
 
+async fn call_payment_provider(
+    http_client: &reqwest::Client,
+    provider_base_url: &str,
+    order_no: &str,
+) -> Result<PaymentProviderResponse, ApiError> {
+    let url = format!("{}/payments/create", provider_base_url.trim_end_matches('/'));
+    let response = http_client
+        .post(&url)
+        .json(&PaymentProviderRequest {
+            order_no: order_no.to_string(),
+        })
+        .send()
+        .await
+        .map_err(|error| {
+            ApiError::bad_gateway(format!("failed to call payment provider: {error}"))
+        })?;
+
+    if !response.status().is_success() {
+        return Err(ApiError::bad_gateway(format!(
+            "payment provider returned HTTP {}",
+            response.status()
+        )));
+    }
+
+    response
+        .json::<PaymentProviderResponse>()
+        .await
+        .map_err(|error| {
+            ApiError::bad_gateway(format!("failed to parse payment provider response: {error}"))
+        })
+}
+
 fn resolve_sms_provider_base_url(
     request_provider_base_url: Option<String>,
     state: &AppState,
@@ -674,6 +818,26 @@ fn resolve_sms_provider_base_url(
 
     Err(ApiError::service_unavailable(
         "sms provider is not configured; pass provider_base_url or set SMS_PROVIDER_BASE_URL",
+    ))
+}
+
+fn resolve_payment_provider_base_url(
+    request_provider_base_url: Option<String>,
+    state: &AppState,
+) -> Result<String, ApiError> {
+    if let Some(value) = request_provider_base_url
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(value);
+    }
+
+    if let Some(value) = &state.payment_provider_base_url {
+        return Ok(value.clone());
+    }
+
+    Err(ApiError::service_unavailable(
+        "payment provider is not configured; pass provider_base_url or set PAYMENT_PROVIDER_BASE_URL",
     ))
 }
 
@@ -725,6 +889,10 @@ fn sms_code_key(phone: &str) -> String {
     format!("{SMS_CODE_KEY_PREFIX}{phone}")
 }
 
+fn payment_status_key(order_no: &str) -> String {
+    format!("{PAYMENT_STATUS_KEY_PREFIX}{order_no}")
+}
+
 fn normalize_name(value: String) -> Result<String, ApiError> {
     let name = value.trim();
     if name.is_empty() {
@@ -756,6 +924,24 @@ fn normalize_phone(value: String) -> Result<String, ApiError> {
     }
 
     Ok(phone.to_string())
+}
+
+fn normalize_order_no(value: String) -> Result<String, ApiError> {
+    let order_no = value.trim();
+    if order_no.is_empty() {
+        return Err(ApiError::bad_request("order_no is required"));
+    }
+
+    Ok(order_no.to_string())
+}
+
+fn normalize_payment_status(value: String) -> Result<String, ApiError> {
+    let status = value.trim().to_ascii_uppercase();
+    if status.is_empty() {
+        return Err(ApiError::bad_request("status is required"));
+    }
+
+    Ok(status)
 }
 
 fn normalize_optional_text(value: Option<String>) -> Option<String> {

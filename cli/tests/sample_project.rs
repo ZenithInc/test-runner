@@ -6,6 +6,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::time::sleep;
@@ -23,6 +24,13 @@ fn workspace_root() -> PathBuf {
 
 fn sample_project_root() -> PathBuf {
     workspace_root().join("sample-projects")
+}
+
+fn sample_project_docker_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("sample project docker lock")
 }
 
 #[tokio::test]
@@ -49,8 +57,9 @@ async fn sample_health_service_passes_health_case() {
         ])
         .assert()
         .success()
-        .stdout(contains("Run finished: 1 passed, 0 failed, 1 total"))
-        .stdout(contains("[PASSED] system/health/smoke"));
+        .stdout(contains("==> Running 1 case(s) for api `system/health` in env `it`"))
+        .stdout(contains("PASS [1/1] system/health/smoke"))
+        .stdout(contains("Cases: 1 passed, 0 failed, 1 total"));
 }
 
 #[tokio::test]
@@ -77,8 +86,9 @@ async fn sample_health_service_passes_order_expression_case() {
         ])
         .assert()
         .success()
-        .stdout(contains("Run finished: 1 passed, 0 failed, 1 total"))
-        .stdout(contains("[PASSED] order/create/expression-happy-path"));
+        .stdout(contains("==> Running 1 case(s) for api `order/create` in env `it`"))
+        .stdout(contains("PASS [1/1] order/create/expression-happy-path"))
+        .stdout(contains("Cases: 1 passed, 0 failed, 1 total"));
 }
 
 #[tokio::test]
@@ -124,15 +134,104 @@ async fn sample_project_all_cases_pass() {
         ])
         .assert()
         .success()
-        .stdout(contains("Run finished: 8 passed, 0 failed, 8 total"))
-        .stdout(contains("[PASSED] system/health/smoke"))
-        .stdout(contains("[PASSED] order/create/expression-happy-path"))
-        .stdout(contains("[PASSED] user/send-sms-code/happy-path"))
-        .stdout(contains("[PASSED] user/register/happy-path"))
-        .stdout(contains("[PASSED] user/login/happy-path"))
-        .stdout(contains("[PASSED] user/login/invalid-sms-code"))
-        .stdout(contains("[PASSED] workflow/user/login-after-register"))
-        .stdout(contains("[PASSED] workflow/order/create-after-login"));
+        .stdout(contains("==> Running 12 case(s) for all cases in env `it`"))
+        .stdout(contains("Cases: 12 passed, 0 failed, 12 total"))
+        .stdout(contains("callback/direct-payment-success"))
+        .stdout(contains("payment/provider-callback-via-mock"))
+        .stdout(contains("system/health/smoke"))
+        .stdout(contains("order/create/expression-happy-path"))
+        .stdout(contains("user/send-sms-code/happy-path"))
+        .stdout(contains("user/register/happy-path"))
+        .stdout(contains("user/login/happy-path"))
+        .stdout(contains("user/login/invalid-sms-code"))
+        .stdout(contains("workflow/user/login-after-register"))
+        .stdout(contains("workflow/order/create-after-login"));
+}
+
+#[tokio::test]
+async fn sample_project_direct_callback_case_passes() {
+    let temp = tempdir().expect("tempdir");
+    let runner_root = temp.path();
+
+    let app_port = reserve_port();
+    let mysql_port = reserve_port();
+    let redis_port = reserve_port();
+    prepare_full_suite_runner(
+        runner_root,
+        app_port,
+        reserve_port(),
+        mysql_port,
+        redis_port,
+    )
+    .expect("prepare callback runner root");
+
+    let _dependency_stack = start_dependency_stack(temp.path(), mysql_port, redis_port);
+    let mut service = ChildGuard(start_sample_service_with_env(
+        app_port,
+        &[(
+            "REDIS_URL".to_string(),
+            format!("redis://127.0.0.1:{redis_port}/0"),
+        )],
+    ));
+    wait_for_service(&mut service.0, app_port).await;
+
+    Command::new(binary())
+        .args([
+            "test",
+            "dir",
+            "callback",
+            "--case",
+            "direct-payment-success",
+            "--root",
+            runner_root.to_str().expect("utf8"),
+            "--env",
+            "it",
+            "--no-mock",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("Callbacks: 1 passed, 0 failed, 1 total"))
+        .stdout(contains("PASS [1/1] callback/direct-payment-success"))
+        .stdout(contains("PASS #1 case:callback/direct-payment-success ->"));
+}
+
+#[tokio::test]
+async fn sample_project_mock_callback_case_passes() {
+    let temp = tempdir().expect("tempdir");
+    let runner_root = temp.path();
+
+    let app_port = reserve_port();
+    let mock_port = reserve_port();
+    let mysql_port = reserve_port();
+    let redis_port = reserve_port();
+    prepare_full_suite_runner(runner_root, app_port, mock_port, mysql_port, redis_port)
+        .expect("prepare mock callback runner root");
+
+    let _dependency_stack = start_dependency_stack(temp.path(), mysql_port, redis_port);
+    let mut service = ChildGuard(start_sample_service_with_env(
+        app_port,
+        &[(
+            "REDIS_URL".to_string(),
+            format!("redis://127.0.0.1:{redis_port}/0"),
+        )],
+    ));
+    wait_for_service(&mut service.0, app_port).await;
+
+    Command::new(binary())
+        .args([
+            "test",
+            "api",
+            "payment/provider/create",
+            "--root",
+            runner_root.to_str().expect("utf8"),
+            "--env",
+            "it",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("Callbacks: 1 passed, 0 failed, 1 total"))
+        .stdout(contains("PASS [1/1] payment/provider-callback-via-mock"))
+        .stdout(contains("PASS #1 mock:POST /payments/create ->"));
 }
 
 #[test]
@@ -147,7 +246,7 @@ fn sample_project_dry_run_lists_all_cases() {
         ])
         .assert()
         .success()
-        .stdout(contains("Selected 8 case(s)"));
+        .stdout(contains("Selected 12 case(s)"));
 }
 
 #[test]
@@ -292,9 +391,11 @@ async fn workflow_failure_branch_is_executed() {
         ])
         .assert()
         .failure()
-        .stdout(contains("Workflow `failure-branch-flow` finished:"))
-        .stdout(contains("[FAILED] failing-check"))
-        .stdout(contains("[PASSED] fallback"))
+        .stdout(contains("==> Running workflow `failure-branch-flow` in env `it`"))
+        .stdout(contains("Status: FAIL"))
+        .stdout(contains("Steps: 2 passed, 1 failed, 3 total"))
+        .stdout(contains("FAIL [2] failing-check -> workflow/cache/assert-wrong"))
+        .stdout(contains("PASS [3] fallback -> workflow/cache/assert-present"))
         .stdout(contains("should-not-run").not());
 
     assert_eq!(
@@ -358,9 +459,10 @@ async fn workflow_executes_with_deferred_cleanup() {
         ])
         .assert()
         .success()
-        .stdout(contains("Workflow `deferred-cache-flow` finished:"))
-        .stdout(contains("[PASSED] seed"))
-        .stdout(contains("[PASSED] verify"));
+        .stdout(contains("==> Running workflow `deferred-cache-flow` in env `it`"))
+        .stdout(contains("PASS [1] seed -> workflow/cache/seed"))
+        .stdout(contains("PASS [2] verify -> workflow/cache/assert-present"))
+        .stdout(contains("Steps: 2 passed, 0 failed, 2 total"));
 
     assert_eq!(
         redis_get_string(redis_port, "workflow:test:key")
@@ -414,11 +516,154 @@ async fn sample_project_register_login_create_order_workflow_passes() {
         ])
         .assert()
         .success()
-        .stdout(contains("Workflow `register-login-create-order` finished:"))
-        .stdout(contains("[PASSED] register"))
-        .stdout(contains("[PASSED] send-sms"))
-        .stdout(contains("[PASSED] login"))
-        .stdout(contains("[PASSED] create-order"));
+        .stdout(contains("==> Running workflow `register-login-create-order` in env `it`"))
+        .stdout(contains("PASS [1] register -> user/register/happy-path"))
+        .stdout(contains("PASS [2] send-sms -> user/send-sms-code/happy-path"))
+        .stdout(contains("PASS [3] login -> workflow/user/login-after-register"))
+        .stdout(contains("PASS [4] create-order -> workflow/order/create-after-login"))
+        .stdout(contains("Steps: 4 passed, 0 failed, 4 total"));
+}
+
+#[tokio::test]
+async fn sample_project_payment_callback_workflow_passes() {
+    let temp = tempdir().expect("tempdir");
+    let runner_root = temp.path();
+
+    let app_port = reserve_port();
+    let mysql_port = reserve_port();
+    let redis_port = reserve_port();
+    prepare_full_suite_runner(
+        runner_root,
+        app_port,
+        reserve_port(),
+        mysql_port,
+        redis_port,
+    )
+    .expect("prepare payment callback workflow root");
+
+    let _dependency_stack = start_dependency_stack(temp.path(), mysql_port, redis_port);
+    let mut service = ChildGuard(start_sample_service_with_env(
+        app_port,
+        &[(
+            "REDIS_URL".to_string(),
+            format!("redis://127.0.0.1:{redis_port}/0"),
+        )],
+    ));
+    wait_for_service(&mut service.0, app_port).await;
+
+    Command::new(binary())
+        .args([
+            "test",
+            "workflow",
+            "payment-callback-flow",
+            "--root",
+            runner_root.to_str().expect("utf8"),
+            "--env",
+            "it",
+            "--no-mock",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("==> Running workflow `payment-callback-flow` in env `it`"))
+        .stdout(contains("PASS [1] schedule-callback -> workflow/payment/schedule-callback"))
+        .stdout(contains("PASS [2] verify-callback -> workflow/payment/assert-callback"))
+        .stdout(contains("Steps: 2 passed, 0 failed, 2 total"))
+        .stdout(contains("Callbacks: 1 passed, 0 failed, 1 total"))
+        .stdout(contains("PASS #1 case:workflow/payment/schedule-callback ->"));
+}
+
+#[test]
+fn sample_project_docker_env_managed_api_run_passes() {
+    let _lock = sample_project_docker_lock();
+    let _cleanup = SampleProjectDockerCleanupGuard;
+
+    cleanup_sample_project_docker_env();
+
+    Command::new(binary())
+        .args([
+            "test",
+            "api",
+            "system/health",
+            "--root",
+            sample_project_root().to_str().expect("utf8"),
+            "--env",
+            "docker",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("==> Running 1 case(s) for api `system/health` in env `docker`"))
+        .stdout(contains("PASS [1/1] system/health/smoke"))
+        .stdout(contains("Cases: 1 passed, 0 failed, 1 total"))
+        .stdout(contains("Readiness: 2 passed, 0 failed"));
+
+    let report = read_json_report(&sample_project_root().join(".testrunner/reports/last-run.json"));
+    assert_eq!(report["environment"], "docker");
+    assert_eq!(
+        report["environment_artifacts"]["runtime"]["startup_status"],
+        "passed"
+    );
+    assert_eq!(
+        report["environment_artifacts"]["runtime"]["shutdown_status"],
+        "passed"
+    );
+    assert!(
+        report["environment_artifacts"]["readiness"]
+            .as_array()
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+    );
+}
+
+#[test]
+fn sample_project_docker_env_managed_workflow_collects_environment_logs() {
+    let _lock = sample_project_docker_lock();
+    let _cleanup = SampleProjectDockerCleanupGuard;
+
+    cleanup_sample_project_docker_env();
+
+    Command::new(binary())
+        .args([
+            "test",
+            "workflow",
+            "register-login-create-order",
+            "--root",
+            sample_project_root().to_str().expect("utf8"),
+            "--env",
+            "docker",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("==> Running workflow `register-login-create-order` in env `docker`"))
+        .stdout(contains("PASS [1] register -> user/register/happy-path"))
+        .stdout(contains("PASS [2] send-sms -> user/send-sms-code/happy-path"))
+        .stdout(contains("PASS [3] login -> workflow/user/login-after-register"))
+        .stdout(contains("PASS [4] create-order -> workflow/order/create-after-login"))
+        .stdout(contains("Steps: 4 passed, 0 failed, 4 total"))
+        .stdout(contains("Logs: 3 collected, 0 failed"));
+
+    let report = read_json_report(
+        &sample_project_root().join(".testrunner/reports/last-workflow-run.json"),
+    );
+    let logs = report["environment_artifacts"]["logs"]
+        .as_array()
+        .expect("environment logs array");
+    assert_eq!(logs.len(), 3);
+    assert!(logs.iter().all(|log| log["status"] == "passed"));
+    assert!(
+        sample_project_root()
+            .join(".testrunner/reports/env/app.log")
+            .exists()
+    );
+    assert!(
+        sample_project_root()
+            .join(".testrunner/reports/env/mysql-query.log")
+            .exists()
+    );
+    assert!(
+        sample_project_root()
+            .join(".testrunner/reports/env/mysql-slow.log")
+            .exists()
+    );
 }
 
 struct ChildGuard(Child);
@@ -429,6 +674,14 @@ impl Drop for ChildGuard {
             let _ = self.0.kill();
         }
         let _ = self.0.wait();
+    }
+}
+
+struct SampleProjectDockerCleanupGuard;
+
+impl Drop for SampleProjectDockerCleanupGuard {
+    fn drop(&mut self) {
+        cleanup_sample_project_docker_env();
     }
 }
 
@@ -517,6 +770,30 @@ fn docker_compose(
     command.output()
 }
 
+fn cleanup_sample_project_docker_env() {
+    let compose_file = sample_project_root().join("docker-compose.yml");
+    match docker_compose(
+        "test-runner-sample",
+        &compose_file,
+        &["down", "-v", "--remove-orphans"],
+    ) {
+        Ok(output) if !output.status.success() => {
+            eprintln!(
+                "sample project docker cleanup failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("failed to clean sample project docker env: {error}"),
+    }
+}
+
+fn read_json_report(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(path).expect("read report"))
+        .expect("parse report json")
+}
+
 fn write_dependency_compose(
     compose_file: &Path,
     mysql_port: u16,
@@ -544,7 +821,7 @@ fn prepare_full_suite_runner(
     fs::write(
         runner_root.join(".testrunner/env/it.yaml"),
         format!(
-            "name: it\nbase_url: http://127.0.0.1:{app_port}\nheaders:\n  x-test-env: it\nvariables:\n  service_base_url: http://127.0.0.1:{app_port}\n  sms_provider_base_url: http://127.0.0.1:{mock_port}\n"
+            "name: it\nbase_url: http://127.0.0.1:{app_port}\nheaders:\n  x-test-env: it\nvariables:\n  service_base_url: http://127.0.0.1:{app_port}\n  sms_provider_base_url: http://127.0.0.1:{mock_port}\n  payment_provider_base_url: http://127.0.0.1:{mock_port}\n"
         ),
     )?;
     fs::write(

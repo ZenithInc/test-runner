@@ -1,0 +1,21 @@
+method: POST
+path: /payments/create
+extract:
+  order_no: request.json.order_no
+steps:
+  - set:
+      request_id: "mock-payment-{{ vars.order_no }}"
+  - callback:
+      after_ms: 120
+      request:
+        api: callback/payment/status
+        body:
+          order_no: "{{ vars.order_no }}"
+          status: SUCCESS
+respond:
+  status: 202
+  headers:
+    content-type: application/json
+  body:
+    accepted: true
+    request_id: "{{ vars.request_id }}"

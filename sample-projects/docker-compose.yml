@@ -1,6 +1,13 @@
 services:
   mysql:
     image: mysql:8.4
+    command:
+      - --general_log=1
+      - --general_log_file=/var/lib/mysql/general.log
+      - --slow_query_log=1
+      - --slow_query_log_file=/var/lib/mysql/slow.log
+      - --long_query_time=0
+      - --log_output=FILE
     environment:
       MYSQL_DATABASE: app
       MYSQL_USER: app

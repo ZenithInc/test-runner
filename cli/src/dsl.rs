@@ -30,6 +30,8 @@ pub enum Step {
     Sql(SqlExecStep),
     Redis(RedisCommandStep),
     Request(RequestStep),
+    Callback(CallbackStep),
+    Sleep(SleepStep),
     QueryDb(QueryDbStep),
     QueryRedis(QueryRedisStep),
     Conditional(ConditionalStep),
@@ -74,6 +76,18 @@ pub struct RequestStep {
     pub request: RequestSpec,
     pub extract: IndexMap<String, String>,
     pub assertions: Vec<Assertion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CallbackStep {
+    #[serde(default)]
+    pub after_ms: u64,
+    pub request: RequestSpec,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SleepStep {
+    pub ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -197,6 +211,14 @@ fn parse_step(value: YamlValue) -> Result<Step> {
         }));
     }
 
+    if let Some(raw) = get_value(mapping, "callback") {
+        return Ok(Step::Callback(serde_yaml::from_value(raw.clone())?));
+    }
+
+    if let Some(raw) = get_value(mapping, "sleep") {
+        return Ok(Step::Sleep(serde_yaml::from_value(raw.clone())?));
+    }
+
     if let Some(raw) = get_value(mapping, "query_db") {
         let query: QueryDbSpec = serde_yaml::from_value(raw.clone())?;
         validate_sqlish(query.sql.as_ref(), query.file.as_ref(), "query_db")?;
@@ -303,5 +325,44 @@ fn validate_sqlish(sql: Option<&String>, file: Option<&String>, step_name: &str)
         Ok(())
     } else {
         bail!("{step_name} requires either `sql` or `file`")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_supports_callback_and_sleep_steps() {
+        let case: CaseFile = serde_yaml::from_str(
+            r#"
+name: callback case
+api: system/health
+steps:
+  - callback:
+      after_ms: 250
+      request:
+        api: callback/payment/status
+        body:
+          order_no: "order-1"
+          status: SUCCESS
+  - sleep:
+      ms: 400
+"#,
+        )
+        .expect("case should deserialize");
+
+        assert_eq!(case.steps.len(), 2);
+        match &case.steps[0] {
+            Step::Callback(step) => {
+                assert_eq!(step.after_ms, 250);
+                assert_eq!(step.request.api.as_deref(), Some("callback/payment/status"));
+            }
+            other => panic!("expected callback step, got {other:?}"),
+        }
+        match &case.steps[1] {
+            Step::Sleep(step) => assert_eq!(step.ms, 400),
+            other => panic!("expected sleep step, got {other:?}"),
+        }
     }
 }

@@ -1,0 +1,41 @@
+name: payment provider callback via mock
+api: payment/provider/create
+tags:
+  - callback
+  - mock
+  - redis
+vars:
+  order_no: callback-mock-001
+setup:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - "payment:status:{{ order_no }}"
+steps:
+  - request:
+      api: payment/provider/create
+      base_url: "${env.variables.service_base_url}"
+      body:
+        order_no: "{{ order_no }}"
+        provider_base_url: "${env.variables.payment_provider_base_url}"
+    assert:
+      - eq: ["response.status", 202]
+      - eq: ["response.json.order_no", "order_no"]
+      - eq: ["response.json.status", "PENDING"]
+      - not_empty: ["response.json.provider_request_id"]
+  - sleep:
+      ms: 300
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - "payment:status:{{ order_no }}"
+    assert:
+      - eq: ["result.value", "SUCCESS"]
+teardown:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - "payment:status:{{ order_no }}"

@@ -139,6 +139,23 @@ steps:
 
 这里用到的 `sample-projects/.testrunner/mocks/routes/sms-send.yaml` 现在也是一个动态 Mock 示例：它会读取 `request.json.phone` 和 `request.json.message`，再通过 `when`、`extract`、`if`、`respond` 生成短信服务响应。
 
+## 一个 callback case 和一个 mock-triggered callback
+
+如果你要模拟“第三方稍后主动回调被测系统”，可以看两个样例：
+
+1. `sample-projects/.testrunner/cases/callback/direct-payment-success.yaml`
+2. `sample-projects/.testrunner/cases/payment/provider-callback-via-mock.yaml`
+
+前者直接在 case 里使用 `callback + sleep + query_redis`。
+
+后者则更贴近真实链路：
+
+- 被测服务先请求 mock 的 `/payments/create`
+- mock route `payments-create.yaml` 在返回 `202` 的同时安排 callback
+- case 通过 `sleep` 等待后，再去 Redis 断言支付状态已经变成 `SUCCESS`
+
+如果你想系统看这两种 callback 模式，以及它们在 workflow 里的组合方式，请继续阅读 [Callback](/guide/callbacks)。
+
 ## 一个跨 case 的 workflow
 
 `sample-projects/.testrunner/workflows/register-login-create-order.yaml` 展示了一条真正跨 case 的流程：
@@ -159,20 +176,14 @@ steps:
 
 ```bash
 test-runner test workflow register-login-create-order --root sample-projects --env docker
+test-runner test workflow payment-callback-flow --root sample-projects --env docker --no-mock
 ```
 
 如果你要看 workflow YAML 字段和 cleanup 策略的完整说明，请继续阅读顶部导航里的「工作流」页面。
 
 ## 启动仓库内样例服务
 
-推荐直接使用 Docker Compose：
-
-```bash
-cd sample-projects
-docker compose up --build -d
-```
-
-然后回到仓库根目录执行：
+`sample-projects/.testrunner/env/docker.yaml` 现在已经声明了 Docker Compose 生命周期，因此直接运行 `test-runner` 即可自动完成环境启动、readiness 检查、日志采集和回收：
 
 ```bash
 test-runner test api system/health --root sample-projects --env docker
@@ -183,11 +194,10 @@ test-runner test api user/send-sms-code --root sample-projects --env docker
 test-runner test workflow register-login-create-order --root sample-projects --env docker
 ```
 
-清理环境：
+如果你只是想看看执行计划，不想真的启动环境，也可以继续使用：
 
 ```bash
-cd sample-projects
-docker compose down -v
+test-runner test workflow register-login-create-order --root sample-projects --env docker --dry-run
 ```
 
 ## 报告文件示例
@@ -197,6 +207,14 @@ docker compose down -v
 ```text
 sample-projects/.testrunner/reports/last-run.json
 ```
+
+如果环境声明里配置了 `logs:`，对应的日志文件也会落到：
+
+```text
+sample-projects/.testrunner/reports/env/
+```
+
+如果你想看这套环境文件的完整 DSL、执行顺序和 `environment_artifacts` 报告结构，请继续阅读 [环境 DSL](/guide/environment-dsl)。
 
 报告结构大致如下：
 

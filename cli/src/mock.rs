@@ -15,8 +15,14 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use url::form_urlencoded;
 
-use crate::config::{LoadedProject, MockResponseDefinition, MockRouteDefinition, load_data_tree};
-use crate::dsl::{Assertion, ConditionalStep, Step};
+use crate::callback::{
+    CallbackRuntime, RequestPreparationContext, ScheduledCallback, prepare_callback_request,
+};
+use crate::config::{
+    LoadedProject, MockResponseDefinition, MockRouteDefinition, environment_context_value,
+    load_data_tree,
+};
+use crate::dsl::{Assertion, CallbackStep, ConditionalStep, Step};
 use crate::runtime::{RuntimeContext, assertions_match, value_to_string};
 
 #[derive(Debug)]
@@ -42,6 +48,8 @@ struct MockState {
     routes: Arc<Vec<MockRoute>>,
     base_root: Arc<Map<String, Value>>,
     runner_root: Arc<PathBuf>,
+    request_context: RequestPreparationContext,
+    callback_runtime: CallbackRuntime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,11 +59,17 @@ struct RenderedMockResponse {
     body: String,
 }
 
-pub async fn start(project: &LoadedProject) -> Result<MockServerHandle> {
+pub async fn start(
+    project: &LoadedProject,
+    request_context: RequestPreparationContext,
+    callback_runtime: CallbackRuntime,
+) -> Result<MockServerHandle> {
     let state = MockState {
         routes: Arc::new(load_routes(project)?),
         base_root: Arc::new(build_base_root(project)?),
         runner_root: Arc::new(project.runner_root.clone()),
+        request_context,
+        callback_runtime,
     };
 
     let address = format!(
@@ -142,7 +156,13 @@ fn resolve_request(
         }
 
         context.apply_extracts(&route.extract)?;
-        execute_mock_steps(&route.steps, &mut context)?;
+        execute_mock_steps(
+            &route.steps,
+            &mut context,
+            &state.request_context,
+            &state.callback_runtime,
+            &format!("mock:{} {}", route.method.as_str(), route.path),
+        )?;
         return Ok(Some(render_route_response(
             &state.runner_root,
             &route.response,
@@ -153,7 +173,13 @@ fn resolve_request(
     Ok(None)
 }
 
-fn execute_mock_steps(steps: &[Step], context: &mut RuntimeContext) -> Result<()> {
+fn execute_mock_steps(
+    steps: &[Step],
+    context: &mut RuntimeContext,
+    request_context: &RequestPreparationContext,
+    callback_runtime: &CallbackRuntime,
+    source: &str,
+) -> Result<()> {
     for step in steps {
         match step {
             Step::Set { values } => {
@@ -162,20 +188,47 @@ fn execute_mock_steps(steps: &[Step], context: &mut RuntimeContext) -> Result<()
                     context.set_var(key, resolved);
                 }
             }
-            Step::Conditional(step) => execute_conditional_step(step, context)?,
-            _ => bail!("mock route steps currently support only `set` and `if`"),
+            Step::Callback(step) => {
+                schedule_mock_callback(step, context, request_context, callback_runtime, source)?;
+            }
+            Step::Conditional(step) => {
+                execute_conditional_step(step, context, request_context, callback_runtime, source)?
+            }
+            _ => bail!("mock route steps currently support only `set`, `callback` and `if`"),
         }
     }
     Ok(())
 }
 
-fn execute_conditional_step(step: &ConditionalStep, context: &mut RuntimeContext) -> Result<()> {
+fn execute_conditional_step(
+    step: &ConditionalStep,
+    context: &mut RuntimeContext,
+    request_context: &RequestPreparationContext,
+    callback_runtime: &CallbackRuntime,
+    source: &str,
+) -> Result<()> {
     let branch = if context.evaluate_condition(&step.condition)? {
         &step.then_steps
     } else {
         &step.else_steps
     };
-    execute_mock_steps(branch, context)
+    execute_mock_steps(branch, context, request_context, callback_runtime, source)
+}
+
+fn schedule_mock_callback(
+    step: &CallbackStep,
+    context: &mut RuntimeContext,
+    request_context: &RequestPreparationContext,
+    callback_runtime: &CallbackRuntime,
+    source: &str,
+) -> Result<()> {
+    let request = prepare_callback_request(request_context, &step.request, context)?;
+    callback_runtime.schedule(ScheduledCallback {
+        source: source.to_string(),
+        after_ms: step.after_ms,
+        request,
+    });
+    Ok(())
 }
 
 fn build_base_root(project: &LoadedProject) -> Result<Map<String, Value>> {
@@ -188,12 +241,7 @@ fn build_base_root(project: &LoadedProject) -> Result<Map<String, Value>> {
     );
     root.insert(
         "env".to_string(),
-        json!({
-            "name": project.environment.name,
-            "base_url": project.environment.base_url,
-            "headers": project.environment.headers,
-            "variables": project.environment.variables,
-        }),
+        environment_context_value(&project.environment_name, &project.environment)?,
     );
     root.insert(
         "data".to_string(),
@@ -407,6 +455,12 @@ mod tests {
             routes: Arc::new(routes),
             base_root: Arc::new(Map::new()),
             runner_root: Arc::new(runner_root),
+            request_context: RequestPreparationContext {
+                apis: Arc::new(IndexMap::new()),
+                environment_base_url: "http://127.0.0.1:3000".to_string(),
+                environment_headers: IndexMap::new(),
+            },
+            callback_runtime: CallbackRuntime::new(reqwest::Client::new()),
         }
     }
 
@@ -562,5 +616,114 @@ mod tests {
             response.body,
             "{\n  \"provider\": \"mock-sms\",\n  \"request_id\": \"vip-request\"\n}\n"
         );
+    }
+
+    #[tokio::test]
+    async fn dynamic_mock_route_can_schedule_callbacks() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::Mutex;
+
+        let temp = tempdir().expect("tempdir");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind callback target");
+        let addr = listener.local_addr().expect("local addr");
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let state = received.clone();
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/callbacks/payment",
+                post(move |Json(payload): Json<Value>| {
+                    let state = state.clone();
+                    async move {
+                        state.lock().expect("received lock").push(payload);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.expect("serve callback target");
+        });
+
+        let callback_runtime = CallbackRuntime::new(reqwest::Client::new());
+        let request_context = RequestPreparationContext {
+            apis: Arc::new(IndexMap::from([(
+                "callback/payment/status".to_string(),
+                crate::config::LoadedApi {
+                    id: "callback/payment/status".to_string(),
+                    relative_path: PathBuf::from("apis/callback/payment/status.yaml"),
+                    definition: crate::config::ApiDefinition {
+                        name: "Payment callback".to_string(),
+                        method: "POST".to_string(),
+                        path: "/callbacks/payment".to_string(),
+                        base_url: Some(format!("http://{addr}")),
+                        headers: IndexMap::from([(
+                            "content-type".to_string(),
+                            "application/json".to_string(),
+                        )]),
+                        query: IndexMap::new(),
+                        body: None,
+                        timeout_ms: None,
+                    },
+                },
+            )])),
+            environment_base_url: format!("http://{addr}"),
+            environment_headers: IndexMap::new(),
+        };
+        let route = MockRoute {
+            method: Method::POST,
+            path: "/payments/create".to_string(),
+            priority: 0,
+            when: Vec::new(),
+            extract: IndexMap::from([("order_no".to_string(), "request.json.order_no".to_string())]),
+            steps: vec![Step::Callback(CallbackStep {
+                after_ms: 10,
+                request: crate::dsl::RequestSpec {
+                    api: Some("callback/payment/status".to_string()),
+                    base_url: None,
+                    path_params: IndexMap::new(),
+                    query: IndexMap::new(),
+                    headers: IndexMap::new(),
+                    body: Some(json!({
+                        "order_no": "{{ vars.order_no }}",
+                        "status": "SUCCESS"
+                    })),
+                },
+            })],
+            response: MockResponseDefinition {
+                status: Some(json!(202)),
+                headers: IndexMap::new(),
+                body: Some(json!({ "accepted": true })),
+                body_file: None,
+            },
+        };
+        let state = MockState {
+            routes: Arc::new(vec![route]),
+            base_root: Arc::new(Map::new()),
+            runner_root: Arc::new(temp.path().to_path_buf()),
+            request_context,
+            callback_runtime: callback_runtime.clone(),
+        };
+
+        let response = resolve_request(
+            &state,
+            Method::POST,
+            &"/payments/create".parse::<Uri>().expect("uri"),
+            &HeaderMap::new(),
+            br#"{"order_no":"order-42"}"#,
+        )
+        .expect("response")
+        .expect("matched route");
+
+        assert_eq!(response.status, StatusCode::ACCEPTED);
+        let reports = callback_runtime.flush().await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].status, "passed");
+        assert_eq!(
+            received.lock().expect("received lock").as_slice(),
+            &[json!({
+                "order_no": "order-42",
+                "status": "SUCCESS"
+            })]
+        );
+
+        server.abort();
     }
 }

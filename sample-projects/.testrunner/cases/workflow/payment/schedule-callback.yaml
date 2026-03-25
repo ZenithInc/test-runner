@@ -1,0 +1,31 @@
+name: workflow schedule payment callback
+api: callback/payment/status
+tags:
+  - callback
+  - workflow
+  - redis
+vars:
+  order_no: workflow-callback-001
+  callback_status: SUCCESS
+setup:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - "payment:status:{{ order_no }}"
+steps:
+  - callback:
+      after_ms: 100
+      request:
+        api: callback/payment/status
+        body:
+          order_no: "{{ order_no }}"
+          status: "{{ callback_status }}"
+  - sleep:
+      ms: 180
+teardown:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - "payment:status:{{ order_no }}"

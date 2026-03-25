@@ -1,0 +1,7 @@
+name: Payment status callback
+method: POST
+path: /callbacks/payments/status
+headers:
+  content-type: application/json
+  accept: application/json
+query: {}

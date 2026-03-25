@@ -79,6 +79,93 @@ pub struct EnvironmentConfig {
     pub headers: IndexMap<String, String>,
     #[serde(default)]
     pub variables: IndexMap<String, Value>,
+    #[serde(default)]
+    pub runtime: Option<EnvironmentRuntimeConfig>,
+    #[serde(default)]
+    pub readiness: Vec<EnvironmentReadinessCheck>,
+    #[serde(default)]
+    pub logs: Vec<EnvironmentLogSource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentRuntimeConfig {
+    #[serde(default)]
+    pub kind: EnvironmentRuntimeKind,
+    #[serde(default = "default_runtime_project_directory")]
+    pub project_directory: String,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub project_name: Option<String>,
+    #[serde(default = "default_runtime_up_args")]
+    pub up: Vec<String>,
+    #[serde(default = "default_runtime_down_args")]
+    pub down: Vec<String>,
+    #[serde(default)]
+    pub cleanup: EnvironmentRuntimeCleanupPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentRuntimeKind {
+    #[default]
+    DockerCompose,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentRuntimeCleanupPolicy {
+    #[default]
+    Always,
+    OnSuccess,
+    Never,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EnvironmentReadinessCheck {
+    Http {
+        url: String,
+        #[serde(default = "default_http_status")]
+        expect_status: u16,
+        #[serde(default = "default_readiness_timeout_ms")]
+        timeout_ms: u64,
+        #[serde(default = "default_readiness_interval_ms")]
+        interval_ms: u64,
+    },
+    Tcp {
+        host: String,
+        port: u16,
+        #[serde(default = "default_readiness_timeout_ms")]
+        timeout_ms: u64,
+        #[serde(default = "default_readiness_interval_ms")]
+        interval_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EnvironmentLogSource {
+    ComposeService {
+        service: String,
+        #[serde(default)]
+        stream: ComposeLogStream,
+        output: String,
+    },
+    ContainerFile {
+        service: String,
+        path: String,
+        output: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposeLogStream {
+    Stdout,
+    Stderr,
+    #[default]
+    Combined,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +304,12 @@ pub fn load_project(root: &Path, env_override: Option<&str>) -> Result<LoadedPro
         )
     })?;
     environment.name = Some(environment_name.clone());
+    validate_environment_config(&environment).with_context(|| {
+        format!(
+            "invalid environment configuration in {}",
+            environment_path.display()
+        )
+    })?;
 
     let datasources = load_datasources(&runner_root.join("datasources"))?;
     let apis = load_apis(&runner_root.join("apis"))?;
@@ -253,6 +346,15 @@ pub fn load_project(root: &Path, env_override: Option<&str>) -> Result<LoadedPro
 
 pub fn project_root(root: &Path) -> PathBuf {
     root.join(TESTRUNNER_DIR)
+}
+
+pub fn environment_context_value(
+    environment_name: &str,
+    environment: &EnvironmentConfig,
+) -> Result<Value> {
+    let mut environment = environment.clone();
+    environment.name = Some(environment_name.to_string());
+    serde_json::to_value(environment).context("failed to serialize environment context")
 }
 
 pub fn load_data_tree(data_root: &Path) -> Result<Value> {
@@ -408,6 +510,7 @@ fn validate_mock_steps(steps: &[Step]) -> Result<()> {
     for step in steps {
         match step {
             Step::Set { .. } => {}
+            Step::Callback(_) => {}
             Step::Conditional(ConditionalStep {
                 then_steps,
                 else_steps,
@@ -416,8 +519,118 @@ fn validate_mock_steps(steps: &[Step]) -> Result<()> {
                 validate_mock_steps(then_steps)?;
                 validate_mock_steps(else_steps)?;
             }
-            _ => bail!("mock route steps currently support only `set` and `if`"),
+            _ => bail!("mock route steps currently support only `set`, `callback` and `if`"),
         }
+    }
+    Ok(())
+}
+
+fn validate_environment_config(environment: &EnvironmentConfig) -> Result<()> {
+    if let Some(runtime) = &environment.runtime {
+        if runtime.project_directory.trim().is_empty() {
+            bail!("environment.runtime.project_directory cannot be empty");
+        }
+        if runtime.files.is_empty() {
+            bail!("environment.runtime.files must contain at least one compose file");
+        }
+        for file in &runtime.files {
+            if file.trim().is_empty() {
+                bail!("environment.runtime.files cannot contain empty file paths");
+            }
+        }
+        if let Some(project_name) = &runtime.project_name
+            && project_name.trim().is_empty()
+        {
+            bail!("environment.runtime.project_name cannot be empty");
+        }
+    }
+
+    for readiness in &environment.readiness {
+        match readiness {
+            EnvironmentReadinessCheck::Http {
+                url,
+                timeout_ms,
+                interval_ms,
+                ..
+            } => {
+                if url.trim().is_empty() {
+                    bail!("environment.readiness.http.url cannot be empty");
+                }
+                validate_readiness_timings(*timeout_ms, *interval_ms)?;
+            }
+            EnvironmentReadinessCheck::Tcp {
+                host,
+                port,
+                timeout_ms,
+                interval_ms,
+            } => {
+                if host.trim().is_empty() {
+                    bail!("environment.readiness.tcp.host cannot be empty");
+                }
+                if *port == 0 {
+                    bail!("environment.readiness.tcp.port must be greater than zero");
+                }
+                validate_readiness_timings(*timeout_ms, *interval_ms)?;
+            }
+        }
+    }
+
+    if !environment.logs.is_empty() && environment.runtime.is_none() {
+        bail!("environment.logs requires environment.runtime to be configured");
+    }
+
+    for log in &environment.logs {
+        match log {
+            EnvironmentLogSource::ComposeService {
+                service, output, ..
+            } => {
+                if service.trim().is_empty() {
+                    bail!("environment.logs.compose_service.service cannot be empty");
+                }
+                validate_log_output(output)?;
+            }
+            EnvironmentLogSource::ContainerFile {
+                service,
+                path,
+                output,
+            } => {
+                if service.trim().is_empty() {
+                    bail!("environment.logs.container_file.service cannot be empty");
+                }
+                if path.trim().is_empty() {
+                    bail!("environment.logs.container_file.path cannot be empty");
+                }
+                validate_log_output(output)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_readiness_timings(timeout_ms: u64, interval_ms: u64) -> Result<()> {
+    if timeout_ms == 0 {
+        bail!("environment.readiness timeout_ms must be greater than zero");
+    }
+    if interval_ms == 0 {
+        bail!("environment.readiness interval_ms must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_log_output(output: &str) -> Result<()> {
+    if output.trim().is_empty() {
+        bail!("environment.logs output cannot be empty");
+    }
+    let path = Path::new(output);
+    if path.is_absolute() {
+        bail!("environment.logs output must be a path relative to .testrunner/reports");
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        bail!("environment.logs output cannot escape .testrunner/reports");
     }
     Ok(())
 }
@@ -520,4 +733,97 @@ fn default_base_url() -> String {
 
 fn default_http_status() -> u16 {
     200
+}
+
+fn default_runtime_project_directory() -> String {
+    ".".to_string()
+}
+
+fn default_runtime_up_args() -> Vec<String> {
+    vec!["-d".to_string()]
+}
+
+fn default_runtime_down_args() -> Vec<String> {
+    vec!["-v".to_string(), "--remove-orphans".to_string()]
+}
+
+fn default_readiness_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_readiness_interval_ms() -> u64 {
+    1_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_config_supports_runtime_readiness_and_logs() {
+        let environment: EnvironmentConfig = serde_yaml::from_str(
+            r#"
+name: docker
+base_url: http://127.0.0.1:18080
+runtime:
+  kind: docker_compose
+  files:
+    - docker-compose.yml
+  project_name: sample-{{ run.id }}
+  up:
+    - --build
+    - -d
+  down:
+    - -v
+    - --remove-orphans
+readiness:
+  - kind: http
+    url: http://127.0.0.1:18080/health
+    expect_status: 200
+  - kind: tcp
+    host: 127.0.0.1
+    port: 13306
+logs:
+  - kind: compose_service
+    service: app
+    output: env/app.log
+  - kind: container_file
+    service: mysql
+    path: /var/lib/mysql/slow.log
+    output: env/mysql-slow.log
+"#,
+        )
+        .expect("environment should deserialize");
+
+        validate_environment_config(&environment).expect("environment should validate");
+        assert!(matches!(
+            environment.runtime.as_ref().map(|runtime| runtime.kind),
+            Some(EnvironmentRuntimeKind::DockerCompose)
+        ));
+        assert_eq!(environment.readiness.len(), 2);
+        assert_eq!(environment.logs.len(), 2);
+    }
+
+    #[test]
+    fn environment_validation_rejects_logs_without_runtime() {
+        let environment: EnvironmentConfig = serde_yaml::from_str(
+            r#"
+name: local
+base_url: http://127.0.0.1:3000
+logs:
+  - kind: compose_service
+    service: app
+    output: env/app.log
+"#,
+        )
+        .expect("environment should deserialize");
+
+        let error = validate_environment_config(&environment)
+            .expect_err("logs without runtime should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("environment.logs requires environment.runtime")
+        );
+    }
 }

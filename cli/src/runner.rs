@@ -1,29 +1,38 @@
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use indexmap::IndexMap;
-use reqwest::{Method, header::HeaderMap};
+use reqwest::header::HeaderMap;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::mysql::{MySqlPool, MySqlRow};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Column, ColumnIndex, Decode, Row, Type, TypeInfo};
+use std::env;
 use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
+use std::io::{self, IsTerminal};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Instant;
+use tokio::time::{Duration, sleep};
 
+use crate::callback::{
+    CallbackReport, CallbackRuntime, CallbackSummaryReport, PreparedRequest,
+    PreparedRequestBody, RequestPreparationContext, ScheduledCallback, prepare_callback_request,
+    prepare_case_request,
+};
 use crate::cli::{CommonTestArgs, ReportFormat, TestCommand, TestWorkflowArgs};
 use crate::config::{
-    DatasourceDefinition, LoadedApi, LoadedCase, LoadedProject, LoadedWorkflow, TESTRUNNER_DIR,
-    load_data_tree, load_project,
+    DatasourceDefinition, EnvironmentConfig, LoadedApi, LoadedCase, LoadedProject, LoadedWorkflow,
+    TESTRUNNER_DIR, environment_context_value, load_data_tree, load_project,
 };
 use crate::dsl::{
-    ConditionalStep, ForeachStep, QueryDbStep, QueryRedisStep, RedisCommandStep, RequestSpec,
-    RequestStep, SqlExecStep, Step,
+    CallbackStep, ConditionalStep, ForeachStep, QueryDbStep, QueryRedisStep, RedisCommandStep,
+    RequestSpec, RequestStep, SleepStep, SqlExecStep, Step,
 };
+use crate::environment::{EnvironmentArtifactsReport, EnvironmentSession};
 use crate::mock;
 use crate::runtime::{RuntimeContext, apply_assertions, value_to_string};
 use crate::workflow::{CleanupPolicy, WorkflowStep};
@@ -44,7 +53,7 @@ pub async fn run(command: TestCommand) -> Result<()> {
         TestCommand::Workflow(_) => unreachable!(),
     };
 
-    let mut project = load_project(&options.root, options.env.as_deref())?;
+    let project = load_project(&options.root, options.env.as_deref())?;
     let selected_cases = select_cases(&project, &target, &options)?;
 
     if selected_cases.is_empty() {
@@ -71,14 +80,26 @@ pub async fn run(command: TestCommand) -> Result<()> {
         bail!("junit output is planned but not implemented yet");
     }
 
+    let mut runner = Runner::new(project, options.report_format);
+    runner
+        .console
+        .run_started(&target, &runner.project.environment_name, selected_cases.len());
     let should_start_mock = options
         .mock_override()
-        .unwrap_or(project.project.mock.enabled)
-        && !project.mock_routes.is_empty();
+        .unwrap_or(runner.project.project.mock.enabled)
+        && !runner.project.mock_routes.is_empty();
+    let manages_environment = manages_environment(&runner.project.environment);
 
-    let mock_server = if should_start_mock {
-        let handle = mock::start(&project).await?;
-        project.environment.variables.insert(
+    let mut mock_server = if should_start_mock {
+        runner.console.mock_starting();
+        let handle = mock::start(
+            &runner.project,
+            runner.request_context.clone(),
+            runner.callback_runtime.clone(),
+        )
+        .await?;
+        runner.console.mock_ready(&handle.base_url);
+        runner.project.environment.variables.insert(
             "mock_base_url".to_string(),
             Value::String(handle.base_url.clone()),
         );
@@ -86,15 +107,55 @@ pub async fn run(command: TestCommand) -> Result<()> {
     } else {
         None
     };
+    let mut environment_session = match EnvironmentSession::new(&runner.project) {
+        Ok(session) => session,
+        Err(error) => {
+            if manages_environment {
+                runner
+                    .console
+                    .environment_failed(&runner.project.environment_name, &error);
+            }
+            if let Some(server) = mock_server.take() {
+                server.shutdown().await;
+            }
+            return Err(error);
+        }
+    };
+    if manages_environment {
+        runner
+            .console
+            .environment_starting(&runner.project.environment_name, &runner.project.environment);
+    }
+    let execution_result = match environment_session.prepare().await {
+        Ok(()) => {
+            if manages_environment {
+                runner.console.environment_ready(&runner.project.environment_name);
+            }
+            runner.execute(&selected_cases, &options, &target).await
+        }
+        Err(error) => {
+            if manages_environment {
+                runner
+                    .console
+                    .environment_failed(&runner.project.environment_name, &error);
+            }
+            Err(error)
+        }
+    };
+    let execution_succeeded = match &execution_result {
+        Ok(report) => report.summary.failed == 0 && report.callback_summary.failed == 0,
+        Err(_) => false,
+    };
+    let environment_artifacts = environment_session.finish(execution_succeeded).await;
 
-    let mut runner = Runner::new(project);
-    let report = runner.execute(&selected_cases, &options, &target).await;
-
-    if let Some(server) = mock_server {
+    if let Some(server) = mock_server.take() {
         server.shutdown().await;
     }
 
-    let report = report?;
+    let mut report = execution_result?;
+    if !environment_artifacts.is_empty() {
+        report.environment_artifacts = Some(environment_artifacts);
+    }
     let report_path = write_report(&runner.project.runner_root, &report)?;
     print_report(&report, &report_path, options.report_format)?;
 
@@ -103,6 +164,13 @@ pub async fn run(command: TestCommand) -> Result<()> {
             "{} of {} case(s) failed",
             report.summary.failed,
             report.summary.total
+        );
+    }
+    if report.callback_summary.failed > 0 {
+        bail!(
+            "{} of {} callback(s) failed",
+            report.callback_summary.failed,
+            report.callback_summary.total
         );
     }
 
@@ -126,7 +194,7 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
         bail!("junit output is planned but not implemented yet");
     }
 
-    let mut project = load_project(&options.root, options.env.as_deref())?;
+    let project = load_project(&options.root, options.env.as_deref())?;
     let workflow = project
         .workflows
         .get(&args.workflow_id)
@@ -143,14 +211,26 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
         return Ok(());
     }
 
+    let mut runner = Runner::new(project, options.report_format);
+    runner
+        .console
+        .workflow_started(&workflow.id, &runner.project.environment_name);
     let should_start_mock = options
         .mock_override()
-        .unwrap_or(project.project.mock.enabled)
-        && !project.mock_routes.is_empty();
+        .unwrap_or(runner.project.project.mock.enabled)
+        && !runner.project.mock_routes.is_empty();
+    let manages_environment = manages_environment(&runner.project.environment);
 
-    let mock_server = if should_start_mock {
-        let handle = mock::start(&project).await?;
-        project.environment.variables.insert(
+    let mut mock_server = if should_start_mock {
+        runner.console.mock_starting();
+        let handle = mock::start(
+            &runner.project,
+            runner.request_context.clone(),
+            runner.callback_runtime.clone(),
+        )
+        .await?;
+        runner.console.mock_ready(&handle.base_url);
+        runner.project.environment.variables.insert(
             "mock_base_url".to_string(),
             Value::String(handle.base_url.clone()),
         );
@@ -158,15 +238,55 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
     } else {
         None
     };
+    let mut environment_session = match EnvironmentSession::new(&runner.project) {
+        Ok(session) => session,
+        Err(error) => {
+            if manages_environment {
+                runner
+                    .console
+                    .environment_failed(&runner.project.environment_name, &error);
+            }
+            if let Some(server) = mock_server.take() {
+                server.shutdown().await;
+            }
+            return Err(error);
+        }
+    };
+    if manages_environment {
+        runner
+            .console
+            .environment_starting(&runner.project.environment_name, &runner.project.environment);
+    }
+    let execution_result = match environment_session.prepare().await {
+        Ok(()) => {
+            if manages_environment {
+                runner.console.environment_ready(&runner.project.environment_name);
+            }
+            runner.execute_workflow(&workflow, &args, options).await
+        }
+        Err(error) => {
+            if manages_environment {
+                runner
+                    .console
+                    .environment_failed(&runner.project.environment_name, &error);
+            }
+            Err(error)
+        }
+    };
+    let execution_succeeded = match &execution_result {
+        Ok(report) => report.status == "passed" && report.callback_summary.failed == 0,
+        Err(_) => false,
+    };
+    let environment_artifacts = environment_session.finish(execution_succeeded).await;
 
-    let mut runner = Runner::new(project);
-    let report = runner.execute_workflow(&workflow, &args, options).await;
-
-    if let Some(server) = mock_server {
+    if let Some(server) = mock_server.take() {
         server.shutdown().await;
     }
 
-    let report = report?;
+    let mut report = execution_result?;
+    if !environment_artifacts.is_empty() {
+        report.environment_artifacts = Some(environment_artifacts);
+    }
     let report_path = write_workflow_report(&runner.project.runner_root, &report)?;
     print_workflow_report(&report, &report_path, options.report_format)?;
 
@@ -202,6 +322,11 @@ struct RunReport {
     started_at: String,
     finished_at: String,
     summary: SummaryReport,
+    callback_summary: CallbackSummaryReport,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    callbacks: Vec<CallbackReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment_artifacts: Option<EnvironmentArtifactsReport>,
     cases: Vec<CaseReport>,
 }
 
@@ -245,6 +370,11 @@ struct WorkflowRunReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     summary: WorkflowSummaryReport,
+    callback_summary: CallbackSummaryReport,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    callbacks: Vec<CallbackReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment_artifacts: Option<EnvironmentArtifactsReport>,
     steps: Vec<WorkflowStepReport>,
 }
 
@@ -282,6 +412,215 @@ struct WorkflowStepState {
     exports: serde_json::Map<String, Value>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SummaryConsole {
+    enabled: bool,
+    styler: TerminalStyler,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalStyler {
+    enabled: bool,
+}
+
+impl TerminalStyler {
+    fn detect() -> Self {
+        let stdout_is_terminal = io::stdout().is_terminal();
+        let no_color = env::var_os("NO_COLOR").is_some();
+        let term_is_dumb = env::var("TERM")
+            .map(|term| term.eq_ignore_ascii_case("dumb"))
+            .unwrap_or(false);
+        Self {
+            enabled: stdout_is_terminal && !no_color && !term_is_dumb,
+        }
+    }
+
+    fn paint(&self, text: impl AsRef<str>, code: &str) -> String {
+        let text = text.as_ref();
+        if self.enabled {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn phase(&self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;36")
+    }
+
+    fn section(&self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;34")
+    }
+
+    fn success(&self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;32")
+    }
+
+    fn failure(&self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;31")
+    }
+
+    fn warning(&self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;33")
+    }
+
+    fn info(&self, text: impl AsRef<str>) -> String {
+        self.paint(text, "1;34")
+    }
+
+    fn muted(&self, text: impl AsRef<str>) -> String {
+        self.paint(text, "2")
+    }
+
+    fn status(&self, status: &str) -> String {
+        match status {
+            "passed" => self.success(status_label(status)),
+            "failed" => self.failure(status_label(status)),
+            "skipped" => self.warning(status_label(status)),
+            _ => self.info(status_label(status)),
+        }
+    }
+}
+
+impl SummaryConsole {
+    fn new(format: ReportFormat) -> Self {
+        Self {
+            enabled: format == ReportFormat::Summary,
+            styler: TerminalStyler::detect(),
+        }
+    }
+
+    fn run_started(&self, target: &TargetSelection, env_name: &str, case_count: usize) {
+        if !self.enabled {
+            return;
+        }
+        println!(
+            "{}",
+            self.styler.phase(format!(
+                "==> Running {case_count} case(s) for {} in env `{env_name}`",
+                target.display()
+            ))
+        );
+    }
+
+    fn workflow_started(&self, workflow_id: &str, env_name: &str) {
+        if !self.enabled {
+            return;
+        }
+        println!(
+            "{}",
+            self.styler
+                .phase(format!("==> Running workflow `{workflow_id}` in env `{env_name}`"))
+        );
+    }
+
+    fn mock_starting(&self) {
+        if !self.enabled {
+            return;
+        }
+        println!("{}", self.styler.phase("==> Starting embedded mock server"));
+    }
+
+    fn mock_ready(&self, base_url: &str) {
+        if !self.enabled {
+            return;
+        }
+        println!(
+            "{}",
+            self.styler.phase(format!("==> Mock ready at {base_url}"))
+        );
+    }
+
+    fn environment_starting(&self, env_name: &str, environment: &EnvironmentConfig) {
+        if !self.enabled {
+            return;
+        }
+
+        let mut parts = Vec::new();
+        if environment.runtime.is_some() {
+            parts.push("docker compose".to_string());
+        }
+        if !environment.readiness.is_empty() {
+            parts.push(format!(
+                "{} readiness check(s)",
+                environment.readiness.len()
+            ));
+        }
+        if !environment.logs.is_empty() {
+            parts.push(format!("{} log source(s)", environment.logs.len()));
+        }
+
+        if parts.is_empty() {
+            println!(
+                "{}",
+                self.styler
+                    .phase(format!("==> Preparing environment `{env_name}`"))
+            );
+        } else {
+            println!(
+                "{}",
+                self.styler.phase(format!(
+                    "==> Preparing environment `{env_name}` ({})",
+                    parts.join(" | ")
+                ))
+            );
+        }
+    }
+
+    fn environment_ready(&self, env_name: &str) {
+        if !self.enabled {
+            return;
+        }
+        println!(
+            "{}",
+            self.styler
+                .phase(format!("==> Environment `{env_name}` ready"))
+        );
+    }
+
+    fn environment_failed(&self, env_name: &str, error: impl std::fmt::Display) {
+        if !self.enabled {
+            return;
+        }
+        println!(
+            "{}",
+            self.styler
+                .failure(format!("FAIL environment `{env_name}`: {error}"))
+        );
+    }
+
+    fn case_finished(&self, index: usize, total: usize, report: &CaseReport) {
+        if !self.enabled {
+            return;
+        }
+        println!(
+            "{} [{index}/{total}] {} ({})",
+            self.styler.status(&report.status),
+            report.id,
+            self.styler.muted(format_duration(report.duration_ms))
+        );
+        if let Some(error) = &report.error {
+            println!("    {error}");
+        }
+    }
+
+    fn workflow_step_finished(&self, index: usize, report: &WorkflowStepReport) {
+        if !self.enabled {
+            return;
+        }
+        println!(
+            "{} [{index}] {} -> {} ({})",
+            self.styler.status(&report.status),
+            report.id,
+            report.case_id,
+            self.styler.muted(format_duration(report.duration_ms))
+        );
+        if let Some(error) = &report.error {
+            println!("    {error}");
+        }
+    }
+}
+
 struct DeferredTeardown {
     step_id: String,
     case: LoadedCase,
@@ -297,22 +636,30 @@ struct WorkflowCaseOutcome {
 struct Runner {
     project: LoadedProject,
     http_client: reqwest::Client,
+    request_context: RequestPreparationContext,
+    callback_runtime: CallbackRuntime,
     db_pools: HashMap<String, DatabasePool>,
     redis_clients: HashMap<String, redis::Client>,
+    console: SummaryConsole,
 }
 
 impl Runner {
-    fn new(project: LoadedProject) -> Self {
+    fn new(project: LoadedProject, report_format: ReportFormat) -> Self {
+        let request_context = RequestPreparationContext::from_project(&project);
         let timeout = std::time::Duration::from_millis(project.project.defaults.timeout_ms);
         let http_client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
             .expect("failed to build reqwest client");
+        let callback_runtime = CallbackRuntime::new(http_client.clone());
         Self {
             project,
             http_client,
+            request_context,
+            callback_runtime,
             db_pools: HashMap::new(),
             redis_clients: HashMap::new(),
+            console: SummaryConsole::new(report_format),
         }
     }
 
@@ -328,8 +675,9 @@ impl Runner {
         let mut passed = 0usize;
         let mut failed = 0usize;
 
-        for case in cases {
+        for (index, case) in cases.iter().enumerate() {
             let report = self.execute_case(case).await;
+            self.console.case_finished(index + 1, cases.len(), &report);
             let failed_now = report.error.is_some();
             if failed_now {
                 failed += 1;
@@ -342,6 +690,8 @@ impl Runner {
             }
         }
 
+        let callbacks = self.callback_runtime.flush().await;
+        let callback_summary = CallbackSummaryReport::from_reports(&callbacks);
         let finished_at = Utc::now().to_rfc3339();
         Ok(RunReport {
             project: self.project.project.project.name.clone(),
@@ -355,6 +705,9 @@ impl Runner {
                 failed,
                 duration_ms: started.elapsed().as_millis(),
             },
+            callback_summary,
+            callbacks,
+            environment_artifacts: None,
             cases: reports,
         })
     }
@@ -367,7 +720,6 @@ impl Runner {
     ) -> Result<WorkflowRunReport> {
         let started_at = Utc::now().to_rfc3339();
         let started = Instant::now();
-
         let mut state = WorkflowState {
             vars: serde_json::Map::new(),
             steps: IndexMap::new(),
@@ -382,6 +734,7 @@ impl Runner {
         let mut deferred_teardowns = Vec::new();
         let mut any_case_failed = false;
         let mut stop_execution = false;
+        let mut executed_run_case_steps = 0usize;
 
         self.execute_workflow_steps(
             &workflow.definition.steps,
@@ -391,6 +744,7 @@ impl Runner {
             &mut any_case_failed,
             options.fail_fast,
             &mut stop_execution,
+            &mut executed_run_case_steps,
         )
         .await?;
 
@@ -414,9 +768,24 @@ impl Runner {
             }
         }
 
+        let callbacks = self.callback_runtime.flush().await;
+        let callback_summary = CallbackSummaryReport::from_reports(&callbacks);
+        if callback_summary.failed > 0 {
+            any_case_failed = true;
+        }
         let status = if any_case_failed { "failed" } else { "passed" };
         let passed_steps = step_reports.iter().filter(|report| report.passed).count();
         let failed_steps = step_reports.iter().filter(|report| !report.passed).count();
+        let mut error_parts = Vec::new();
+        if failed_steps > 0 {
+            error_parts.push(format!("{failed_steps} of {} step(s) failed", step_reports.len()));
+        }
+        if callback_summary.failed > 0 {
+            error_parts.push(format!(
+                "{} of {} callback(s) failed",
+                callback_summary.failed, callback_summary.total
+            ));
+        }
 
         Ok(WorkflowRunReport {
             project: self.project.project.project.name.clone(),
@@ -426,13 +795,10 @@ impl Runner {
             started_at,
             finished_at: Utc::now().to_rfc3339(),
             status: status.to_string(),
-            error: if any_case_failed {
-                Some(format!(
-                    "{failed_steps} of {} step(s) failed",
-                    step_reports.len()
-                ))
-            } else {
+            error: if error_parts.is_empty() {
                 None
+            } else {
+                Some(error_parts.join("; "))
             },
             summary: WorkflowSummaryReport {
                 executed_steps: step_reports.len(),
@@ -440,6 +806,9 @@ impl Runner {
                 failed_steps,
                 duration_ms: started.elapsed().as_millis(),
             },
+            callback_summary,
+            callbacks,
+            environment_artifacts: None,
             steps: step_reports,
         })
     }
@@ -453,6 +822,7 @@ impl Runner {
         any_case_failed: &'a mut bool,
         fail_fast: bool,
         stop_execution: &'a mut bool,
+        executed_run_case_steps: &'a mut usize,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         Box::pin(async move {
             for step in steps {
@@ -517,6 +887,11 @@ impl Runner {
                             deferred_teardowns.push(deferred);
                         }
 
+                        *executed_run_case_steps += 1;
+                        self.console.workflow_step_finished(
+                            *executed_run_case_steps,
+                            &outcome.step_report,
+                        );
                         step_reports.push(outcome.step_report);
                     }
                     WorkflowStep::Conditional(cond) => {
@@ -535,6 +910,7 @@ impl Runner {
                             any_case_failed,
                             fail_fast,
                             stop_execution,
+                            executed_run_case_steps,
                         )
                         .await?;
                     }
@@ -872,6 +1248,8 @@ impl Runner {
             Step::Sql(step) => self.run_sql_step(step, context, reports).await,
             Step::Redis(step) => self.run_redis_step(step, context, reports).await,
             Step::Request(step) => self.run_request_step(step, context, reports).await,
+            Step::Callback(step) => self.run_callback_step(step, context, reports).await,
+            Step::Sleep(step) => self.run_sleep_step(step, context, reports).await,
             Step::QueryDb(step) => self.run_query_db_step(step, context, reports).await,
             Step::QueryRedis(step) => self.run_query_redis_step(step, context, reports).await,
             Step::Conditional(step) => self.run_conditional_step(step, context, reports).await,
@@ -942,6 +1320,55 @@ impl Runner {
                 "api": step.request.api.clone().unwrap_or_else(|| context.case.definition.api.clone()),
                 "status": response.get("status").cloned().unwrap_or(Value::Null)
             }),
+            error: None,
+        });
+        Ok(())
+    }
+
+    async fn run_callback_step(
+        &mut self,
+        step: &CallbackStep,
+        context: &mut ExecutionContext<'_>,
+        reports: &mut Vec<StepReport>,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let request = prepare_callback_request(&self.request_context, &step.request, context)?;
+        let scheduled = self.callback_runtime.schedule(ScheduledCallback {
+            source: format!("case:{}", context.case.id),
+            after_ms: step.after_ms,
+            request,
+        });
+        let details = json!({
+            "id": scheduled.id,
+            "after_ms": scheduled.after_ms,
+            "request": scheduled.request.to_json(),
+        });
+        context.set_result(details.clone());
+        reports.push(StepReport {
+            kind: "callback".to_string(),
+            status: "passed".to_string(),
+            duration_ms: started.elapsed().as_millis(),
+            details,
+            error: None,
+        });
+        Ok(())
+    }
+
+    async fn run_sleep_step(
+        &mut self,
+        step: &SleepStep,
+        context: &mut ExecutionContext<'_>,
+        reports: &mut Vec<StepReport>,
+    ) -> Result<()> {
+        let started = Instant::now();
+        sleep(Duration::from_millis(step.ms)).await;
+        let details = json!({ "ms": step.ms });
+        context.set_result(details.clone());
+        reports.push(StepReport {
+            kind: "sleep".to_string(),
+            status: "passed".to_string(),
+            duration_ms: started.elapsed().as_millis(),
+            details,
             error: None,
         });
         Ok(())
@@ -1074,70 +1501,32 @@ impl Runner {
         step: &RequestSpec,
         context: &ExecutionContext<'_>,
     ) -> Result<Value> {
-        let api_id = step
-            .api
-            .clone()
-            .unwrap_or_else(|| context.case.definition.api.clone());
-        let api = self
-            .project
-            .apis
-            .get(&api_id)
-            .with_context(|| format!("unknown API `{api_id}`"))?;
-        let method = Method::from_bytes(api.definition.method.as_bytes())?;
-        let base_url = match &step.base_url {
-            Some(base_url) => {
-                value_to_string(context.resolve_value(&Value::String(base_url.clone()))?)
+        let request = prepare_case_request(
+            &self.request_context,
+            &context.case.definition.api,
+            step,
+            context,
+        )?;
+        self.send_prepared_request(&request).await
+    }
+
+    async fn send_prepared_request(&self, request: &PreparedRequest) -> Result<Value> {
+        let mut builder = self
+            .http_client
+            .request(request.method.clone(), &request.url);
+        for (key, value) in &request.headers {
+            builder = builder.header(key, value);
+        }
+        match &request.body {
+            Some(PreparedRequestBody::Text(body)) => {
+                builder = builder.body(body.clone());
             }
-            None => api
-                .definition
-                .base_url
-                .clone()
-                .unwrap_or_else(|| self.project.environment.base_url.clone()),
-        };
-        let path = render_api_path(&api.definition.path, &step.path_params, context)?;
-        let url = format!(
-            "{}/{}",
-            base_url.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        );
-
-        let mut request_builder = self.http_client.request(method, &url);
-
-        let mut headers = self.project.environment.headers.clone();
-        headers.extend(api.definition.headers.clone());
-        for (key, value) in &step.headers {
-            headers.insert(key.clone(), value_to_string(context.resolve_value(value)?));
-        }
-        for (key, value) in headers {
-            request_builder = request_builder.header(&key, value);
-        }
-
-        let mut query = api.definition.query.clone();
-        query.extend(step.query.clone());
-        if !query.is_empty() {
-            let query_pairs = query
-                .into_iter()
-                .map(|(key, value)| Ok((key, value_to_string(context.resolve_value(&value)?))))
-                .collect::<Result<Vec<_>>>()?;
-            request_builder = request_builder.query(&query_pairs);
-        }
-
-        let body = step
-            .body
-            .clone()
-            .or_else(|| api.definition.body.clone())
-            .map(|value| context.resolve_value(&value))
-            .transpose()?;
-        if let Some(body) = body {
-            if body.is_string() {
-                request_builder =
-                    request_builder.body(body.as_str().unwrap_or_default().to_string());
-            } else {
-                request_builder = request_builder.json(&body);
+            Some(PreparedRequestBody::Json(body)) => {
+                builder = builder.json(body);
             }
+            None => {}
         }
-
-        let response = request_builder.send().await?;
+        let response = builder.send().await?;
         response_to_json(response).await
     }
 
@@ -1270,12 +1659,7 @@ impl<'a> ExecutionContext<'a> {
         let mut root = serde_json::Map::new();
         root.insert(
             "env".to_string(),
-            json!({
-                "name": project.environment_name,
-                "base_url": project.environment.base_url,
-                "headers": project.environment.headers,
-                "variables": project.environment.variables,
-            }),
+            environment_context_value(&project.environment_name, &project.environment)?,
         );
         root.insert(
             "project".to_string(),
@@ -1433,19 +1817,6 @@ fn header_map_to_json(headers: &HeaderMap) -> Value {
     Value::Object(map)
 }
 
-fn render_api_path(
-    path: &str,
-    path_params: &IndexMap<String, Value>,
-    context: &ExecutionContext<'_>,
-) -> Result<String> {
-    let mut rendered = path.to_string();
-    for (key, value) in path_params {
-        let replacement = value_to_string(context.resolve_value(value)?);
-        rendered = rendered.replace(&format!("{{{key}}}"), &replacement);
-    }
-    context.render_string(&rendered)
-}
-
 fn insert_nested(
     root: &mut serde_json::Map<String, Value>,
     path: &[String],
@@ -1511,12 +1882,7 @@ fn build_workflow_runtime(
     let mut root = serde_json::Map::new();
     root.insert(
         "env".to_string(),
-        json!({
-            "name": project.environment_name,
-            "base_url": project.environment.base_url,
-            "headers": project.environment.headers,
-            "variables": project.environment.variables,
-        }),
+        environment_context_value(&project.environment_name, &project.environment)?,
     );
     root.insert(
         "project".to_string(),
@@ -1537,18 +1903,6 @@ fn build_workflow_runtime(
 }
 
 fn print_workflow_dry_run(workflow: &LoadedWorkflow, env_name: &str) {
-    fn count_run_case_steps(steps: &[WorkflowStep]) -> usize {
-        steps
-            .iter()
-            .map(|step| match step {
-                WorkflowStep::RunCase(_) => 1,
-                WorkflowStep::Conditional(cond) => {
-                    count_run_case_steps(&cond.then_steps) + count_run_case_steps(&cond.else_steps)
-                }
-            })
-            .sum()
-    }
-
     let step_count = count_run_case_steps(&workflow.definition.steps);
     println!(
         "Workflow `{}` ({}) — {} step(s) in env `{}`:",
@@ -1590,24 +1944,25 @@ fn write_workflow_report(root: &Path, report: &WorkflowRunReport) -> Result<Path
 fn print_report(report: &RunReport, report_path: &Path, format: ReportFormat) -> Result<()> {
     match format {
         ReportFormat::Summary => {
+            let styler = TerminalStyler::detect();
+            print_summary_header(&styler);
             println!(
-                "Run finished: {} passed, {} failed, {} total (report: {})",
-                report.summary.passed,
-                report.summary.failed,
-                report.summary.total,
-                report_path.display()
+                "  Cases: {} passed, {} failed, {} total",
+                styler.success(report.summary.passed.to_string()),
+                styler.failure(report.summary.failed.to_string()),
+                styler.info(report.summary.total.to_string())
             );
-            for case in &report.cases {
+            if report.callback_summary.total > 0 {
                 println!(
-                    "  [{}] {} ({})",
-                    case.status.to_uppercase(),
-                    case.id,
-                    case.duration_ms
+                    "  Callbacks: {} passed, {} failed, {} total",
+                    styler.success(report.callback_summary.passed.to_string()),
+                    styler.failure(report.callback_summary.failed.to_string()),
+                    styler.info(report.callback_summary.total.to_string())
                 );
-                if let Some(error) = &case.error {
-                    println!("    -> {error}");
-                }
             }
+            print_environment_summary(&styler, report.environment_artifacts.as_ref());
+            print_summary_metadata(&styler, report_path, report.summary.duration_ms);
+            print_callback_details(&styler, &report.callbacks);
         }
         ReportFormat::Json => {
             println!("{}", serde_json::to_string_pretty(report)?);
@@ -1625,26 +1980,26 @@ fn print_workflow_report(
 ) -> Result<()> {
     match format {
         ReportFormat::Summary => {
+            let styler = TerminalStyler::detect();
+            print_summary_header(&styler);
+            println!("  Status: {}", styler.status(&report.status));
             println!(
-                "Workflow `{}` finished: {} passed, {} failed, {} total (report: {})",
-                report.workflow_id,
-                report.summary.passed_steps,
-                report.summary.failed_steps,
-                report.summary.executed_steps,
-                report_path.display(),
+                "  Steps: {} passed, {} failed, {} total",
+                styler.success(report.summary.passed_steps.to_string()),
+                styler.failure(report.summary.failed_steps.to_string()),
+                styler.info(report.summary.executed_steps.to_string())
             );
-            for step in &report.steps {
+            if report.callback_summary.total > 0 {
                 println!(
-                    "  [{}] {} → {} ({}ms)",
-                    step.status.to_uppercase(),
-                    step.id,
-                    step.case_id,
-                    step.duration_ms,
+                    "  Callbacks: {} passed, {} failed, {} total",
+                    styler.success(report.callback_summary.passed.to_string()),
+                    styler.failure(report.callback_summary.failed.to_string()),
+                    styler.info(report.callback_summary.total.to_string())
                 );
-                if let Some(error) = &step.error {
-                    println!("    -> {error}");
-                }
             }
+            print_environment_summary(&styler, report.environment_artifacts.as_ref());
+            print_summary_metadata(&styler, report_path, report.summary.duration_ms);
+            print_callback_details(&styler, &report.callbacks);
         }
         ReportFormat::Json => {
             println!("{}", serde_json::to_string_pretty(report)?);
@@ -1653,6 +2008,119 @@ fn print_workflow_report(
         ReportFormat::Junit => {}
     }
     Ok(())
+}
+
+fn manages_environment(environment: &EnvironmentConfig) -> bool {
+    environment.runtime.is_some() || !environment.readiness.is_empty() || !environment.logs.is_empty()
+}
+
+fn count_run_case_steps(steps: &[WorkflowStep]) -> usize {
+    steps
+        .iter()
+        .map(|step| match step {
+            WorkflowStep::RunCase(_) => 1,
+            WorkflowStep::Conditional(cond) => {
+                count_run_case_steps(&cond.then_steps) + count_run_case_steps(&cond.else_steps)
+            }
+        })
+        .sum()
+}
+
+fn print_summary_header(styler: &TerminalStyler) {
+    println!();
+    println!("{}", styler.section("==> Summary"));
+}
+
+fn print_summary_metadata(styler: &TerminalStyler, report_path: &Path, duration_ms: u128) {
+    println!("  Duration: {}", styler.muted(format_duration(duration_ms)));
+    println!("  Report: {}", styler.muted(report_path.display().to_string()));
+}
+
+fn print_environment_summary(
+    styler: &TerminalStyler,
+    environment_artifacts: Option<&EnvironmentArtifactsReport>,
+) {
+    let Some(environment_artifacts) = environment_artifacts else {
+        return;
+    };
+
+    let readiness_passed = environment_artifacts
+        .readiness
+        .iter()
+        .filter(|report| report.status == "passed")
+        .count();
+    let readiness_failed = environment_artifacts.readiness.len() - readiness_passed;
+    let logs_passed = environment_artifacts
+        .logs
+        .iter()
+        .filter(|report| report.status == "passed")
+        .count();
+    let logs_failed = environment_artifacts.logs.len() - logs_passed;
+
+    println!("  {}", styler.section("Environment:"));
+    if let Some(runtime) = &environment_artifacts.runtime {
+        println!(
+            "    Runtime: {} (startup: {}, shutdown: {})",
+            styler.info(runtime.kind.clone()),
+            styler.status(runtime.startup_status.as_deref().unwrap_or("n/a")),
+            styler.status(runtime.shutdown_status.as_deref().unwrap_or("n/a"))
+        );
+    }
+    if !environment_artifacts.readiness.is_empty() {
+        println!(
+            "    Readiness: {} passed, {} failed",
+            styler.success(readiness_passed.to_string()),
+            styler.failure(readiness_failed.to_string())
+        );
+    }
+    if !environment_artifacts.logs.is_empty() {
+        println!(
+            "    Logs: {} collected, {} failed",
+            styler.success(logs_passed.to_string()),
+            styler.failure(logs_failed.to_string())
+        );
+    }
+}
+
+fn print_callback_details(styler: &TerminalStyler, callbacks: &[CallbackReport]) {
+    if callbacks.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("{}", styler.section("==> Callbacks"));
+    for callback in callbacks {
+        println!(
+            "  {} #{} {} -> {} ({})",
+            styler.status(&callback.status),
+            callback.id,
+            callback.source,
+            callback.url,
+            styler.muted(format_duration(callback.duration_ms))
+        );
+        if let Some(error) = &callback.error {
+            println!("    {error}");
+        }
+    }
+}
+
+fn status_label(status: &str) -> &'static str {
+    match status {
+        "passed" => "PASS",
+        "failed" => "FAIL",
+        "skipped" => "SKIP",
+        "n/a" => "N/A",
+        _ => "INFO",
+    }
+}
+
+fn format_duration(duration_ms: u128) -> String {
+    if duration_ms >= 1_000 {
+        let seconds = duration_ms as f64 / 1_000.0;
+        format!("{seconds:.2}s")
+    } else {
+        format!("{duration_ms}ms")
+    }
 }
 
 fn split_sql_statements(script: &str) -> Vec<String> {
@@ -1798,5 +2266,19 @@ steps:
             project.workflows.contains_key("smoke-flow"),
             "workflow should be loaded"
         );
+    }
+
+    #[test]
+    fn terminal_styler_keeps_plain_text_when_disabled() {
+        let styler = TerminalStyler { enabled: false };
+        assert_eq!(styler.success("PASS"), "PASS");
+        assert_eq!(styler.section("==> Summary"), "==> Summary");
+    }
+
+    #[test]
+    fn terminal_styler_wraps_text_when_enabled() {
+        let styler = TerminalStyler { enabled: true };
+        assert_eq!(styler.failure("FAIL"), "\u{1b}[1;31mFAIL\u{1b}[0m");
+        assert_eq!(styler.muted("12ms"), "\u{1b}[2m12ms\u{1b}[0m");
     }
 }

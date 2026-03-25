@@ -47,7 +47,7 @@
 | 路径 | 用途 |
 | --- | --- |
 | `project.yaml` | 项目级默认配置，例如默认环境、全局超时和 Mock 开关。 |
-| `env/` | 环境级配置，例如 `base_url`、通用 headers、环境变量。 |
+| `env/` | 环境级配置，例如 `base_url`、通用 headers、环境变量，也可以声明 Docker Compose runtime / readiness / logs。 |
 | `datasources/` | MySQL、PostgreSQL、Redis 连接定义。 |
 | `apis/` | API 元数据，例如方法、路径、默认 query、默认 body。 |
 | `cases/` | 测试用例 YAML DSL。 |
@@ -55,7 +55,7 @@
 | `mocks/` | 内嵌 Mock 服务的路由、动态响应 DSL 与 fixture 文件。 |
 | `hooks/` | 当前只是预留目录，CLI 还不会自动执行这里的脚本。 |
 | `workflows/` | workflow 定义文件，描述跨 case 的顺序、分支、输入输出与 cleanup 策略。 |
-| `reports/` | 每次运行产出的报告目录。 |
+| `reports/` | 每次运行产出的报告目录；如果启用了环境日志采集，相关文件会额外写到 `reports/env/`。 |
 
 ## API ID 和 Case ID 怎么来的
 
@@ -103,3 +103,5 @@ test-runner test workflow register-login-create-order
 ```
 
 文件里会包含 workflow 级汇总信息、每个 `run_case` step 的状态、导出值，以及 deferred teardown 的执行结果。
+
+如果你想看 `env/*.yaml` 如何进一步声明环境生命周期、就绪检查和日志产物，请继续阅读 [环境 DSL](/guide/environment-dsl)。

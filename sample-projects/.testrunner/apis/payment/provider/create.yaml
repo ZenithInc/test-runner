@@ -1,0 +1,7 @@
+name: Create payment via provider
+method: POST
+path: /payments/provider/create
+headers:
+  content-type: application/json
+  accept: application/json
+query: {}
