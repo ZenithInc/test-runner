@@ -104,4 +104,36 @@ test-runner test workflow register-login-create-order
 
 文件里会包含 workflow 级汇总信息、每个 `run_case` step 的状态、导出值，以及 deferred teardown 的执行结果。
 
+## `reports/last-workflows-run.json`
+
+当你执行：
+
+```bash
+test-runner test workflow --all --parallel --jobs 2
+```
+
+批量 workflow 报告会固定写到：
+
+```text
+.testrunner/reports/last-workflows-run.json
+```
+
+文件里会包含：
+
+- 本次执行的 workflow 列表
+- workflow 级汇总（passed / failed / total）
+- 并行元数据（jobs、slots、unit）
+- callback 汇总和环境产物索引
+
+## `reports/slot-<id>/`
+
+在 Testcontainers slot 并行模式下，环境日志产物会按 slot 自动分目录：
+
+```text
+.testrunner/reports/slot-0/...
+.testrunner/reports/slot-1/...
+```
+
+这样可以避免不同 slot 的 app / mysql / redis 日志互相覆盖。
+
 如果你想看 `env/*.yaml` 如何进一步声明环境生命周期、就绪检查和日志产物，请继续阅读 [环境 DSL](/guide/environment-dsl)。

@@ -15,17 +15,17 @@ hero:
 
 features:
   - title: CLI 驱动
-    details: 支持 `init`、`test api`、`test dir`、`test all`、`test workflow`，可以按 API、目录、全量或工作流运行测试。
+    details: 支持 `init`、`test api`、`test dir`、`test all`、`test workflow`，并可在 Testcontainers slot 上并行运行 case / workflow。
   - title: YAML DSL
     details: 在测试用例里描述变量、HTTP 请求、SQL、Redis、分支、循环、extract 和 assert。
   - title: Workflow 编排
     details: 在 case 之上增加 workflow 层，用 YAML 编排跨 case 的顺序、分支、输入输出和 cleanup 策略。
   - title: 环境 DSL
-    details: 在 `env/*.yaml` 里声明 Docker Compose 或 Testcontainers 容器的生命周期、readiness 和日志采集，让测试命令自动托管环境。
+    details: 在 `env/*.yaml` 里声明 Docker Compose 或 Testcontainers 容器的生命周期、readiness、日志采集与 slot 并行隔离，让测试命令自动托管环境。
   - title: Callback 与副作用验证
     details: 支持在 case 和 mock route 里安排异步 callback，再通过 Redis / 数据库断言验证最终副作用。
   - title: 可追踪结果
-    details: 每次执行都能输出终端摘要或 JSON，并把报告写入 `.testrunner/reports/last-run.json` 或 `.testrunner/reports/last-workflow-run.json`。
+    details: 每次执行都能输出终端摘要或 JSON，并把报告写入 `.testrunner/reports/last-run.json`、`last-workflow-run.json` 或批量 workflow 的 `last-workflows-run.json`。
 ---
 
 ## 这份文档覆盖什么

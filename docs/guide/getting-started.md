@@ -71,6 +71,22 @@ test-runner test dir user --root /path/to/your-project
 test-runner test all --root /path/to/your-project
 ```
 
+如果你的环境使用 `kind: containers`，并且在 `env/*.yaml` 里声明了 `runtime.parallel.slots`，还可以直接启用 slot 并行：
+
+```bash
+# case 级并行
+test-runner test dir user --root sample-projects --env containers --parallel --jobs 2
+
+# workflow 级并行（一次运行多个 workflow）
+test-runner test workflow --all --root sample-projects --env containers --parallel --jobs 2
+```
+
+其中：
+
+- `test api` / `test dir` / `test all`：按 **case** 分配 slot
+- `test workflow --all`：按 **workflow** 分配 slot
+- 单个 workflow 内部的 steps 仍保持串行
+
 ## 一个推荐的接入顺序
 
 如果你是第一次给项目接入 `test-runner`，可以按这个顺序推进：

@@ -197,6 +197,10 @@ test-runner test workflow register-login-create-order --root sample-projects --e
 # Testcontainers 模式（通过 Docker API 直接管理容器，自动构建应用镜像）
 test-runner test api system/health --root sample-projects --env containers
 test-runner test workflow register-login-create-order --root sample-projects --env containers
+
+# Testcontainers 并行 slot（cases 按 case 并发，workflows 按 workflow 并发）
+test-runner test all --root sample-projects --env containers --parallel
+test-runner test workflow --all --root sample-projects --env containers --parallel --jobs 4
 ```
 
 如果你只是想看看执行计划，不想真的启动环境，也可以继续使用：
@@ -211,12 +215,15 @@ test-runner test workflow register-login-create-order --root sample-projects --e
 
 ```text
 sample-projects/.testrunner/reports/last-run.json
+sample-projects/.testrunner/reports/last-workflow-run.json
+sample-projects/.testrunner/reports/last-workflows-run.json
 ```
 
 如果环境声明里配置了 `logs:`，对应的日志文件也会落到：
 
 ```text
 sample-projects/.testrunner/reports/env/
+sample-projects/.testrunner/reports/slot-<id>/
 ```
 
 如果你想看这套环境文件的完整 DSL、执行顺序和 `environment_artifacts` 报告结构，请继续阅读 [环境 DSL](/guide/environment-dsl)。
@@ -247,7 +254,7 @@ sample-projects/.testrunner/reports/env/
 
 在给团队推广之前，建议先明确这些边界：
 
-- 当前按 case 串行执行，还没有并行调度。
+- 默认仍以串行为主；只有 `containers + parallel.slots + --parallel` 会启用 slot 并行调度。
 - `report-format=junit` 尚未实现。
 - `api.timeout_ms` 目前不会覆盖全局 HTTP 超时。
 - Redis `key_prefix` 只是配置字段，不会自动拼接到命令参数。

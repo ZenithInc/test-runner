@@ -7,16 +7,21 @@ use serde_json::{Value, json};
 use sqlx::mysql::{MySqlPool, MySqlRow};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Column, ColumnIndex, Decode, Row, Type, TypeInfo};
+use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::io::{self, IsTerminal};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
+use url::Url;
 
 use crate::callback::{
     CallbackReport, CallbackRuntime, CallbackSummaryReport, PreparedRequest,
@@ -80,65 +85,71 @@ pub async fn run(command: TestCommand) -> Result<()> {
         bail!("junit output is planned but not implemented yet");
     }
 
-    let mut runner = Runner::new(project, options.report_format);
-    runner
-        .console
-        .run_started(&target, &runner.project.environment_name, selected_cases.len());
+    let parallel_jobs = resolve_parallel_jobs(&project, &options, selected_cases.len())?;
+    let console = SummaryConsole::new(options.report_format);
+    console.run_started(
+        &target,
+        &project.environment_name,
+        selected_cases.len(),
+        parallel_jobs,
+    );
     let should_start_mock = options
         .mock_override()
-        .unwrap_or(runner.project.project.mock.enabled)
-        && !runner.project.mock_routes.is_empty();
-    let manages_environment = manages_environment(&runner.project.environment);
+        .unwrap_or(project.project.mock.enabled)
+        && !project.mock_routes.is_empty();
+    let manages_environment = manages_environment(&project.environment);
 
-    let mut mock_server = if should_start_mock {
-        runner.console.mock_starting();
-        let handle = mock::start(
-            &runner.project,
-            runner.request_context.clone(),
-            runner.callback_runtime.clone(),
-        )
-        .await?;
-        runner.console.mock_ready(&handle.base_url);
-        runner.project.environment.variables.insert(
-            "mock_base_url".to_string(),
-            Value::String(handle.base_url.clone()),
-        );
-        Some(handle)
-    } else {
-        None
-    };
-    let mut environment_session = match EnvironmentSession::new(&runner.project) {
+    let mut environment_session = match EnvironmentSession::new(&project, parallel_jobs.unwrap_or(1)) {
         Ok(session) => session,
         Err(error) => {
             if manages_environment {
-                runner
-                    .console
-                    .environment_failed(&runner.project.environment_name, &error);
-            }
-            if let Some(server) = mock_server.take() {
-                server.shutdown().await;
+                console.environment_failed(&project.environment_name, &error);
             }
             return Err(error);
         }
     };
     if manages_environment {
-        runner
-            .console
-            .environment_starting(&runner.project.environment_name, &runner.project.environment);
+        console.environment_starting(&project.environment_name, &project.environment);
     }
+    let mut mock_servers: Vec<mock::MockServerHandle> = Vec::new();
     let execution_result = match environment_session.prepare().await {
         Ok(()) => {
             if manages_environment {
-                runner.console.environment_ready(&runner.project.environment_name);
+                console.environment_ready(&project.environment_name);
             }
-            inject_port_mappings(&environment_session, &mut runner.project.environment);
-            runner.execute(&selected_cases, &options, &target).await
+            match build_slot_execution_contexts(&environment_session, should_start_mock, &console).await {
+                Ok((slot_contexts, servers)) => {
+                    mock_servers = servers;
+                    if let Some(jobs) = parallel_jobs {
+                        execute_cases_parallel(
+                            slot_contexts,
+                            &selected_cases,
+                            &options,
+                            &target,
+                            &console,
+                            jobs,
+                        )
+                        .await
+                    } else {
+                        let slot_context = slot_contexts
+                            .into_iter()
+                            .next()
+                            .context("no execution slot was prepared")?;
+                        let mut runner = Runner::new_with_callback_runtime(
+                            slot_context.project,
+                            options.report_format,
+                            slot_context.callback_runtime,
+                            None,
+                        );
+                        runner.execute(&selected_cases, &options, &target).await
+                    }
+                }
+                Err(error) => Err(error),
+            }
         }
         Err(error) => {
             if manages_environment {
-                runner
-                    .console
-                    .environment_failed(&runner.project.environment_name, &error);
+                console.environment_failed(&project.environment_name, &error);
             }
             Err(error)
         }
@@ -149,7 +160,7 @@ pub async fn run(command: TestCommand) -> Result<()> {
     };
     let environment_artifacts = environment_session.finish(execution_succeeded).await;
 
-    if let Some(server) = mock_server.take() {
+    for server in mock_servers.drain(..) {
         server.shutdown().await;
     }
 
@@ -157,7 +168,7 @@ pub async fn run(command: TestCommand) -> Result<()> {
     if !environment_artifacts.is_empty() {
         report.environment_artifacts = Some(environment_artifacts);
     }
-    let report_path = write_report(&runner.project.runner_root, &report)?;
+    let report_path = write_report(&project.runner_root, &report)?;
     print_report(&report, &report_path, options.report_format)?;
 
     if report.summary.failed > 0 {
@@ -196,104 +207,136 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
     }
 
     let project = load_project(&options.root, options.env.as_deref())?;
-    let workflow = project
-        .workflows
-        .get(&args.workflow_id)
-        .with_context(|| {
-            format!(
-                "workflow `{}` not found in {TESTRUNNER_DIR}",
-                args.workflow_id
-            )
-        })?
-        .clone();
+    let workflows = select_workflows(&project, &args)?;
 
     if options.dry_run {
-        print_workflow_dry_run(&workflow, &project.environment_name);
+        if workflows.len() == 1 {
+            print_workflow_dry_run(&workflows[0], &project.environment_name);
+        } else {
+            print_workflows_dry_run(&workflows, &project.environment_name);
+        }
         return Ok(());
     }
 
-    let mut runner = Runner::new(project, options.report_format);
-    runner
-        .console
-        .workflow_started(&workflow.id, &runner.project.environment_name);
+    let parallel_jobs = resolve_parallel_jobs(&project, options, workflows.len())?;
+    let console = SummaryConsole::new(options.report_format);
+    if workflows.len() == 1 && parallel_jobs.is_none() {
+        console.workflow_started(&workflows[0].id, &project.environment_name);
+    } else {
+        console.workflows_started(workflows.len(), &project.environment_name, parallel_jobs);
+    }
     let should_start_mock = options
         .mock_override()
-        .unwrap_or(runner.project.project.mock.enabled)
-        && !runner.project.mock_routes.is_empty();
-    let manages_environment = manages_environment(&runner.project.environment);
+        .unwrap_or(project.project.mock.enabled)
+        && !project.mock_routes.is_empty();
+    let manages_environment = manages_environment(&project.environment);
 
-    let mut mock_server = if should_start_mock {
-        runner.console.mock_starting();
-        let handle = mock::start(
-            &runner.project,
-            runner.request_context.clone(),
-            runner.callback_runtime.clone(),
-        )
-        .await?;
-        runner.console.mock_ready(&handle.base_url);
-        runner.project.environment.variables.insert(
-            "mock_base_url".to_string(),
-            Value::String(handle.base_url.clone()),
-        );
-        Some(handle)
-    } else {
-        None
-    };
-    let mut environment_session = match EnvironmentSession::new(&runner.project) {
+    let mut environment_session = match EnvironmentSession::new(&project, parallel_jobs.unwrap_or(1)) {
         Ok(session) => session,
         Err(error) => {
             if manages_environment {
-                runner
-                    .console
-                    .environment_failed(&runner.project.environment_name, &error);
-            }
-            if let Some(server) = mock_server.take() {
-                server.shutdown().await;
+                console.environment_failed(&project.environment_name, &error);
             }
             return Err(error);
         }
     };
     if manages_environment {
-        runner
-            .console
-            .environment_starting(&runner.project.environment_name, &runner.project.environment);
+        console.environment_starting(&project.environment_name, &project.environment);
     }
+    let mut mock_servers: Vec<mock::MockServerHandle> = Vec::new();
     let execution_result = match environment_session.prepare().await {
         Ok(()) => {
             if manages_environment {
-                runner.console.environment_ready(&runner.project.environment_name);
+                console.environment_ready(&project.environment_name);
             }
-            inject_port_mappings(&environment_session, &mut runner.project.environment);
-            runner.execute_workflow(&workflow, &args, options).await
+            match build_slot_execution_contexts(&environment_session, should_start_mock, &console).await {
+                Ok((slot_contexts, servers)) => {
+                    mock_servers = servers;
+                    if workflows.len() == 1 && parallel_jobs.is_none() {
+                        let slot_context = slot_contexts
+                            .into_iter()
+                            .next()
+                            .context("no execution slot was prepared")?;
+                        let mut runner = Runner::new_with_callback_runtime(
+                            slot_context.project,
+                            options.report_format,
+                            slot_context.callback_runtime,
+                            None,
+                        );
+                        runner.execute_workflow(&workflows[0].id, &workflows[0], options).await
+                    } else if let Some(jobs) = parallel_jobs {
+                        let report = execute_workflows_parallel(
+                            slot_contexts,
+                            &workflows,
+                            options,
+                            &console,
+                            jobs,
+                        )
+                        .await?;
+                        Err(anyhow::anyhow!(WorkflowBatchError(report)))
+                    } else {
+                        let slot_context = slot_contexts
+                            .into_iter()
+                            .next()
+                            .context("no execution slot was prepared")?;
+                        let report =
+                            execute_workflows_serial(slot_context, &workflows, options, &console).await?;
+                        Err(anyhow::anyhow!(WorkflowBatchError(report)))
+                    }
+                }
+                Err(error) => Err(error),
+            }
         }
         Err(error) => {
             if manages_environment {
-                runner
-                    .console
-                    .environment_failed(&runner.project.environment_name, &error);
+                console.environment_failed(&project.environment_name, &error);
             }
             Err(error)
         }
     };
-    let execution_succeeded = match &execution_result {
-        Ok(report) => report.status == "passed" && report.callback_summary.failed == 0,
-        Err(_) => false,
+
+    let batch_report = execution_result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<WorkflowBatchError>())
+        .cloned()
+        .map(|error| error.0);
+    let execution_succeeded = match (&execution_result, &batch_report) {
+        (Ok(report), _) => report.status == "passed" && report.callback_summary.failed == 0,
+        (_, Some(report)) => report.summary.failed_workflows == 0 && report.callback_summary.failed == 0,
+        _ => false,
     };
     let environment_artifacts = environment_session.finish(execution_succeeded).await;
 
-    if let Some(server) = mock_server.take() {
+    for server in mock_servers.drain(..) {
         server.shutdown().await;
+    }
+
+    if let Some(mut report) = batch_report {
+        if !environment_artifacts.is_empty() {
+            report.environment_artifacts = Some(environment_artifacts);
+        }
+        let report_path = write_workflow_batch_report(&project.runner_root, &report)?;
+        print_workflow_batch_report(&report, &report_path, options.report_format)?;
+        if report.summary.failed_workflows > 0 {
+            bail!(
+                "{} of {} workflow(s) failed",
+                report.summary.failed_workflows,
+                report.summary.total_workflows
+            );
+        }
+        return Ok(());
     }
 
     let mut report = execution_result?;
     if !environment_artifacts.is_empty() {
         report.environment_artifacts = Some(environment_artifacts);
     }
-    let report_path = write_workflow_report(&runner.project.runner_root, &report)?;
+    let report_path = write_workflow_report(&project.runner_root, &report)?;
     print_workflow_report(&report, &report_path, options.report_format)?;
 
     if report.status == "failed" {
-        bail!("workflow `{}` failed", args.workflow_id);
+        bail!("workflow `{}` failed", report.workflow_id);
     }
 
     Ok(())
@@ -325,6 +368,8 @@ struct RunReport {
     finished_at: String,
     summary: SummaryReport,
     callback_summary: CallbackSummaryReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel: Option<ParallelRunMetadata>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     callbacks: Vec<CallbackReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -332,7 +377,7 @@ struct RunReport {
     cases: Vec<CaseReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct SummaryReport {
     total: usize,
     passed: usize,
@@ -340,18 +385,20 @@ struct SummaryReport {
     duration_ms: u128,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct CaseReport {
     id: String,
     name: String,
     api: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot_id: Option<usize>,
     status: String,
     duration_ms: u128,
     error: Option<String>,
     steps: Vec<StepReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct StepReport {
     kind: String,
     status: String,
@@ -360,12 +407,14 @@ struct StepReport {
     error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct WorkflowRunReport {
     project: String,
     environment: String,
     workflow_id: String,
     workflow_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot_id: Option<usize>,
     started_at: String,
     finished_at: String,
     status: String,
@@ -380,7 +429,39 @@ struct WorkflowRunReport {
     steps: Vec<WorkflowStepReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
+struct ParallelRunMetadata {
+    jobs: usize,
+    slots: usize,
+    unit: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct WorkflowBatchRunReport {
+    project: String,
+    environment: String,
+    started_at: String,
+    finished_at: String,
+    summary: WorkflowBatchSummaryReport,
+    callback_summary: CallbackSummaryReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel: Option<ParallelRunMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    callbacks: Vec<CallbackReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environment_artifacts: Option<EnvironmentArtifactsReport>,
+    workflows: Vec<WorkflowRunReport>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct WorkflowBatchSummaryReport {
+    total_workflows: usize,
+    passed_workflows: usize,
+    failed_workflows: usize,
+    duration_ms: u128,
+}
+
+#[derive(Debug, Serialize, Clone)]
 struct WorkflowSummaryReport {
     executed_steps: usize,
     passed_steps: usize,
@@ -388,7 +469,7 @@ struct WorkflowSummaryReport {
     duration_ms: u128,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct WorkflowStepReport {
     id: String,
     case_id: String,
@@ -492,15 +573,24 @@ impl SummaryConsole {
         }
     }
 
-    fn run_started(&self, target: &TargetSelection, env_name: &str, case_count: usize) {
+    fn run_started(
+        &self,
+        target: &TargetSelection,
+        env_name: &str,
+        case_count: usize,
+        parallel_jobs: Option<usize>,
+    ) {
         if !self.enabled {
             return;
         }
+        let parallel_suffix = parallel_jobs
+            .map(|jobs| format!(" (parallel: {jobs} jobs)"))
+            .unwrap_or_default();
         println!(
             "{}",
             self.styler.phase(format!(
-                "==> Running {case_count} case(s) for {} in env `{env_name}`",
-                target.display()
+                "==> Running {case_count} case(s) for {} in env `{env_name}`{parallel_suffix}",
+                target.display(),
             ))
         );
     }
@@ -513,6 +603,21 @@ impl SummaryConsole {
             "{}",
             self.styler
                 .phase(format!("==> Running workflow `{workflow_id}` in env `{env_name}`"))
+        );
+    }
+
+    fn workflows_started(&self, workflow_count: usize, env_name: &str, parallel_jobs: Option<usize>) {
+        if !self.enabled {
+            return;
+        }
+        let parallel_suffix = parallel_jobs
+            .map(|jobs| format!(" (parallel: {jobs} jobs)"))
+            .unwrap_or_default();
+        println!(
+            "{}",
+            self.styler.phase(format!(
+                "==> Running {workflow_count} workflow(s) in env `{env_name}`{parallel_suffix}"
+            ))
         );
     }
 
@@ -530,6 +635,17 @@ impl SummaryConsole {
         println!(
             "{}",
             self.styler.phase(format!("==> Mock ready at {base_url}"))
+        );
+    }
+
+    fn mock_pool_ready(&self, slot_count: usize) {
+        if !self.enabled {
+            return;
+        }
+        println!(
+            "{}",
+            self.styler
+                .phase(format!("==> {slot_count} embedded mock server slot(s) ready"))
         );
     }
 
@@ -599,11 +715,36 @@ impl SummaryConsole {
         if !self.enabled {
             return;
         }
+        let slot_suffix = report
+            .slot_id
+            .map(|slot_id| format!(" [slot {slot_id}]"))
+            .unwrap_or_default();
         println!(
-            "{} [{index}/{total}] {} ({})",
+            "{} [{index}/{total}] {}{} ({})",
             self.styler.status(&report.status),
             report.id,
+            slot_suffix,
             self.styler.muted(format_duration(report.duration_ms))
+        );
+        if let Some(error) = &report.error {
+            println!("    {error}");
+        }
+    }
+
+    fn workflow_finished(&self, index: usize, total: usize, report: &WorkflowRunReport) {
+        if !self.enabled {
+            return;
+        }
+        let slot_suffix = report
+            .slot_id
+            .map(|slot_id| format!(" [slot {slot_id}]"))
+            .unwrap_or_default();
+        println!(
+            "{} [{index}/{total}] {}{} ({})",
+            self.styler.status(&report.status),
+            report.workflow_id,
+            slot_suffix,
+            self.styler.muted(format_duration(report.summary.duration_ms))
         );
         if let Some(error) = &report.error {
             println!("    {error}");
@@ -639,6 +780,107 @@ struct WorkflowCaseOutcome {
     deferred: Option<DeferredTeardown>,
 }
 
+#[derive(Clone)]
+struct SlotExecutionContext {
+    slot_id: usize,
+    project: LoadedProject,
+    callback_runtime: CallbackRuntime,
+}
+
+#[derive(Clone)]
+struct SlotAllocator {
+    slots: Arc<Vec<SlotExecutionContext>>,
+    available: Arc<Mutex<VecDeque<usize>>>,
+    semaphore: Arc<Semaphore>,
+}
+
+struct SlotLease {
+    slot: SlotExecutionContext,
+    _permit: OwnedSemaphorePermit,
+    available: Arc<Mutex<VecDeque<usize>>>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowBatchError(WorkflowBatchRunReport);
+
+struct CaseTaskResult {
+    index: usize,
+    report: CaseReport,
+    callbacks: Vec<CallbackReport>,
+}
+
+struct WorkflowTaskResult {
+    index: usize,
+    report: WorkflowRunReport,
+}
+
+impl SlotAllocator {
+    fn new(slots: Vec<SlotExecutionContext>) -> Self {
+        let slot_count = slots.len();
+        Self {
+            slots: Arc::new(slots),
+            available: Arc::new(Mutex::new((0..slot_count).collect())),
+            semaphore: Arc::new(Semaphore::new(slot_count)),
+        }
+    }
+
+    fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    async fn acquire(&self) -> Result<SlotLease> {
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .context("slot allocator closed")?;
+        let slot_id = self
+            .available
+            .lock()
+            .expect("slot allocator mutex poisoned")
+            .pop_front()
+            .context("no slot available after acquiring permit")?;
+        let slot = self
+            .slots
+            .get(slot_id)
+            .cloned()
+            .with_context(|| format!("slot `{slot_id}` does not exist"))?;
+        Ok(SlotLease {
+            slot,
+            _permit: permit,
+            available: self.available.clone(),
+        })
+    }
+}
+
+impl SlotLease {
+    fn slot(&self) -> &SlotExecutionContext {
+        &self.slot
+    }
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        self.available
+            .lock()
+            .expect("slot allocator mutex poisoned")
+            .push_back(self.slot.slot_id);
+    }
+}
+
+impl std::fmt::Display for WorkflowBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "workflow batch completed with {} workflow(s)",
+            self.0.summary.total_workflows
+        )
+    }
+}
+
+impl std::error::Error for WorkflowBatchError {}
+
 struct Runner {
     project: LoadedProject,
     http_client: reqwest::Client,
@@ -647,17 +889,18 @@ struct Runner {
     db_pools: HashMap<String, DatabasePool>,
     redis_clients: HashMap<String, redis::Client>,
     console: SummaryConsole,
+    slot_id: Option<usize>,
 }
 
 impl Runner {
-    fn new(project: LoadedProject, report_format: ReportFormat) -> Self {
+    fn new_with_callback_runtime(
+        project: LoadedProject,
+        report_format: ReportFormat,
+        callback_runtime: CallbackRuntime,
+        slot_id: Option<usize>,
+    ) -> Self {
         let request_context = RequestPreparationContext::from_project(&project);
-        let timeout = std::time::Duration::from_millis(project.project.defaults.timeout_ms);
-        let http_client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("failed to build reqwest client");
-        let callback_runtime = CallbackRuntime::new(http_client.clone());
+        let http_client = build_http_client(&project);
         Self {
             project,
             http_client,
@@ -666,6 +909,7 @@ impl Runner {
             db_pools: HashMap::new(),
             redis_clients: HashMap::new(),
             console: SummaryConsole::new(report_format),
+            slot_id,
         }
     }
 
@@ -712,6 +956,7 @@ impl Runner {
                 duration_ms: started.elapsed().as_millis(),
             },
             callback_summary,
+            parallel: None,
             callbacks,
             environment_artifacts: None,
             cases: reports,
@@ -720,8 +965,8 @@ impl Runner {
 
     async fn execute_workflow(
         &mut self,
+        workflow_id: &str,
         workflow: &LoadedWorkflow,
-        args: &TestWorkflowArgs,
         options: &CommonTestArgs,
     ) -> Result<WorkflowRunReport> {
         let started_at = Utc::now().to_rfc3339();
@@ -796,8 +1041,9 @@ impl Runner {
         Ok(WorkflowRunReport {
             project: self.project.project.project.name.clone(),
             environment: self.project.environment_name.clone(),
-            workflow_id: args.workflow_id.clone(),
+            workflow_id: workflow_id.to_string(),
             workflow_name: workflow.definition.name.clone(),
+            slot_id: self.slot_id,
             started_at,
             finished_at: Utc::now().to_rfc3339(),
             status: status.to_string(),
@@ -829,7 +1075,7 @@ impl Runner {
         fail_fast: bool,
         stop_execution: &'a mut bool,
         executed_run_case_steps: &'a mut usize,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             for step in steps {
                 if *stop_execution {
@@ -1116,6 +1362,7 @@ impl Runner {
                     id: case.id.clone(),
                     name: case.definition.name.clone(),
                     api: case.definition.api.clone(),
+                    slot_id: self.slot_id,
                     status: "failed".to_string(),
                     duration_ms: started.elapsed().as_millis(),
                     error: Some(format!("API `{}` was not found", case.definition.api)),
@@ -1129,6 +1376,7 @@ impl Runner {
                 id: case.id.clone(),
                 name: case.definition.name.clone(),
                 api: case.definition.api.clone(),
+                slot_id: self.slot_id,
                 status: "passed".to_string(),
                 duration_ms: started.elapsed().as_millis(),
                 error: None,
@@ -1138,6 +1386,7 @@ impl Runner {
                 id: case.id.clone(),
                 name: case.definition.name.clone(),
                 api: case.definition.api.clone(),
+                slot_id: self.slot_id,
                 status: "failed".to_string(),
                 duration_ms: started.elapsed().as_millis(),
                 error: Some(error.to_string()),
@@ -1207,7 +1456,7 @@ impl Runner {
         steps: &'a [Step],
         context: &'a mut ExecutionContext<'_>,
         reports: &'a mut Vec<StepReport>,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             for step in steps {
                 self.execute_single_step(step, context, reports).await?;
@@ -1616,6 +1865,548 @@ impl Runner {
     }
 }
 
+fn build_http_client(project: &LoadedProject) -> reqwest::Client {
+    let timeout = std::time::Duration::from_millis(project.project.defaults.timeout_ms);
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("failed to build reqwest client")
+}
+
+fn resolve_parallel_jobs(
+    project: &LoadedProject,
+    options: &CommonTestArgs,
+    unit_count: usize,
+) -> Result<Option<usize>> {
+    if !options.parallel_requested() || unit_count <= 1 {
+        return Ok(None);
+    }
+    let runtime = project
+        .environment
+        .runtime
+        .as_ref()
+        .context("--parallel requires environment.runtime to be configured")?;
+    if runtime.kind != crate::config::EnvironmentRuntimeKind::Containers {
+        bail!("--parallel requires environment.runtime.kind = containers");
+    }
+    let jobs = match options.jobs {
+        Some(0) => bail!("--jobs must be greater than zero"),
+        Some(jobs) => jobs,
+        None => runtime
+            .parallel
+            .as_ref()
+            .map(|parallel| parallel.slots)
+            .context("--parallel requires environment.runtime.parallel.slots or --jobs")?,
+    };
+    if jobs == 0 {
+        bail!("--jobs must be greater than zero");
+    }
+    Ok(Some(jobs.min(unit_count)))
+}
+
+fn select_workflows(project: &LoadedProject, args: &TestWorkflowArgs) -> Result<Vec<LoadedWorkflow>> {
+    if args.all {
+        let workflows = project.workflows.values().cloned().collect::<Vec<_>>();
+        if workflows.is_empty() {
+            bail!("no workflow definitions were found under {TESTRUNNER_DIR}/workflows");
+        }
+        return Ok(workflows);
+    }
+
+    let workflow_id = args
+        .workflow_id
+        .as_deref()
+        .context("workflow id is required unless --all is specified")?;
+    let workflow = project
+        .workflows
+        .get(workflow_id)
+        .with_context(|| format!("workflow `{workflow_id}` not found in {TESTRUNNER_DIR}"))?
+        .clone();
+    Ok(vec![workflow])
+}
+
+fn print_workflows_dry_run(workflows: &[LoadedWorkflow], env_name: &str) {
+    println!(
+        "Selected {} workflow(s) in env `{env_name}`:",
+        workflows.len()
+    );
+    for workflow in workflows {
+        println!(
+            "  - {} ({}) — {} step(s)",
+            workflow.id,
+            workflow.definition.name,
+            count_run_case_steps(&workflow.definition.steps)
+        );
+    }
+}
+
+async fn build_slot_execution_contexts(
+    session: &EnvironmentSession,
+    should_start_mock: bool,
+    console: &SummaryConsole,
+) -> Result<(Vec<SlotExecutionContext>, Vec<mock::MockServerHandle>)> {
+    let slot_ids = if session.slots().is_empty() {
+        vec![0]
+    } else {
+        session.slots().iter().map(|slot| slot.slot_id).collect::<Vec<_>>()
+    };
+
+    let mut contexts = Vec::new();
+    let mut mock_servers: Vec<mock::MockServerHandle> = Vec::new();
+    let mut first_mock_base_url = None;
+
+    if should_start_mock {
+        console.mock_starting();
+    }
+
+    let multi_slot_mock = should_start_mock && slot_ids.len() > 1;
+
+    for slot_id in slot_ids {
+        let base_project = match session.project_for_slot(slot_id) {
+            Ok(project) => project,
+            Err(error) => {
+                for server in mock_servers.drain(..) {
+                    server.shutdown().await;
+                }
+                return Err(error);
+            }
+        };
+        let callback_runtime = CallbackRuntime::new(build_http_client(&base_project));
+        let mut execution_project = base_project.clone();
+
+        if should_start_mock {
+            let mut mock_project = base_project.clone();
+            if multi_slot_mock {
+                mock_project.project.mock.port = 0;
+            }
+            let handle = match mock::start(
+                &mock_project,
+                RequestPreparationContext::from_project(&mock_project),
+                callback_runtime.clone(),
+            )
+            .await
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    for server in mock_servers.drain(..) {
+                        server.shutdown().await;
+                    }
+                    return Err(error);
+                }
+            };
+            if first_mock_base_url.is_none() {
+                first_mock_base_url = Some(handle.base_url.clone());
+            }
+            apply_mock_base_url(&mut execution_project, &handle)?;
+            mock_servers.push(handle);
+        }
+
+        contexts.push(SlotExecutionContext {
+            slot_id,
+            project: execution_project,
+            callback_runtime,
+        });
+    }
+
+    if let Some(base_url) = first_mock_base_url {
+        if mock_servers.len() == 1 {
+            console.mock_ready(&base_url);
+        } else {
+            console.mock_pool_ready(mock_servers.len());
+        }
+    }
+
+    Ok((contexts, mock_servers))
+}
+
+fn apply_mock_base_url(project: &mut LoadedProject, handle: &mock::MockServerHandle) -> Result<()> {
+    let local_base_url = handle.base_url.clone();
+    project.environment.variables.insert(
+        "mock_base_url".to_string(),
+        Value::String(local_base_url.clone()),
+    );
+
+    let replacement_url = if project.environment.runtime.is_some() {
+        container_visible_mock_base_url(&local_base_url)?
+    } else {
+        local_base_url.clone()
+    };
+    rewrite_mock_urls(project, project.project.mock.port, &replacement_url);
+    Ok(())
+}
+
+fn container_visible_mock_base_url(base_url: &str) -> Result<String> {
+    let url = Url::parse(base_url).with_context(|| format!("invalid mock base URL `{base_url}`"))?;
+    let port = url
+        .port()
+        .with_context(|| format!("mock base URL `{base_url}` does not contain a port"))?;
+    Ok(format!("http://host.docker.internal:{port}"))
+}
+
+fn rewrite_mock_urls(project: &mut LoadedProject, original_port: u16, replacement_base_url: &str) {
+    rewrite_mock_url_in_place(&mut project.environment.base_url, original_port, replacement_base_url);
+    for value in project.environment.variables.values_mut() {
+        rewrite_mock_value(value, original_port, replacement_base_url);
+    }
+    for api in project.apis.values_mut() {
+        if let Some(base_url) = api.definition.base_url.as_mut() {
+            rewrite_mock_url_in_place(base_url, original_port, replacement_base_url);
+        }
+    }
+}
+
+fn rewrite_mock_value(value: &mut Value, original_port: u16, replacement_base_url: &str) {
+    match value {
+        Value::String(text) => rewrite_mock_url_in_place(text, original_port, replacement_base_url),
+        Value::Array(items) => {
+            for item in items {
+                rewrite_mock_value(item, original_port, replacement_base_url);
+            }
+        }
+        Value::Object(object) => {
+            for item in object.values_mut() {
+                rewrite_mock_value(item, original_port, replacement_base_url);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_mock_url_in_place(text: &mut String, original_port: u16, replacement_base_url: &str) {
+    let Ok(mut url) = Url::parse(text) else {
+        return;
+    };
+    let Some(host) = url.host_str() else {
+        return;
+    };
+    if !matches!(
+        host,
+        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "host.docker.internal"
+    ) {
+        return;
+    }
+    if url.port() != Some(original_port) {
+        return;
+    }
+    let Ok(replacement) = Url::parse(replacement_base_url) else {
+        return;
+    };
+    let _ = url.set_scheme(replacement.scheme());
+    let _ = url.set_host(replacement.host_str());
+    let _ = url.set_port(replacement.port());
+    *text = render_url_without_root_slash(&url);
+}
+
+fn render_url_without_root_slash(url: &Url) -> String {
+    let rendered = url.to_string();
+    if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
+        rendered.trim_end_matches('/').to_string()
+    } else {
+        rendered
+    }
+}
+
+async fn execute_cases_parallel(
+    slot_contexts: Vec<SlotExecutionContext>,
+    cases: &[LoadedCase],
+    options: &CommonTestArgs,
+    target: &TargetSelection,
+    console: &SummaryConsole,
+    jobs: usize,
+) -> Result<RunReport> {
+    let first_slot = slot_contexts
+        .first()
+        .context("parallel case run requires at least one execution slot")?;
+    let project_name = first_slot.project.project.project.name.clone();
+    let environment_name = first_slot.project.environment_name.clone();
+    let allocator = SlotAllocator::new(slot_contexts);
+    let started_at = Utc::now().to_rfc3339();
+    let started = Instant::now();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut join_set = JoinSet::new();
+    let mut next_index = 0usize;
+    let mut completed = 0usize;
+    let mut reports = std::iter::repeat_with(|| None)
+        .take(cases.len())
+        .collect::<Vec<Option<CaseTaskResult>>>();
+
+    while next_index < cases.len() && join_set.len() < jobs {
+        spawn_case_task(
+            &mut join_set,
+            next_index,
+            cases[next_index].clone(),
+            options.clone(),
+            target.clone(),
+            allocator.clone(),
+        )
+        .await?;
+        next_index += 1;
+    }
+
+    while let Some(joined) = join_set.join_next().await {
+        let result = joined.context("case task failed to join")??;
+        completed += 1;
+        console.case_finished(completed, cases.len(), &result.report);
+        if result.report.status == "failed" && options.fail_fast {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        let should_spawn_more = !(options.fail_fast && cancel.load(Ordering::SeqCst));
+        let result_index = result.index;
+        reports[result_index] = Some(result);
+        if should_spawn_more && next_index < cases.len() {
+            spawn_case_task(
+                &mut join_set,
+                next_index,
+                cases[next_index].clone(),
+                options.clone(),
+                target.clone(),
+                allocator.clone(),
+            )
+            .await?;
+            next_index += 1;
+        }
+    }
+
+    let mut callbacks = Vec::new();
+    let mut ordered_reports = Vec::new();
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    for task_result in reports.into_iter().flatten() {
+        if task_result.report.status == "failed" {
+            failed += 1;
+        } else {
+            passed += 1;
+        }
+        callbacks.extend(task_result.callbacks);
+        ordered_reports.push(task_result.report);
+    }
+    let callback_summary = CallbackSummaryReport::from_reports(&callbacks);
+
+    Ok(RunReport {
+        project: project_name,
+        environment: environment_name,
+        target: target.display(),
+        started_at,
+        finished_at: Utc::now().to_rfc3339(),
+        summary: SummaryReport {
+            total: ordered_reports.len(),
+            passed,
+            failed,
+            duration_ms: started.elapsed().as_millis(),
+        },
+        callback_summary,
+        parallel: Some(ParallelRunMetadata {
+            jobs,
+            slots: allocator.slot_count(),
+            unit: "case".to_string(),
+        }),
+        callbacks,
+        environment_artifacts: None,
+        cases: ordered_reports,
+    })
+}
+
+async fn spawn_case_task(
+    join_set: &mut JoinSet<Result<CaseTaskResult>>,
+    index: usize,
+    case: LoadedCase,
+    options: CommonTestArgs,
+    target: TargetSelection,
+    allocator: SlotAllocator,
+) -> Result<()> {
+    join_set.spawn(async move {
+        let lease = allocator.acquire().await?;
+        let slot = lease.slot().clone();
+        let mut runner = Runner::new_with_callback_runtime(
+            slot.project,
+            ReportFormat::Json,
+            slot.callback_runtime,
+            Some(slot.slot_id),
+        );
+        let run_report = runner.execute(std::slice::from_ref(&case), &options, &target).await?;
+        let case_report = run_report
+            .cases
+            .into_iter()
+            .next()
+            .context("expected single case report")?;
+        Ok(CaseTaskResult {
+            index,
+            report: case_report,
+            callbacks: run_report.callbacks,
+        })
+    });
+    Ok(())
+}
+
+async fn execute_workflows_serial(
+    slot_context: SlotExecutionContext,
+    workflows: &[LoadedWorkflow],
+    options: &CommonTestArgs,
+    console: &SummaryConsole,
+) -> Result<WorkflowBatchRunReport> {
+    let started_at = Utc::now().to_rfc3339();
+    let started = Instant::now();
+    let mut reports = Vec::new();
+    let mut callbacks = Vec::new();
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+
+    for (index, workflow) in workflows.iter().enumerate() {
+        let mut runner = Runner::new_with_callback_runtime(
+            slot_context.project.clone(),
+            ReportFormat::Json,
+            slot_context.callback_runtime.clone(),
+            None,
+        );
+        let report = runner.execute_workflow(&workflow.id, workflow, options).await?;
+        console.workflow_finished(index + 1, workflows.len(), &report);
+        if report.status == "failed" {
+            failed += 1;
+        } else {
+            passed += 1;
+        }
+        callbacks.extend(report.callbacks.clone());
+        reports.push(report);
+        if failed > 0 && options.fail_fast {
+            break;
+        }
+    }
+
+    Ok(WorkflowBatchRunReport {
+        project: slot_context.project.project.project.name.clone(),
+        environment: slot_context.project.environment_name.clone(),
+        started_at,
+        finished_at: Utc::now().to_rfc3339(),
+        summary: WorkflowBatchSummaryReport {
+            total_workflows: reports.len(),
+            passed_workflows: passed,
+            failed_workflows: failed,
+            duration_ms: started.elapsed().as_millis(),
+        },
+        callback_summary: CallbackSummaryReport::from_reports(&callbacks),
+        parallel: None,
+        callbacks,
+        environment_artifacts: None,
+        workflows: reports,
+    })
+}
+
+async fn execute_workflows_parallel(
+    slot_contexts: Vec<SlotExecutionContext>,
+    workflows: &[LoadedWorkflow],
+    options: &CommonTestArgs,
+    console: &SummaryConsole,
+    jobs: usize,
+) -> Result<WorkflowBatchRunReport> {
+    let allocator = SlotAllocator::new(slot_contexts);
+    let started_at = Utc::now().to_rfc3339();
+    let started = Instant::now();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut join_set = JoinSet::new();
+    let mut next_index = 0usize;
+    let mut completed = 0usize;
+    let mut reports = std::iter::repeat_with(|| None)
+        .take(workflows.len())
+        .collect::<Vec<Option<WorkflowTaskResult>>>();
+
+    while next_index < workflows.len() && join_set.len() < jobs {
+        spawn_workflow_task(
+            &mut join_set,
+            next_index,
+            workflows[next_index].clone(),
+            options.clone(),
+            allocator.clone(),
+        )
+        .await?;
+        next_index += 1;
+    }
+
+    while let Some(joined) = join_set.join_next().await {
+        let result = joined.context("workflow task failed to join")??;
+        completed += 1;
+        console.workflow_finished(completed, workflows.len(), &result.report);
+        if result.report.status == "failed" && options.fail_fast {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        let should_spawn_more = !(options.fail_fast && cancel.load(Ordering::SeqCst));
+        let result_index = result.index;
+        reports[result_index] = Some(result);
+        if should_spawn_more && next_index < workflows.len() {
+            spawn_workflow_task(
+                &mut join_set,
+                next_index,
+                workflows[next_index].clone(),
+                options.clone(),
+                allocator.clone(),
+            )
+            .await?;
+            next_index += 1;
+        }
+    }
+
+    let mut callbacks = Vec::new();
+    let mut ordered_reports = Vec::new();
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    for task_result in reports.into_iter().flatten() {
+        if task_result.report.status == "failed" {
+            failed += 1;
+        } else {
+            passed += 1;
+        }
+        callbacks.extend(task_result.report.callbacks.clone());
+        ordered_reports.push(task_result.report);
+    }
+    let first = ordered_reports
+        .first()
+        .context("parallel workflow run did not produce any reports")?;
+    Ok(WorkflowBatchRunReport {
+        project: first.project.clone(),
+        environment: first.environment.clone(),
+        started_at,
+        finished_at: Utc::now().to_rfc3339(),
+        summary: WorkflowBatchSummaryReport {
+            total_workflows: ordered_reports.len(),
+            passed_workflows: passed,
+            failed_workflows: failed,
+            duration_ms: started.elapsed().as_millis(),
+        },
+        callback_summary: CallbackSummaryReport::from_reports(&callbacks),
+        parallel: Some(ParallelRunMetadata {
+            jobs,
+            slots: allocator.slot_count(),
+            unit: "workflow".to_string(),
+        }),
+        callbacks,
+        environment_artifacts: None,
+        workflows: ordered_reports,
+    })
+}
+
+async fn spawn_workflow_task(
+    join_set: &mut JoinSet<Result<WorkflowTaskResult>>,
+    index: usize,
+    workflow: LoadedWorkflow,
+    options: CommonTestArgs,
+    allocator: SlotAllocator,
+) -> Result<()> {
+    join_set.spawn(async move {
+        let lease = allocator.acquire().await?;
+        let slot = lease.slot().clone();
+        let mut runner = Runner::new_with_callback_runtime(
+            slot.project,
+            ReportFormat::Json,
+            slot.callback_runtime,
+            Some(slot.slot_id),
+        );
+        let report = runner
+            .execute_workflow(&workflow.id, &workflow, &options)
+            .await?;
+        Ok(WorkflowTaskResult { index, report })
+    });
+    Ok(())
+}
+
 enum DatabasePool {
     Mysql(MySqlPool),
     Postgres(PgPool),
@@ -1947,6 +2738,14 @@ fn write_workflow_report(root: &Path, report: &WorkflowRunReport) -> Result<Path
     Ok(report_path)
 }
 
+fn write_workflow_batch_report(root: &Path, report: &WorkflowBatchRunReport) -> Result<PathBuf> {
+    let report_dir = root.join("reports");
+    fs::create_dir_all(&report_dir)?;
+    let report_path = report_dir.join("last-workflows-run.json");
+    fs::write(&report_path, serde_json::to_string_pretty(report)?)?;
+    Ok(report_path)
+}
+
 fn print_report(report: &RunReport, report_path: &Path, format: ReportFormat) -> Result<()> {
     match format {
         ReportFormat::Summary => {
@@ -1964,6 +2763,14 @@ fn print_report(report: &RunReport, report_path: &Path, format: ReportFormat) ->
                     styler.success(report.callback_summary.passed.to_string()),
                     styler.failure(report.callback_summary.failed.to_string()),
                     styler.info(report.callback_summary.total.to_string())
+                );
+            }
+            if let Some(parallel) = &report.parallel {
+                println!(
+                    "  Parallel: {} {}(s) across {} slot(s)",
+                    styler.info(parallel.jobs.to_string()),
+                    parallel.unit,
+                    styler.info(parallel.slots.to_string())
                 );
             }
             print_environment_summary(&styler, report.environment_artifacts.as_ref());
@@ -2016,31 +2823,52 @@ fn print_workflow_report(
     Ok(())
 }
 
-fn manages_environment(environment: &EnvironmentConfig) -> bool {
-    environment.runtime.is_some() || !environment.readiness.is_empty() || !environment.logs.is_empty()
+fn print_workflow_batch_report(
+    report: &WorkflowBatchRunReport,
+    report_path: &Path,
+    format: ReportFormat,
+) -> Result<()> {
+    match format {
+        ReportFormat::Summary => {
+            let styler = TerminalStyler::detect();
+            print_summary_header(&styler);
+            println!(
+                "  Workflows: {} passed, {} failed, {} total",
+                styler.success(report.summary.passed_workflows.to_string()),
+                styler.failure(report.summary.failed_workflows.to_string()),
+                styler.info(report.summary.total_workflows.to_string())
+            );
+            if report.callback_summary.total > 0 {
+                println!(
+                    "  Callbacks: {} passed, {} failed, {} total",
+                    styler.success(report.callback_summary.passed.to_string()),
+                    styler.failure(report.callback_summary.failed.to_string()),
+                    styler.info(report.callback_summary.total.to_string())
+                );
+            }
+            if let Some(parallel) = &report.parallel {
+                println!(
+                    "  Parallel: {} {}(s) across {} slot(s)",
+                    styler.info(parallel.jobs.to_string()),
+                    parallel.unit,
+                    styler.info(parallel.slots.to_string())
+                );
+            }
+            print_environment_summary(&styler, report.environment_artifacts.as_ref());
+            print_summary_metadata(&styler, report_path, report.summary.duration_ms);
+            print_callback_details(&styler, &report.callbacks);
+        }
+        ReportFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(report)?);
+            println!("Report written to {}", report_path.display());
+        }
+        ReportFormat::Junit => {}
+    }
+    Ok(())
 }
 
-/// Inject dynamic port mappings from the containers runtime into environment variables.
-/// This makes ports accessible in DSL via `{{ env.variables.runtime_ports.<service>.<container_port> }}`.
-fn inject_port_mappings(
-    session: &EnvironmentSession,
-    environment: &mut EnvironmentConfig,
-) {
-    if session.port_mappings.is_empty() {
-        return;
-    }
-    let mut ports_map = serde_json::Map::new();
-    for (service, mapping) in &session.port_mappings {
-        let mut service_map = serde_json::Map::new();
-        for (container_port, host_port) in mapping {
-            service_map.insert(container_port.to_string(), json!(host_port));
-        }
-        ports_map.insert(service.clone(), Value::Object(service_map));
-    }
-    environment.variables.insert(
-        "runtime_ports".to_string(),
-        Value::Object(ports_map),
-    );
+fn manages_environment(environment: &EnvironmentConfig) -> bool {
+    environment.runtime.is_some() || !environment.readiness.is_empty() || !environment.logs.is_empty()
 }
 
 fn count_run_case_steps(steps: &[WorkflowStep]) -> usize {
@@ -2088,9 +2916,13 @@ fn print_environment_summary(
 
     println!("  {}", styler.section("Environment:"));
     if let Some(runtime) = &environment_artifacts.runtime {
+        let runtime_label = match runtime.slots {
+            Some(slots) => format!("{} x{slots}", runtime.kind),
+            None => runtime.kind.clone(),
+        };
         println!(
             "    Runtime: {} (startup: {}, shutdown: {})",
-            styler.info(runtime.kind.clone()),
+            styler.info(runtime_label),
             styler.status(runtime.startup_status.as_deref().unwrap_or("n/a")),
             styler.status(runtime.shutdown_status.as_deref().unwrap_or("n/a"))
         );
@@ -2253,6 +3085,8 @@ mod tests {
                 tag: vec![],
                 case_pattern: None,
                 fail_fast: false,
+                parallel: false,
+                jobs: None,
                 dry_run: true,
                 mock: false,
                 no_mock: false,
@@ -2295,6 +3129,72 @@ steps:
             project.workflows.contains_key("smoke-flow"),
             "workflow should be loaded"
         );
+    }
+
+    #[tokio::test]
+    async fn select_workflows_supports_all_flag() {
+        let temp = tempdir().expect("tempdir");
+        init::run(InitArgs {
+            root: temp.path().to_path_buf(),
+            force: false,
+            env_template: EnvTemplate::Local,
+            with_mock: true,
+        })
+        .await
+        .expect("init");
+
+        let wf_dir = temp.path().join(".testrunner/workflows");
+        std::fs::create_dir_all(&wf_dir).expect("create workflows dir");
+        std::fs::write(
+            wf_dir.join("smoke-flow.yaml"),
+            r#"name: smoke flow
+steps:
+  - run_case:
+      id: health
+      case: user/create-user/happy-path
+      cleanup: immediate
+"#,
+        )
+        .expect("write smoke workflow");
+        std::fs::write(
+            wf_dir.join("login-flow.yaml"),
+            r#"name: login flow
+steps:
+  - run_case:
+      id: login
+      case: user/login/happy-path
+      cleanup: immediate
+"#,
+        )
+        .expect("write login workflow");
+
+        let project = load_project(temp.path(), None).expect("load project");
+        let workflows = select_workflows(
+            &project,
+            &TestWorkflowArgs {
+                workflow_id: None,
+                all: true,
+                common: CommonTestArgs {
+                    root: temp.path().to_path_buf(),
+                    env: None,
+                    tag: vec![],
+                    case_pattern: None,
+                    fail_fast: false,
+                    parallel: false,
+                    jobs: None,
+                    dry_run: true,
+                    mock: false,
+                    no_mock: false,
+                    report_format: ReportFormat::Summary,
+                },
+            },
+        )
+        .expect("select workflows");
+
+        assert!(workflows.len() >= 2);
+        let workflow_ids = workflows.iter().map(|workflow| workflow.id.as_str()).collect::<Vec<_>>();
+        assert!(workflow_ids.contains(&"login-flow"));
+        assert!(workflow_ids.contains(&"smoke-flow"));
     }
 
     #[test]

@@ -81,6 +81,11 @@ pub async fn start(
         .await
         .with_context(|| format!("failed to bind mock server on {address}"))?;
     let local_addr = listener.local_addr()?;
+    let advertised_host = if local_addr.ip().is_unspecified() {
+        "127.0.0.1".to_string()
+    } else {
+        local_addr.ip().to_string()
+    };
 
     let app = Router::new()
         .fallback(any(handle_request))
@@ -97,7 +102,7 @@ pub async fn start(
     });
 
     Ok(MockServerHandle {
-        base_url: format!("http://{local_addr}"),
+        base_url: format!("http://{advertised_host}:{}", local_addr.port()),
         shutdown: Some(shutdown_tx),
         join_handle,
     })

@@ -20,3 +20,5 @@ Thumbs.db
 *.swo
 *~
 sample-projects/.testrunner/reports/env/
+sample-projects/.testrunner/reports/slot-*/
+sample-projects/.testrunner/reports/last-workflows-run.json

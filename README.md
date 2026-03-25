@@ -6,6 +6,7 @@
 
 - `init`：在目标项目根目录生成 `.testrunner/` 测试目录和样例文件
 - `test`：按 `api` / `dir` / `all` / `workflow` 选择测试范围
+- Testcontainers 并行：在 `containers` runtime 上通过 slot 隔离并行执行 case / workflow
 - YAML DSL：描述变量、前置步骤、请求、callback、sleep、分支、循环、数据库查询、Redis 查询和断言
 - Workflow：在 case 之上编排跨用例的顺序、分支、输入输出和 deferred cleanup
 - 环境 DSL：在 `env/*.yaml` 中声明 Docker Compose runtime、readiness 和日志采集
@@ -13,7 +14,7 @@
 - Mock：内嵌 HTTP Mock 服务，支持静态路由、动态 DSL 和 callback 调度
 - 报告：终端摘要 / JSON 输出，外加 `.testrunner/reports/*.json`、`callbacks` 和 `environment_artifacts`
 
-> 当前实现以 **串行执行** 为主，优先保证数据一致性和可重复性。
+> 默认仍以串行执行为主；当环境使用 `containers` runtime 并声明 `parallel.slots` 时，可以通过 `--parallel` / `--jobs` 开启 slot 隔离并发。
 
 当前仓库已经按 monorepo 组织：
 
@@ -93,6 +94,9 @@ cargo run -p test-runner -- test all --root /path/to/your-project
 ```bash
 cargo run -p test-runner -- test workflow register-login-create-order --root sample-projects --env docker
 cargo run -p test-runner -- test workflow payment-callback-flow --root sample-projects --env docker --no-mock
+
+# 运行全部 workflow（可配合 Testcontainers slot 并行）
+cargo run -p test-runner -- test workflow --all --root sample-projects --env containers --parallel --jobs 4
 ```
 
 如果环境文件里声明了 `runtime` / `readiness` / `logs`，`test-runner` 会在执行前后自动托管环境，而不需要你手工先跑 `docker compose up/down`。

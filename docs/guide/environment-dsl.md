@@ -106,6 +106,8 @@ docker compose down -v --remove-orphans
 ```yaml
 runtime:
   kind: containers
+  parallel:
+    slots: 4
   services:
     - name: mysql
       image: mysql:8.4
@@ -198,6 +200,30 @@ variables:
   db_port: "{{ env.variables.runtime_ports.mysql.3306 }}"
 ```
 
+**并行 slot（`parallel.slots`）：**
+
+当你给 `containers` runtime 增加：
+
+```yaml
+runtime:
+  kind: containers
+  parallel:
+    slots: 4
+```
+
+并以 `--parallel` 运行时，执行器会启动 4 套完全隔离的容器组。
+
+- `test api` / `test dir` / `test all`：按 **case** 并行
+- `test workflow --all`：按 **workflow** 并行
+- 单个 workflow 内部仍保持顺序执行，不会拆成 step 级并发
+- `--jobs N` 可以覆盖 `parallel.slots`
+
+每个 slot 都会拥有自己的网络、端口映射、callback runtime 和内嵌 mock server，所以：
+
+- 不需要修改应用代码
+- 固定 host 端口会自动改写到当前 slot 的实际端口
+- 日志会写到 `.testrunner/reports/slot-<id>/...`
+
 **两种模式对比：**
 
 | 特性 | `docker_compose` | `containers` |
@@ -252,13 +278,13 @@ test-runner test workflow register-login-create-order --root sample-projects --e
 运行器的顺序大致是：
 
 1. 加载 `env/docker.yaml`
-2. 如果启用了内嵌 mock，先启动 mock，并把实际地址回写到 `env.variables.mock_base_url`
-3. 执行 `docker compose up ...`
-4. 逐条执行 readiness 检查
+2. 启动 runtime（`docker compose up ...` 或 Docker API 容器）
+3. 逐条执行 readiness 检查
+4. 如果启用了内嵌 mock，启动 1 个或 N 个 slot 级 mock，并把实际地址回写到执行上下文
 5. 运行 case 或 workflow
 6. 刷新 callback 队列
 7. 收集 `logs:` 里声明的产物
-8. 按 `cleanup` 策略执行 `docker compose down ...`
+8. 按 `cleanup` 策略回收环境
 9. 把环境元数据写进最终报告
 
 这意味着“环境是否 ready”“环境日志是否采集到”“环境回收是否成功”都会和测试结果一起进入报告。
@@ -269,6 +295,7 @@ test-runner test workflow register-login-create-order --root sample-projects --e
 
 - `.testrunner/reports/last-run.json`
 - `.testrunner/reports/last-workflow-run.json`
+- `.testrunner/reports/last-workflows-run.json`
 
 结构里会包含 `environment_artifacts`，例如：
 
@@ -323,7 +350,7 @@ test-runner test workflow payment-callback-flow --root sample-projects --env doc
 这套环境 DSL 当前有几个明确边界：
 
 - 支持两种运行时：`docker_compose`（外部 Compose 文件）和 `containers`（直接 Docker API 管理）
-- 生命周期是"按一次命令运行"管理，而不是"每个 case 各起一套环境"
+- 默认仍是“按一次命令运行”管理；只有 `containers + parallel.slots + --parallel` 会按 slot 拉起多套隔离环境
 - MySQL query log / slow log 是否开启，仍然由环境作者在 Compose / 容器配置里负责；运行器只负责采集
 - 如果你想在失败后保留容器排查，可以把 `cleanup` 调成 `never`
 - `containers` 模式需要本机安装 Docker Engine（但不需要 `docker compose` CLI）

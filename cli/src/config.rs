@@ -107,6 +107,13 @@ pub struct EnvironmentRuntimeConfig {
     pub services: Vec<ContainerServiceConfig>,
     #[serde(default)]
     pub network_name: Option<String>,
+    #[serde(default)]
+    pub parallel: Option<EnvironmentRuntimeParallelConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentRuntimeParallelConfig {
+    pub slots: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -590,6 +597,11 @@ fn validate_environment_config(environment: &EnvironmentConfig) -> Result<()> {
     if let Some(runtime) = &environment.runtime {
         match runtime.kind {
             EnvironmentRuntimeKind::DockerCompose => {
+                if runtime.parallel.is_some() {
+                    bail!(
+                        "environment.runtime.parallel requires environment.runtime.kind = containers"
+                    );
+                }
                 if runtime.project_directory.trim().is_empty() {
                     bail!("environment.runtime.project_directory cannot be empty");
                 }
@@ -608,6 +620,11 @@ fn validate_environment_config(environment: &EnvironmentConfig) -> Result<()> {
                 }
             }
             EnvironmentRuntimeKind::Containers => {
+                if let Some(parallel) = &runtime.parallel
+                    && parallel.slots == 0
+                {
+                    bail!("environment.runtime.parallel.slots must be greater than zero");
+                }
                 if runtime.services.is_empty() {
                     bail!("environment.runtime.services must contain at least one container definition");
                 }
@@ -960,6 +977,8 @@ name: containers
 base_url: http://127.0.0.1:18080
 runtime:
   kind: containers
+  parallel:
+    slots: 4
   services:
     - name: mysql
       image: mysql:8.4
@@ -1006,6 +1025,7 @@ runtime:
             Some(ContainerWaitFor::Tcp { port: 6379, .. })
         ));
         assert_eq!(runtime.network_name.as_deref(), Some("my-test-network"));
+        assert_eq!(runtime.parallel.as_ref().map(|parallel| parallel.slots), Some(4));
         assert_eq!(runtime.cleanup, EnvironmentRuntimeCleanupPolicy::OnSuccess);
     }
 
@@ -1060,6 +1080,49 @@ runtime:
         let error = validate_environment_config(&environment)
             .expect_err("empty services should fail");
         assert!(error.to_string().contains("at least one container definition"));
+    }
+
+    #[test]
+    fn containers_runtime_validation_rejects_zero_parallel_slots() {
+        let environment: EnvironmentConfig = serde_yaml::from_str(
+            r#"
+name: bad
+base_url: http://127.0.0.1:3000
+runtime:
+  kind: containers
+  parallel:
+    slots: 0
+  services:
+    - name: mysql
+      image: mysql:8.4
+"#,
+        )
+        .expect("should deserialize");
+
+        let error = validate_environment_config(&environment)
+            .expect_err("zero slots should fail");
+        assert!(error.to_string().contains("parallel.slots must be greater than zero"));
+    }
+
+    #[test]
+    fn docker_compose_runtime_validation_rejects_parallel_slots() {
+        let environment: EnvironmentConfig = serde_yaml::from_str(
+            r#"
+name: docker
+base_url: http://127.0.0.1:3000
+runtime:
+  kind: docker_compose
+  parallel:
+    slots: 2
+  files:
+    - docker-compose.yml
+"#,
+        )
+        .expect("should deserialize");
+
+        let error = validate_environment_config(&environment)
+            .expect_err("parallel docker compose should fail");
+        assert!(error.to_string().contains("parallel requires environment.runtime.kind = containers"));
     }
 
     #[test]

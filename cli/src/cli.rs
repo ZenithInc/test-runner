@@ -80,7 +80,10 @@ pub struct TestAllArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct TestWorkflowArgs {
-    pub workflow_id: String,
+    #[arg(required_unless_present = "all")]
+    pub workflow_id: Option<String>,
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "workflow_id")]
+    pub all: bool,
     #[command(flatten)]
     pub common: CommonTestArgs,
 }
@@ -102,6 +105,12 @@ pub struct CommonTestArgs {
     /// Stop scheduling new cases after the first failure
     #[arg(long)]
     pub fail_fast: bool,
+    /// Enable parallel execution when the selected runtime supports slot isolation
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub parallel: bool,
+    /// Override the number of parallel jobs / slots to use
+    #[arg(long, value_name = "N")]
+    pub jobs: Option<usize>,
     /// Only show the execution plan without running cases
     #[arg(long)]
     pub dry_run: bool,
@@ -125,6 +134,10 @@ impl CommonTestArgs {
         } else {
             None
         }
+    }
+
+    pub fn parallel_requested(&self) -> bool {
+        self.parallel || self.jobs.is_some()
     }
 }
 

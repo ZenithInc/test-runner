@@ -22,7 +22,7 @@ mock:
 
 - `project.name`：项目名，只用于上下文和报告。
 - `defaults.env`：默认环境名。
-- `defaults.execution_mode`：当前实现只按串行模式执行，推荐固定写 `serial`。
+- `defaults.execution_mode`：默认执行模式提示字段。当前 CLI 仍默认串行；当环境使用 `kind: containers` 并声明 `runtime.parallel.slots` 时，可以通过 `--parallel` / `--jobs` 启用 slot 并行。
 - `defaults.timeout_ms`：用于构建 HTTP 客户端的全局超时。
 - `mock.enabled`：是否默认开启内嵌 Mock 服务。
 - `mock.host` / `mock.port`：Mock 服务监听地址。
@@ -119,9 +119,30 @@ logs:
   - `extra_hosts`：额外 hosts 映射（如 `"host.docker.internal:host-gateway"`）。
   - `wait_for`：容器就绪等待策略（`log_message`、`tcp`、`http`）。
 - `network_name`：可选，自定义 Docker 网络名。
+- `parallel.slots`：可选。为 slot 并行模式预留 N 套隔离容器组；配合 `--parallel` 使用。
 - `cleanup`：同上。
 
 > 动态端口映射会注入到 `env.variables.runtime_ports`，可在 DSL 中引用，如 <code v-pre>{{ env.variables.runtime_ports.mysql.3306 }}</code>。
+
+#### `containers` 并行 slot
+
+当你配置：
+
+```yaml
+runtime:
+  kind: containers
+  parallel:
+    slots: 4
+```
+
+并在命令行加上 `--parallel`（或直接指定 `--jobs`）时，运行器会启动 4 套隔离的 MySQL / Redis / App / Mock slot。
+
+- `test api` / `test dir` / `test all`：按 **case** 分配 slot
+- `test workflow --all`：按 **workflow** 分配 slot
+- 单个 workflow 内部的 steps 仍然保持串行
+- `--jobs N` 会覆盖 `parallel.slots`
+
+在多 slot 模式下，原本写在环境、API、datasource 里的固定 host 端口会自动改写为当前 slot 的实际端口；日志产物则会落到 `.testrunner/reports/slot-<id>/...`。
 
 ### `readiness`
 
@@ -154,6 +175,8 @@ logs:
   - `service`：Compose service 名。
   - `path`：容器内文件路径，例如 MySQL query log / slow log。
   - `output`：相对于 `.testrunner/reports/` 的输出文件路径。
+
+> 多 slot 模式下，环境日志会自动加上 `slot-<id>/` 前缀，避免不同 slot 的产物互相覆盖。
 
 ### 什么时候用环境文件
 

@@ -177,7 +177,7 @@ test-runner test workflow payment-callback-flow --root sample-projects --env doc
 callback 的最终投递结果会出现在：
 
 - 终端 summary 输出的 `Callbacks` 小节
-- `last-run.json` / `last-workflow-run.json` 里的 `callbacks` 数组
+- `last-run.json` / `last-workflow-run.json` / `last-workflows-run.json` 里的 `callbacks` 数组
 
 你会看到类似这样的信息：
 

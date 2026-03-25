@@ -10,6 +10,8 @@ variables:
 # Testcontainers 模式：通过 Docker API 直接管理容器，无需 docker-compose.yml
 runtime:
   kind: containers
+  parallel:
+    slots: 4
   services:
     - name: mysql
       image: mysql:8.4

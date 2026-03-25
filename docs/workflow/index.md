@@ -301,6 +301,7 @@ sample-projects/.testrunner/workflows/payment-callback-flow.yaml
 
 ```bash
 test-runner test workflow payment-callback-flow --root sample-projects --env docker --no-mock
+test-runner test workflow --all --root sample-projects --env containers --parallel --jobs 2
 ```
 
 ## Dry run 和报告
@@ -309,18 +310,26 @@ test-runner test workflow payment-callback-flow --root sample-projects --env doc
 
 ```bash
 test-runner test workflow register-login-create-order --root sample-projects --env docker --dry-run
+test-runner test workflow --all --root sample-projects --env containers --dry-run
 ```
 
-实际执行时，workflow 报告会写到：
+实际执行单个 workflow 时，报告会写到：
 
 ```text
 .testrunner/reports/last-workflow-run.json
+```
+
+如果执行的是 `test workflow --all`，批量报告会写到：
+
+```text
+.testrunner/reports/last-workflows-run.json
 ```
 
 如果环境文件里配置了日志采集，相关产物会写到：
 
 ```text
 .testrunner/reports/env/
+.testrunner/reports/slot-<id>/
 ```
 
 终端摘要大致类似：
@@ -348,3 +357,4 @@ PASS [4] create-order -> workflow/order/create-after-login (10ms)
 3. 只有在后续 step 真的需要前序副作用时，才使用 `cleanup: defer`。
 4. 如果一个 case 既做业务动作又做强耦合清理，考虑拆成更适合 workflow 复用的 helper case。
 5. 先用 `--dry-run` 看清流程，再跑真实环境。
+6. 如果你要并行跑 workflow，请使用 `containers` runtime + `parallel.slots`，并通过 `test workflow --all --parallel` 让调度器按 **workflow** 分 slot；不要期待单个 workflow 内部 step 会并行执行。
