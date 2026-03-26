@@ -225,6 +225,10 @@ pub enum EnvironmentLogSource {
         path: String,
         output: String,
     },
+    RedisMonitor {
+        service: String,
+        output: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -626,7 +630,9 @@ fn validate_environment_config(environment: &EnvironmentConfig) -> Result<()> {
                     bail!("environment.runtime.parallel.slots must be greater than zero");
                 }
                 if runtime.services.is_empty() {
-                    bail!("environment.runtime.services must contain at least one container definition");
+                    bail!(
+                        "environment.runtime.services must contain at least one container definition"
+                    );
                 }
                 for service in &runtime.services {
                     if service.name.trim().is_empty() {
@@ -713,6 +719,12 @@ fn validate_environment_config(environment: &EnvironmentConfig) -> Result<()> {
                 }
                 validate_log_output(output)?;
             }
+            EnvironmentLogSource::RedisMonitor { service, output } => {
+                if service.trim().is_empty() {
+                    bail!("environment.logs.redis_monitor.service cannot be empty");
+                }
+                validate_log_output(output)?;
+            }
         }
     }
 
@@ -751,7 +763,9 @@ fn validate_port_mapping(port: &str) -> Result<()> {
                 format!("invalid container port in `{port}`: must be a valid port number")
             })?;
         }
-        _ => bail!("invalid port mapping `{port}`: expected format `container_port` or `host_port:container_port`"),
+        _ => bail!(
+            "invalid port mapping `{port}`: expected format `container_port` or `host_port:container_port`"
+        ),
     }
     Ok(())
 }
@@ -933,6 +947,9 @@ logs:
     service: mysql
     path: /var/lib/mysql/slow.log
     output: env/mysql-slow.log
+  - kind: redis_monitor
+    service: redis
+    output: env/redis-monitor.log
 "#,
         )
         .expect("environment should deserialize");
@@ -943,7 +960,7 @@ logs:
             Some(EnvironmentRuntimeKind::DockerCompose)
         ));
         assert_eq!(environment.readiness.len(), 2);
-        assert_eq!(environment.logs.len(), 2);
+        assert_eq!(environment.logs.len(), 3);
     }
 
     #[test]
@@ -1015,7 +1032,13 @@ runtime:
         assert_eq!(runtime.services[0].name, "mysql");
         assert_eq!(runtime.services[0].image, "mysql:8.4");
         assert_eq!(runtime.services[0].ports, vec!["13306:3306"]);
-        assert_eq!(runtime.services[0].environment.get("MYSQL_DATABASE").unwrap(), "app");
+        assert_eq!(
+            runtime.services[0]
+                .environment
+                .get("MYSQL_DATABASE")
+                .unwrap(),
+            "app"
+        );
         assert!(matches!(
             runtime.services[0].wait_for,
             Some(ContainerWaitFor::LogMessage { .. })
@@ -1025,7 +1048,10 @@ runtime:
             Some(ContainerWaitFor::Tcp { port: 6379, .. })
         ));
         assert_eq!(runtime.network_name.as_deref(), Some("my-test-network"));
-        assert_eq!(runtime.parallel.as_ref().map(|parallel| parallel.slots), Some(4));
+        assert_eq!(
+            runtime.parallel.as_ref().map(|parallel| parallel.slots),
+            Some(4)
+        );
         assert_eq!(runtime.cleanup, EnvironmentRuntimeCleanupPolicy::OnSuccess);
     }
 
@@ -1055,7 +1081,12 @@ runtime:
         validate_environment_config(&environment).expect("should validate");
         let service = &environment.runtime.as_ref().unwrap().services[0];
         match &service.wait_for {
-            Some(ContainerWaitFor::Http { port, path, expect_status, .. }) => {
+            Some(ContainerWaitFor::Http {
+                port,
+                path,
+                expect_status,
+                ..
+            }) => {
                 assert_eq!(*port, 3000);
                 assert_eq!(path, "/health");
                 assert_eq!(*expect_status, 200);
@@ -1077,9 +1108,13 @@ runtime:
         )
         .expect("should deserialize");
 
-        let error = validate_environment_config(&environment)
-            .expect_err("empty services should fail");
-        assert!(error.to_string().contains("at least one container definition"));
+        let error =
+            validate_environment_config(&environment).expect_err("empty services should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("at least one container definition")
+        );
     }
 
     #[test]
@@ -1099,9 +1134,12 @@ runtime:
         )
         .expect("should deserialize");
 
-        let error = validate_environment_config(&environment)
-            .expect_err("zero slots should fail");
-        assert!(error.to_string().contains("parallel.slots must be greater than zero"));
+        let error = validate_environment_config(&environment).expect_err("zero slots should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("parallel.slots must be greater than zero")
+        );
     }
 
     #[test]
@@ -1122,7 +1160,11 @@ runtime:
 
         let error = validate_environment_config(&environment)
             .expect_err("parallel docker compose should fail");
-        assert!(error.to_string().contains("parallel requires environment.runtime.kind = containers"));
+        assert!(
+            error
+                .to_string()
+                .contains("parallel requires environment.runtime.kind = containers")
+        );
     }
 
     #[test]
@@ -1140,8 +1182,8 @@ runtime:
         )
         .expect("should deserialize");
 
-        let error = validate_environment_config(&environment)
-            .expect_err("no image or build should fail");
+        let error =
+            validate_environment_config(&environment).expect_err("no image or build should fail");
         assert!(error.to_string().contains("image or .build is required"));
     }
 

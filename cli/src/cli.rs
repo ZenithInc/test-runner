@@ -120,6 +120,9 @@ pub struct CommonTestArgs {
     /// Force-disable the embedded mock server
     #[arg(long = "no-mock", action = ArgAction::SetTrue, conflicts_with = "mock")]
     pub no_mock: bool,
+    /// Stream configured environment service logs to stderr while the run is in progress
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub follow_env_logs: bool,
     /// Control how run results are emitted to stdout
     #[arg(long, value_enum, default_value_t = ReportFormat::Summary)]
     pub report_format: ReportFormat,
@@ -146,4 +149,21 @@ pub enum ReportFormat {
     Summary,
     Json,
     Junit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn common_test_args_parse_follow_env_logs_flag() {
+        let cli = Cli::parse_from(["test-runner", "test", "all", "--follow-env-logs"]);
+        match cli.command {
+            Commands::Test {
+                target: TestCommand::All(args),
+            } => assert!(args.common.follow_env_logs),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }

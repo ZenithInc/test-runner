@@ -57,7 +57,9 @@ async fn sample_health_service_passes_health_case() {
         ])
         .assert()
         .success()
-        .stdout(contains("==> Running 1 case(s) for api `system/health` in env `it`"))
+        .stdout(contains(
+            "==> Running 1 case(s) for api `system/health` in env `it`",
+        ))
         .stdout(contains("PASS [1/1] system/health/smoke"))
         .stdout(contains("Cases: 1 passed, 0 failed, 1 total"));
 }
@@ -86,7 +88,9 @@ async fn sample_health_service_passes_order_expression_case() {
         ])
         .assert()
         .success()
-        .stdout(contains("==> Running 1 case(s) for api `order/create` in env `it`"))
+        .stdout(contains(
+            "==> Running 1 case(s) for api `order/create` in env `it`",
+        ))
         .stdout(contains("PASS [1/1] order/create/expression-happy-path"))
         .stdout(contains("Cases: 1 passed, 0 failed, 1 total"));
 }
@@ -391,11 +395,17 @@ async fn workflow_failure_branch_is_executed() {
         ])
         .assert()
         .failure()
-        .stdout(contains("==> Running workflow `failure-branch-flow` in env `it`"))
+        .stdout(contains(
+            "==> Running workflow `failure-branch-flow` in env `it`",
+        ))
         .stdout(contains("Status: FAIL"))
         .stdout(contains("Steps: 2 passed, 1 failed, 3 total"))
-        .stdout(contains("FAIL [2] failing-check -> workflow/cache/assert-wrong"))
-        .stdout(contains("PASS [3] fallback -> workflow/cache/assert-present"))
+        .stdout(contains(
+            "FAIL [2] failing-check -> workflow/cache/assert-wrong",
+        ))
+        .stdout(contains(
+            "PASS [3] fallback -> workflow/cache/assert-present",
+        ))
         .stdout(contains("should-not-run").not());
 
     assert_eq!(
@@ -459,7 +469,9 @@ async fn workflow_executes_with_deferred_cleanup() {
         ])
         .assert()
         .success()
-        .stdout(contains("==> Running workflow `deferred-cache-flow` in env `it`"))
+        .stdout(contains(
+            "==> Running workflow `deferred-cache-flow` in env `it`",
+        ))
         .stdout(contains("PASS [1] seed -> workflow/cache/seed"))
         .stdout(contains("PASS [2] verify -> workflow/cache/assert-present"))
         .stdout(contains("Steps: 2 passed, 0 failed, 2 total"));
@@ -516,11 +528,19 @@ async fn sample_project_register_login_create_order_workflow_passes() {
         ])
         .assert()
         .success()
-        .stdout(contains("==> Running workflow `register-login-create-order` in env `it`"))
+        .stdout(contains(
+            "==> Running workflow `register-login-create-order` in env `it`",
+        ))
         .stdout(contains("PASS [1] register -> user/register/happy-path"))
-        .stdout(contains("PASS [2] send-sms -> user/send-sms-code/happy-path"))
-        .stdout(contains("PASS [3] login -> workflow/user/login-after-register"))
-        .stdout(contains("PASS [4] create-order -> workflow/order/create-after-login"))
+        .stdout(contains(
+            "PASS [2] send-sms -> user/send-sms-code/happy-path",
+        ))
+        .stdout(contains(
+            "PASS [3] login -> workflow/user/login-after-register",
+        ))
+        .stdout(contains(
+            "PASS [4] create-order -> workflow/order/create-after-login",
+        ))
         .stdout(contains("Steps: 4 passed, 0 failed, 4 total"));
 }
 
@@ -564,12 +584,20 @@ async fn sample_project_payment_callback_workflow_passes() {
         ])
         .assert()
         .success()
-        .stdout(contains("==> Running workflow `payment-callback-flow` in env `it`"))
-        .stdout(contains("PASS [1] schedule-callback -> workflow/payment/schedule-callback"))
-        .stdout(contains("PASS [2] verify-callback -> workflow/payment/assert-callback"))
+        .stdout(contains(
+            "==> Running workflow `payment-callback-flow` in env `it`",
+        ))
+        .stdout(contains(
+            "PASS [1] schedule-callback -> workflow/payment/schedule-callback",
+        ))
+        .stdout(contains(
+            "PASS [2] verify-callback -> workflow/payment/assert-callback",
+        ))
         .stdout(contains("Steps: 2 passed, 0 failed, 2 total"))
         .stdout(contains("Callbacks: 1 passed, 0 failed, 1 total"))
-        .stdout(contains("PASS #1 case:workflow/payment/schedule-callback ->"));
+        .stdout(contains(
+            "PASS #1 case:workflow/payment/schedule-callback ->",
+        ));
 }
 
 #[test]
@@ -591,7 +619,9 @@ fn sample_project_docker_env_managed_api_run_passes() {
         ])
         .assert()
         .success()
-        .stdout(contains("==> Running 1 case(s) for api `system/health` in env `docker`"))
+        .stdout(contains(
+            "==> Running 1 case(s) for api `system/health` in env `docker`",
+        ))
         .stdout(contains("PASS [1/1] system/health/smoke"))
         .stdout(contains("Cases: 1 passed, 0 failed, 1 total"))
         .stdout(contains("Readiness: 2 passed, 0 failed"));
@@ -633,17 +663,24 @@ fn sample_project_docker_env_managed_workflow_collects_environment_logs() {
         ])
         .assert()
         .success()
-        .stdout(contains("==> Running workflow `register-login-create-order` in env `docker`"))
+        .stdout(contains(
+            "==> Running workflow `register-login-create-order` in env `docker`",
+        ))
         .stdout(contains("PASS [1] register -> user/register/happy-path"))
-        .stdout(contains("PASS [2] send-sms -> user/send-sms-code/happy-path"))
-        .stdout(contains("PASS [3] login -> workflow/user/login-after-register"))
-        .stdout(contains("PASS [4] create-order -> workflow/order/create-after-login"))
+        .stdout(contains(
+            "PASS [2] send-sms -> user/send-sms-code/happy-path",
+        ))
+        .stdout(contains(
+            "PASS [3] login -> workflow/user/login-after-register",
+        ))
+        .stdout(contains(
+            "PASS [4] create-order -> workflow/order/create-after-login",
+        ))
         .stdout(contains("Steps: 4 passed, 0 failed, 4 total"))
         .stdout(contains("Logs: 3 collected, 0 failed"));
 
-    let report = read_json_report(
-        &sample_project_root().join(".testrunner/reports/last-workflow-run.json"),
-    );
+    let report =
+        read_json_report(&sample_project_root().join(".testrunner/reports/last-workflow-run.json"));
     let logs = report["environment_artifacts"]["logs"]
         .as_array()
         .expect("environment logs array");
@@ -661,7 +698,7 @@ fn sample_project_docker_env_managed_workflow_collects_environment_logs() {
     );
     assert!(
         sample_project_root()
-            .join(".testrunner/reports/env/mysql-slow.log")
+            .join(".testrunner/reports/env/redis-monitor.log")
             .exists()
     );
 }

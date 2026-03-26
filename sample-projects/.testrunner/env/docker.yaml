@@ -39,7 +39,6 @@ logs:
     service: mysql
     path: /var/lib/mysql/general.log
     output: env/mysql-query.log
-  - kind: container_file
-    service: mysql
-    path: /var/lib/mysql/slow.log
-    output: env/mysql-slow.log
+  - kind: redis_monitor
+    service: redis
+    output: env/redis-monitor.log

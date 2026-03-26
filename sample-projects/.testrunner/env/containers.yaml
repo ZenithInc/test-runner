@@ -84,9 +84,10 @@ logs:
   - kind: compose_service
     service: app
     output: env/app.log
-  - kind: compose_service
+  - kind: container_file
     service: mysql
-    output: env/mysql.log
-  - kind: compose_service
+    path: /var/lib/mysql/general.log
+    output: env/mysql-query.log
+  - kind: redis_monitor
     service: redis
-    output: env/redis.log
+    output: env/redis-monitor.log

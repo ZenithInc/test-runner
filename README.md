@@ -97,9 +97,13 @@ cargo run -p test-runner -- test workflow payment-callback-flow --root sample-pr
 
 # 运行全部 workflow（可配合 Testcontainers slot 并行）
 cargo run -p test-runner -- test workflow --all --root sample-projects --env containers --parallel --jobs 4
+
+# 实时跟随环境日志（输出到 stderr，适合盯 SQL / Redis 命令 / app）
+cargo run -p test-runner -- test workflow register-login-create-order --root sample-projects --env containers --follow-env-logs
 ```
 
 如果环境文件里声明了 `runtime` / `readiness` / `logs`，`test-runner` 会在执行前后自动托管环境，而不需要你手工先跑 `docker compose up/down`。
+如果你想像 `tail -f` 一样边跑边看环境输出，可以额外加 `--follow-env-logs`；现在它更适合盯 MySQL query log、Redis MONITOR 和应用运行期日志。
 
 ### 1.5 预览文档站点
 
@@ -248,6 +252,7 @@ test-runner test workflow auth-flow --dry-run --root /path/to/your-project
 - `--dry-run`：只展示执行计划，不真正发请求。
 - `--mock`：强制启用内嵌 Mock 服务。
 - `--no-mock`：强制禁用内嵌 Mock 服务。
+- `--follow-env-logs`：执行期间把环境服务日志实时输出到 `stderr`。
 - `--report-format <summary|json|junit>`：输出格式。
 
 说明：
@@ -256,6 +261,7 @@ test-runner test workflow auth-flow --dry-run --root /path/to/your-project
 - `json`：终端输出 JSON，同时仍然会把报告写入 `.testrunner/reports/last-run.json` 或 `.testrunner/reports/last-workflow-run.json`。
 - `junit`：**当前已预留参数，但尚未实现**，执行时会报错。
 - `--dry-run` 只展示执行计划，不会真正发请求、不会启动环境 runtime，也不会写报告文件。
+- `--follow-env-logs` 会根据 `env/*.yaml` 里的 `logs:` 声明实时跟随相关日志源；为了减少启动噪音，查询级日志会在 readiness 通过后开始输出。为了不破坏 `--report-format json` 的机器可读性，这些 live logs 会写到 `stderr`。当 `stderr` 是 TTY 且未设置 `NO_COLOR` 时，MySQL / Redis / 应用日志会按来源着色。
 
 
 ## 3. 初始化后生成的目录
@@ -409,10 +415,9 @@ logs:
     service: mysql
     path: /var/lib/mysql/general.log
     output: env/mysql-query.log
-  - kind: container_file
-    service: mysql
-    path: /var/lib/mysql/slow.log
-    output: env/mysql-slow.log
+  - kind: redis_monitor
+    service: redis
+    output: env/redis-monitor.log
 ```
 
 补充说明：

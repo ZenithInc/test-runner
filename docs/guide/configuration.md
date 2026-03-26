@@ -83,8 +83,11 @@ logs:
     output: env/app.log
   - kind: container_file
     service: mysql
-    path: /var/lib/mysql/slow.log
-    output: env/mysql-slow.log
+    path: /var/lib/mysql/general.log
+    output: env/mysql-query.log
+  - kind: redis_monitor
+    service: redis
+    output: env/redis-monitor.log
 ```
 
 ### `runtime`
@@ -184,6 +187,10 @@ runtime:
   - 从容器里复制指定文件到报告目录。
   - `service`：Compose service 名。
   - `path`：容器内文件路径，例如 MySQL query log / slow log。
+  - `output`：相对于 `.testrunner/reports/` 的输出文件路径。
+- `kind: redis_monitor`
+  - 在容器内运行 `redis-cli MONITOR`，把 Redis 命令流写入报告目录。
+  - `service`：Redis service 名。
   - `output`：相对于 `.testrunner/reports/` 的输出文件路径。
 
 > 多 slot 模式下，环境日志会自动加上 `slot-<id>/` 前缀，避免不同 slot 的产物互相覆盖。

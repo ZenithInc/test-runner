@@ -71,10 +71,9 @@ logs:
     service: mysql
     path: /var/lib/mysql/general.log
     output: env/mysql-query.log
-  - kind: container_file
-    service: mysql
-    path: /var/lib/mysql/slow.log
-    output: env/mysql-slow.log
+  - kind: redis_monitor
+    service: redis
+    output: env/redis-monitor.log
 ```
 
 ## 三组字段分别负责什么
@@ -294,18 +293,20 @@ runtime:
 
 `logs` 负责“要把哪些环境侧证据收回来”。
 
-当前支持两类来源：
+当前支持三类来源：
 
 - `kind: compose_service`
   - 通过 `docker compose logs` 收集服务日志
 - `kind: container_file`
   - 直接从容器里复制文件，例如 MySQL 的 general log / slow log
+- `kind: redis_monitor`
+  - 在容器内执行 `redis-cli MONITOR`，抓取 Redis 命令流
 
 这特别适合把“业务断言之外的环境证据”一起留档，例如：
 
 - 应用启动日志
 - MySQL general query log
-- MySQL slow query log
+- Redis command stream
 
 ## 执行时会发生什么
 
@@ -376,7 +377,26 @@ test-runner test workflow register-login-create-order --root sample-projects --e
 
 - `env/app.log`
 - `env/mysql-query.log`
-- `env/mysql-slow.log`
+- `env/redis-monitor.log`
+
+## 实时跟随环境日志（tail -f 风格）
+
+如果你希望在执行过程中直接盯着 MySQL / Redis / app 的输出看，可以在命令上加：
+
+```bash
+test-runner test workflow register-login-create-order --root sample-projects --env containers --follow-env-logs
+```
+
+行为上有几个关键点：
+
+- live follow 是 **CLI 级开关**，不会改变 `logs:` 的 artifact 收集行为
+- `kind: compose_service` 会实时跟随对应服务日志
+- `kind: container_file` 在 `--follow-env-logs` 下会直接从容器里 `tail -F` 目标文件，适合盯 MySQL general log 里的 SQL
+- `kind: redis_monitor` 会在容器内启动 `redis-cli MONITOR`，实时输出 Redis 命令并同步写入 artifact
+- 当 `stderr` 是 TTY 且未设置 `NO_COLOR` 时，live 输出会按来源着色，便于区分 MySQL、Redis 与应用日志
+- 查询 / 命令级 live logs 会在 readiness 通过后开始输出，这样可以少看一大段容器启动噪音
+- live logs 会输出到 `stderr`，所以即使你使用 `--report-format json`，`stdout` 里的 JSON 仍然保持机器可读
+- 多 slot 并行时，控制台前缀会带上 slot 信息，方便区分是哪一套环境打出来的日志
 
 ## sample-project 推荐命令
 
@@ -384,6 +404,7 @@ test-runner test workflow register-login-create-order --root sample-projects --e
 test-runner test api system/health --root sample-projects --env docker
 test-runner test workflow register-login-create-order --root sample-projects --env docker
 test-runner test workflow payment-callback-flow --root sample-projects --env docker --no-mock
+test-runner test workflow register-login-create-order --root sample-projects --env containers --follow-env-logs
 ```
 
 ## 当前边界
@@ -393,6 +414,7 @@ test-runner test workflow payment-callback-flow --root sample-projects --env doc
 - 支持两种运行时：`docker_compose`（外部 Compose 文件）和 `containers`（直接 Docker API 管理）
 - 默认仍是“按一次命令运行”管理；只有 `containers + parallel.slots + --parallel` 会按 slot 拉起多套隔离环境
 - MySQL query log / slow log 是否开启，仍然由环境作者在 Compose / 容器配置里负责；运行器只负责采集
+- `redis_monitor` 依赖容器里存在 `redis-cli`
 - 如果你想在失败后保留容器排查，可以把 `cleanup` 调成 `never`
 - `containers` 模式需要本机安装 Docker Engine（但不需要 `docker compose` CLI）
 

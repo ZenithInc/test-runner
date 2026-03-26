@@ -100,18 +100,24 @@ pub async fn run(command: TestCommand) -> Result<()> {
         && !project.mock_routes.is_empty();
     let manages_environment = manages_environment(&project.environment);
 
-    let mut environment_session =
-        match EnvironmentSession::new(&project, parallel_jobs.unwrap_or(1)) {
-            Ok(session) => session,
-            Err(error) => {
-                if manages_environment {
-                    console.environment_failed(&project.environment_name, &error);
-                }
-                return Err(error);
+    let mut environment_session = match EnvironmentSession::new(
+        &project,
+        parallel_jobs.unwrap_or(1),
+        options.follow_env_logs,
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            if manages_environment {
+                console.environment_failed(&project.environment_name, &error);
             }
-        };
+            return Err(error);
+        }
+    };
     if manages_environment {
         console.environment_starting(&project.environment_name, &project.environment);
+        if options.follow_env_logs && !project.environment.logs.is_empty() {
+            console.environment_logs_following(&project.environment_name);
+        }
     }
     let reserved_mock_endpoints = match prepare_slot_mock_endpoints(
         &project,
@@ -256,18 +262,24 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
         && !project.mock_routes.is_empty();
     let manages_environment = manages_environment(&project.environment);
 
-    let mut environment_session =
-        match EnvironmentSession::new(&project, parallel_jobs.unwrap_or(1)) {
-            Ok(session) => session,
-            Err(error) => {
-                if manages_environment {
-                    console.environment_failed(&project.environment_name, &error);
-                }
-                return Err(error);
+    let mut environment_session = match EnvironmentSession::new(
+        &project,
+        parallel_jobs.unwrap_or(1),
+        options.follow_env_logs,
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            if manages_environment {
+                console.environment_failed(&project.environment_name, &error);
             }
-        };
+            return Err(error);
+        }
+    };
     if manages_environment {
         console.environment_starting(&project.environment_name, &project.environment);
+        if options.follow_env_logs && !project.environment.logs.is_empty() {
+            console.environment_logs_following(&project.environment_name);
+        }
     }
     let reserved_mock_endpoints = match prepare_slot_mock_endpoints(
         &project,
@@ -758,6 +770,18 @@ impl SummaryConsole {
             "{}",
             self.styler
                 .phase(format!("==> Environment `{env_name}` ready"))
+        );
+    }
+
+    fn environment_logs_following(&self, env_name: &str) {
+        if !self.enabled {
+            return;
+        }
+        println!(
+            "{}",
+            self.styler.phase(format!(
+                "==> Following environment logs for `{env_name}` on stderr"
+            ))
         );
     }
 
@@ -3230,6 +3254,7 @@ mod tests {
                 dry_run: true,
                 mock: false,
                 no_mock: false,
+                follow_env_logs: false,
                 report_format: ReportFormat::Summary,
             },
         )
@@ -3325,6 +3350,7 @@ steps:
                     dry_run: true,
                     mock: false,
                     no_mock: false,
+                    follow_env_logs: false,
                     report_format: ReportFormat::Summary,
                 },
             },

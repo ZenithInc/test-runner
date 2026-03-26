@@ -5,6 +5,7 @@ use bollard::container::{
     LogsOptions, RemoveContainerOptions, StartContainerOptions,
 };
 use bollard::errors::Error as BollardError;
+use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
 use chrono::Utc;
@@ -15,10 +16,17 @@ use indexmap::IndexMap;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
+use std::io;
+use std::io::IsTerminal;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::task::JoinHandle;
+use tokio::time::{Duration, Instant, sleep, timeout};
 use url::Url;
 
 use crate::config::{
@@ -126,6 +134,9 @@ pub struct EnvironmentSession {
     run_id: String,
     runtime: Option<ResolvedRuntime>,
     runtime_invoked: bool,
+    follow_logs: bool,
+    live_logs: Vec<LiveLogHandle>,
+    active_logs: Vec<ActiveLogHandle>,
     report: EnvironmentArtifactsReport,
     slots: Vec<EnvironmentSlot>,
 }
@@ -199,6 +210,101 @@ enum ResolvedLogSpec {
         path: String,
         output: String,
     },
+    RedisMonitor {
+        service: String,
+        output: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedLiveLogSpec {
+    ComposeService {
+        slot_id: usize,
+        report_slot_id: Option<usize>,
+        service: String,
+        stream: ComposeLogStream,
+    },
+    ContainerFile {
+        slot_id: usize,
+        report_slot_id: Option<usize>,
+        service: String,
+        path: String,
+    },
+}
+
+impl ResolvedLiveLogSpec {
+    fn slot_id(&self) -> usize {
+        match self {
+            Self::ComposeService { slot_id, .. } | Self::ContainerFile { slot_id, .. } => *slot_id,
+        }
+    }
+
+    fn service(&self) -> &str {
+        match self {
+            Self::ComposeService { service, .. } | Self::ContainerFile { service, .. } => service,
+        }
+    }
+
+    fn display_label(&self) -> String {
+        let base = match self {
+            Self::ComposeService {
+                report_slot_id,
+                service,
+                ..
+            }
+            | Self::ContainerFile {
+                report_slot_id,
+                service,
+                ..
+            } => match report_slot_id {
+                Some(slot_id) => format!("[env:slot-{slot_id}:{service}]"),
+                None => format!("[env:{service}]"),
+            },
+        };
+        match self {
+            Self::ComposeService { stream, .. } => match stream {
+                ComposeLogStream::Combined => base,
+                _ => format!("{base}:{}", stream_label(*stream)),
+            },
+            Self::ContainerFile { path, .. } => {
+                let file_name = Path::new(path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("file");
+                format!("{base}:{file_name}")
+            }
+        }
+    }
+
+    fn color(&self) -> LiveLogColor {
+        match self {
+            Self::ComposeService { service, .. } => live_log_color_for_service(service, None),
+            Self::ContainerFile { service, path, .. } => {
+                live_log_color_for_service(service, Some(path))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedActiveLogSpec {
+    slot_id: usize,
+    report_slot_id: Option<usize>,
+    service: String,
+    output: String,
+}
+
+impl ResolvedActiveLogSpec {
+    fn display_label(&self) -> String {
+        match self.report_slot_id {
+            Some(slot_id) => format!("[env:slot-{slot_id}:{}:monitor]", self.service),
+            None => format!("[env:{}:monitor]", self.service),
+        }
+    }
+
+    fn color(&self) -> LiveLogColor {
+        live_log_color_for_service(&self.service, None)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -215,8 +321,100 @@ impl CommandCapture {
     }
 }
 
+struct LiveLogHandle {
+    label: String,
+    task: JoinHandle<()>,
+}
+
+struct ActiveLogHandle {
+    kind: String,
+    service: String,
+    slot_id: Option<usize>,
+    source_path: Option<String>,
+    output: String,
+    output_path: PathBuf,
+    task: JoinHandle<Result<(), String>>,
+}
+
+const LIVE_TAIL_READY_MARKER: &str = "__TEST_RUNNER_LIVE_TAIL_READY__";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveLogColor {
+    Default,
+    App,
+    Mysql,
+    Redis,
+}
+
+impl LiveLogColor {
+    fn label_code(self) -> &'static str {
+        match self {
+            Self::Default => "1;34",
+            Self::App => "1;36",
+            Self::Mysql => "1;35",
+            Self::Redis => "1;33",
+        }
+    }
+
+    fn text_code(self) -> Option<&'static str> {
+        match self {
+            Self::Mysql => Some("35"),
+            Self::Redis => Some("33"),
+            Self::Default | Self::App => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LiveLogStyler {
+    enabled: bool,
+}
+
+impl LiveLogStyler {
+    fn detect() -> Self {
+        let stderr_is_terminal = io::stderr().is_terminal();
+        let no_color = env::var_os("NO_COLOR").is_some();
+        let term_is_dumb = env::var("TERM")
+            .map(|term| term.eq_ignore_ascii_case("dumb"))
+            .unwrap_or(false);
+        Self {
+            enabled: stderr_is_terminal && !no_color && !term_is_dumb,
+        }
+    }
+
+    fn paint(&self, text: impl AsRef<str>, code: &str) -> String {
+        let text = text.as_ref();
+        if self.enabled {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    }
+
+    fn format_line(&self, color: LiveLogColor, label: &str, line: &str) -> String {
+        let label = self.paint(label, color.label_code());
+        let line = match color.text_code() {
+            Some(code) => self.paint(line, code),
+            None => line.to_string(),
+        };
+        format!("{label} {line}")
+    }
+
+    fn format_error(&self, label: &str, message: &str) -> String {
+        if self.enabled {
+            format!(
+                "{} {}",
+                self.paint(label, "1;31"),
+                self.paint(format!("[error] {message}"), "1;31")
+            )
+        } else {
+            format!("{label} [error] {message}")
+        }
+    }
+}
+
 impl EnvironmentSession {
-    pub fn new(project: &LoadedProject, requested_slots: usize) -> Result<Self> {
+    pub fn new(project: &LoadedProject, requested_slots: usize, follow_logs: bool) -> Result<Self> {
         let run_id = build_run_id(&project.project.project.name);
         let render_context = build_render_context(project, &run_id)?;
         let runtime = project
@@ -294,6 +492,9 @@ impl EnvironmentSession {
             run_id,
             runtime,
             runtime_invoked: false,
+            follow_logs,
+            live_logs: Vec::new(),
+            active_logs: Vec::new(),
             report: EnvironmentArtifactsReport {
                 runtime: report,
                 readiness: Vec::new(),
@@ -376,6 +577,34 @@ impl EnvironmentSession {
         }
     }
 
+    fn resolve_live_log_specs(&self) -> Result<Vec<ResolvedLiveLogSpec>> {
+        let mut specs = Vec::new();
+        for slot_id in self.readiness_slot_ids() {
+            let slot_project = self.project_for_slot(slot_id)?;
+            specs.extend(resolve_live_log_specs_for_project(
+                &slot_project,
+                &self.run_id,
+                slot_id,
+                self.slot_report_id(slot_id),
+            )?);
+        }
+        Ok(specs)
+    }
+
+    fn resolve_active_log_specs(&self) -> Result<Vec<ResolvedActiveLogSpec>> {
+        let mut specs = Vec::new();
+        for slot_id in self.readiness_slot_ids() {
+            let slot_project = self.project_for_slot(slot_id)?;
+            specs.extend(resolve_active_log_specs_for_project(
+                &slot_project,
+                &self.run_id,
+                slot_id,
+                self.slot_report_id(slot_id),
+            )?);
+        }
+        Ok(specs)
+    }
+
     async fn run_readiness_checks(&mut self) -> Result<()> {
         for slot_id in self.readiness_slot_ids() {
             let project = self.project_for_slot(slot_id)?;
@@ -395,6 +624,229 @@ impl EnvironmentSession {
             }
         }
         Ok(())
+    }
+
+    async fn start_live_logs(&mut self) -> Result<()> {
+        if !self.follow_logs {
+            return Ok(());
+        }
+        let Some(runtime) = self.runtime.clone() else {
+            return Ok(());
+        };
+        let specs = self.resolve_live_log_specs()?;
+        if specs.is_empty() {
+            return Ok(());
+        }
+
+        let docker = connect_docker()?;
+        let mut handles = Vec::new();
+        let start_result = match runtime {
+            ResolvedRuntime::DockerCompose(dc) => {
+                for spec in specs {
+                    let container_id = compose_container_id(&dc, spec.service()).await?;
+                    handles.push(start_live_log_task(docker.clone(), container_id, spec).await?);
+                }
+                Ok(())
+            }
+            ResolvedRuntime::Containers(ct) => {
+                for spec in specs {
+                    let slot = ct
+                        .slots
+                        .iter()
+                        .find(|slot| slot.slot_id == spec.slot_id())
+                        .with_context(|| {
+                            format!("no slot runtime found for slot `{}`", spec.slot_id())
+                        })?;
+                    let container_id = slot_container_id(slot, spec.service())?;
+                    handles.push(start_live_log_task(docker.clone(), container_id, spec).await?);
+                }
+                Ok(())
+            }
+        };
+
+        if let Err(error) = start_result {
+            stop_live_log_handles(handles).await;
+            return Err(error);
+        }
+
+        self.live_logs = handles;
+        Ok(())
+    }
+
+    async fn stop_live_logs(&mut self) {
+        stop_live_log_handles(std::mem::take(&mut self.live_logs)).await;
+    }
+
+    async fn start_active_logs(&mut self) {
+        let Some(runtime) = self.runtime.clone() else {
+            return;
+        };
+        let specs = match self.resolve_active_log_specs() {
+            Ok(specs) => specs,
+            Err(error) => {
+                self.report.logs.push(EnvironmentLogArtifactReport {
+                    kind: "environment".to_string(),
+                    service: "environment".to_string(),
+                    slot_id: None,
+                    stream: None,
+                    source_path: None,
+                    output: String::new(),
+                    status: "failed".to_string(),
+                    size_bytes: None,
+                    error: Some(error.to_string()),
+                });
+                return;
+            }
+        };
+        if specs.is_empty() {
+            return;
+        }
+        let docker = match connect_docker() {
+            Ok(docker) => docker,
+            Err(error) => {
+                for spec in specs {
+                    self.report.logs.push(failed_active_log_report(
+                        "redis_monitor",
+                        &spec.service,
+                        spec.report_slot_id,
+                        &spec.output,
+                        None,
+                        error.to_string(),
+                    ));
+                }
+                return;
+            }
+        };
+
+        match runtime {
+            ResolvedRuntime::DockerCompose(dc) => {
+                for spec in specs {
+                    let container_id = match compose_container_id(&dc, &spec.service).await {
+                        Ok(container_id) => container_id,
+                        Err(error) => {
+                            self.report.logs.push(failed_active_log_report(
+                                "redis_monitor",
+                                &spec.service,
+                                spec.report_slot_id,
+                                &spec.output,
+                                None,
+                                error.to_string(),
+                            ));
+                            continue;
+                        }
+                    };
+                    match prepare_active_output_path(&self.runner_root, &spec.output) {
+                        Ok(output_path) => {
+                            let report_slot_id = spec.report_slot_id;
+                            let service = spec.service.clone();
+                            let output = spec.output.clone();
+                            match start_redis_monitor_capture(
+                                docker.clone(),
+                                container_id,
+                                spec,
+                                output_path,
+                                self.follow_logs,
+                            )
+                            .await
+                            {
+                                Ok(handle) => self.active_logs.push(handle),
+                                Err(error) => self.report.logs.push(failed_active_log_report(
+                                    "redis_monitor",
+                                    &service,
+                                    report_slot_id,
+                                    &output,
+                                    None,
+                                    error,
+                                )),
+                            }
+                        }
+                        Err(error) => {
+                            self.report.logs.push(failed_active_log_report(
+                                "redis_monitor",
+                                &spec.service,
+                                spec.report_slot_id,
+                                &spec.output,
+                                None,
+                                error.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            ResolvedRuntime::Containers(ct) => {
+                for spec in specs {
+                    let slot = match ct.slots.iter().find(|slot| slot.slot_id == spec.slot_id) {
+                        Some(slot) => slot,
+                        None => {
+                            self.report.logs.push(failed_active_log_report(
+                                "redis_monitor",
+                                &spec.service,
+                                spec.report_slot_id,
+                                &spec.output,
+                                None,
+                                format!("no slot runtime found for slot `{}`", spec.slot_id),
+                            ));
+                            continue;
+                        }
+                    };
+                    let container_id = match slot_container_id(slot, &spec.service) {
+                        Ok(container_id) => container_id,
+                        Err(error) => {
+                            self.report.logs.push(failed_active_log_report(
+                                "redis_monitor",
+                                &spec.service,
+                                spec.report_slot_id,
+                                &spec.output,
+                                None,
+                                error.to_string(),
+                            ));
+                            continue;
+                        }
+                    };
+                    match prepare_active_output_path(&self.runner_root, &spec.output) {
+                        Ok(output_path) => {
+                            let report_slot_id = spec.report_slot_id;
+                            let service = spec.service.clone();
+                            let output = spec.output.clone();
+                            match start_redis_monitor_capture(
+                                docker.clone(),
+                                container_id,
+                                spec,
+                                output_path,
+                                self.follow_logs,
+                            )
+                            .await
+                            {
+                                Ok(handle) => self.active_logs.push(handle),
+                                Err(error) => self.report.logs.push(failed_active_log_report(
+                                    "redis_monitor",
+                                    &service,
+                                    report_slot_id,
+                                    &output,
+                                    None,
+                                    error,
+                                )),
+                            }
+                        }
+                        Err(error) => {
+                            self.report.logs.push(failed_active_log_report(
+                                "redis_monitor",
+                                &spec.service,
+                                spec.report_slot_id,
+                                &spec.output,
+                                None,
+                                error.to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn finalize_active_logs(&mut self) {
+        let reports = stop_active_log_handles(std::mem::take(&mut self.active_logs)).await;
+        self.report.logs.extend(reports);
     }
 
     pub async fn prepare(&mut self) -> Result<()> {
@@ -458,8 +910,9 @@ impl EnvironmentSession {
             }
             None => {}
         }
-
         self.run_readiness_checks().await?;
+        self.start_active_logs().await;
+        self.start_live_logs().await?;
 
         Ok(())
     }
@@ -469,6 +922,8 @@ impl EnvironmentSession {
             self.collect_logs().await;
         }
         self.shutdown(success).await;
+        self.finalize_active_logs().await;
+        self.stop_live_logs().await;
         self.report
     }
 
@@ -605,6 +1060,9 @@ impl EnvironmentSession {
                             error: Some(format!("no slot runtime found for slot `{slot_id}`")),
                         },
                     },
+                    (ResolvedLogSpec::RedisMonitor { .. }, _) => {
+                        continue;
+                    }
                 };
                 self.report.logs.push(artifact);
             }
@@ -686,7 +1144,9 @@ impl EnvironmentSession {
 impl ResolvedLogSpec {
     fn output(&self) -> &str {
         match self {
-            Self::ComposeService { output, .. } | Self::ContainerFile { output, .. } => output,
+            Self::ComposeService { output, .. }
+            | Self::ContainerFile { output, .. }
+            | Self::RedisMonitor { output, .. } => output,
         }
     }
 }
@@ -883,6 +1343,10 @@ fn resolve_log_spec(
         } => ResolvedLogSpec::ContainerFile {
             service: resolve_string(context, service)?,
             path: resolve_string(context, path)?,
+            output: resolve_string(context, output)?,
+        },
+        EnvironmentLogSource::RedisMonitor { service, output } => ResolvedLogSpec::RedisMonitor {
+            service: resolve_string(context, service)?,
             output: resolve_string(context, output)?,
         },
     })
@@ -2032,14 +2496,9 @@ async fn collect_container_logs_bollard(
         }
     };
 
-    let container_id = match slot
-        .container_ids
-        .iter()
-        .find(|(name, _)| name == service)
-        .map(|(_, id)| id.clone())
-    {
-        Some(id) => id,
-        None => {
+    let container_id = match slot_container_id(slot, service) {
+        Ok(id) => id,
+        Err(error) => {
             return EnvironmentLogArtifactReport {
                 kind: "containers".to_string(),
                 service: service.to_string(),
@@ -2049,7 +2508,7 @@ async fn collect_container_logs_bollard(
                 output: output.to_string(),
                 status: "failed".to_string(),
                 size_bytes: None,
-                error: Some(format!("no container found for service `{service}`")),
+                error: Some(error.to_string()),
             };
         }
     };
@@ -2158,14 +2617,9 @@ async fn collect_container_file_bollard(
         }
     };
 
-    let container_id = match slot
-        .container_ids
-        .iter()
-        .find(|(name, _)| name == service)
-        .map(|(_, id)| id.clone())
-    {
-        Some(id) => id,
-        None => {
+    let container_id = match slot_container_id(slot, service) {
+        Ok(id) => id,
+        Err(error) => {
             return EnvironmentLogArtifactReport {
                 kind: "container_file".to_string(),
                 service: service.to_string(),
@@ -2175,7 +2629,7 @@ async fn collect_container_file_bollard(
                 output: output.to_string(),
                 status: "failed".to_string(),
                 size_bytes: None,
-                error: Some(format!("no container found for service `{service}`")),
+                error: Some(error.to_string()),
             };
         }
     };
@@ -2268,10 +2722,110 @@ fn write_artifact_file(path: &Path, contents: &str) -> Result<u64> {
     Ok(fs::metadata(path)?.len())
 }
 
+fn prepare_active_output_path(runner_root: &Path, output: &str) -> Result<PathBuf> {
+    let output_path = resolve_report_output_path(runner_root, output)?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create artifact directory {}", parent.display()))?;
+    }
+    fs::write(&output_path, b"").with_context(|| {
+        format!(
+            "failed to initialize artifact file {}",
+            output_path.display()
+        )
+    })?;
+    Ok(output_path)
+}
+
+fn failed_active_log_report(
+    kind: &str,
+    service: &str,
+    slot_id: Option<usize>,
+    output: &str,
+    source_path: Option<String>,
+    error: String,
+) -> EnvironmentLogArtifactReport {
+    EnvironmentLogArtifactReport {
+        kind: kind.to_string(),
+        service: service.to_string(),
+        slot_id,
+        stream: None,
+        source_path,
+        output: output.to_string(),
+        status: "failed".to_string(),
+        size_bytes: None,
+        error: Some(error),
+    }
+}
+
 fn resolve_string(context: &RuntimeContext, raw: &str) -> Result<String> {
     Ok(value_to_string(
         context.resolve_value(&Value::String(raw.to_string()))?,
     ))
+}
+
+fn resolve_live_log_specs_for_project(
+    project: &LoadedProject,
+    run_id: &str,
+    slot_id: usize,
+    report_slot_id: Option<usize>,
+) -> Result<Vec<ResolvedLiveLogSpec>> {
+    let context = build_render_context(project, run_id)?;
+    let specs = project
+        .environment
+        .logs
+        .iter()
+        .map(|log| resolve_log_spec(log, &context))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|log| match log {
+            ResolvedLogSpec::ComposeService {
+                service, stream, ..
+            } => Some(ResolvedLiveLogSpec::ComposeService {
+                slot_id,
+                report_slot_id,
+                service,
+                stream,
+            }),
+            ResolvedLogSpec::ContainerFile { service, path, .. } => {
+                Some(ResolvedLiveLogSpec::ContainerFile {
+                    slot_id,
+                    report_slot_id,
+                    service,
+                    path,
+                })
+            }
+            ResolvedLogSpec::RedisMonitor { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    Ok(specs)
+}
+
+fn resolve_active_log_specs_for_project(
+    project: &LoadedProject,
+    run_id: &str,
+    slot_id: usize,
+    report_slot_id: Option<usize>,
+) -> Result<Vec<ResolvedActiveLogSpec>> {
+    let context = build_render_context(project, run_id)?;
+    let specs = project
+        .environment
+        .logs
+        .iter()
+        .map(|log| resolve_log_spec(log, &context))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|log| match log {
+            ResolvedLogSpec::RedisMonitor { service, output } => Some(ResolvedActiveLogSpec {
+                slot_id,
+                report_slot_id,
+                service,
+                output,
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    Ok(specs)
 }
 
 fn resolve_project_path(base: &Path, raw: &str) -> Result<PathBuf> {
@@ -2345,6 +2899,19 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
+fn slot_container_id(slot: &ResolvedContainerSlot, service: &str) -> Result<String> {
+    slot.container_ids
+        .iter()
+        .find(|(name, _)| name == service)
+        .map(|(_, id)| id.clone())
+        .with_context(|| {
+            format!(
+                "no container found for service `{service}` in slot `{}`",
+                slot.slot_id
+            )
+        })
+}
+
 fn stream_label(stream: ComposeLogStream) -> &'static str {
     match stream {
         ComposeLogStream::Stdout => "stdout",
@@ -2353,11 +2920,369 @@ fn stream_label(stream: ComposeLogStream) -> &'static str {
     }
 }
 
+fn live_log_color_for_service(service: &str, path: Option<&str>) -> LiveLogColor {
+    let service = service.to_ascii_lowercase();
+    let path = path.map(|value| value.to_ascii_lowercase());
+    if service.contains("redis") {
+        LiveLogColor::Redis
+    } else if service.contains("mysql")
+        || service.contains("mariadb")
+        || path
+            .as_deref()
+            .map(|value| value.contains("general.log") || value.contains("mysql"))
+            .unwrap_or(false)
+    {
+        LiveLogColor::Mysql
+    } else if service.contains("app") {
+        LiveLogColor::App
+    } else {
+        LiveLogColor::Default
+    }
+}
+
+fn live_log_styler() -> &'static LiveLogStyler {
+    static STYLER: OnceLock<LiveLogStyler> = OnceLock::new();
+    STYLER.get_or_init(LiveLogStyler::detect)
+}
+
+fn emit_live_log_text(color: LiveLogColor, label: &str, text: &str) {
+    let styler = live_log_styler();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if !line.is_empty() {
+            eprintln!("{}", styler.format_line(color, label, line));
+        }
+    }
+}
+
+fn emit_live_log_error(label: &str, message: &str) {
+    eprintln!("{}", live_log_styler().format_error(label, message));
+}
+
+fn shell_escape_single_quotes(value: &str) -> String {
+    value.replace('\'', r#"'\''"#)
+}
+
+fn filter_redis_monitor_text(text: &str) -> String {
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed == "OK"
+            || trimmed == "Error: Server closed the connection"
+            || trimmed.contains(r#""CLIENT" "SETINFO""#)
+        {
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        let mut filtered = lines.join("\n");
+        if text.ends_with('\n') {
+            filtered.push('\n');
+        }
+        filtered
+    }
+}
+
+async fn docker_exec_stream(
+    docker: Docker,
+    container_id: String,
+    command: Vec<String>,
+) -> Result<impl futures_util::Stream<Item = Result<LogOutput, BollardError>>, String> {
+    let exec = docker
+        .create_exec(
+            &container_id,
+            CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(command),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| format!("failed to create exec session: {error}"))?;
+
+    match docker
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(|error| format!("failed to start exec session: {error}"))?
+    {
+        StartExecResults::Attached { output, .. } => Ok(output),
+        StartExecResults::Detached => Err("exec session detached unexpectedly".to_string()),
+    }
+}
+
+async fn start_live_log_task(
+    docker: Docker,
+    container_id: String,
+    spec: ResolvedLiveLogSpec,
+) -> Result<LiveLogHandle> {
+    let label = spec.display_label();
+    let color = spec.color();
+    let task_label = label.clone();
+    let task = match spec {
+        ResolvedLiveLogSpec::ComposeService { stream, .. } => {
+            let stdout = stream != ComposeLogStream::Stderr;
+            let stderr = stream != ComposeLogStream::Stdout;
+            let mut stream = docker.logs::<String>(
+                &container_id,
+                Some(LogsOptions {
+                    follow: true,
+                    stdout,
+                    stderr,
+                    timestamps: true,
+                    ..Default::default()
+                }),
+            );
+
+            tokio::spawn(async move {
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(LogOutput::StdOut { message } | LogOutput::StdErr { message }) => {
+                            let text = String::from_utf8_lossy(&message);
+                            emit_live_log_text(color, &task_label, text.as_ref());
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            emit_live_log_error(&task_label, &format!("log stream error: {error}"));
+                            break;
+                        }
+                    }
+                }
+            })
+        }
+        ResolvedLiveLogSpec::ContainerFile { path, .. } => {
+            let escaped = shell_escape_single_quotes(&path);
+            let command = vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                format!(
+                    "while [ ! -f '{escaped}' ]; do sleep 1; done; offset=$(wc -c < '{escaped}' 2>/dev/null || echo 0); printf '%s\\n' '{LIVE_TAIL_READY_MARKER}'; exec tail -c +$((offset + 1)) -F '{escaped}'"
+                ),
+            ];
+            let mut stream = docker_exec_stream(docker, container_id, command)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+            let initial_text =
+                await_live_tail_ready(&mut stream, &task_label, LIVE_TAIL_READY_MARKER).await?;
+
+            tokio::spawn(async move {
+                if !initial_text.is_empty() {
+                    emit_live_log_text(color, &task_label, &initial_text);
+                }
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(LogOutput::StdOut { message } | LogOutput::StdErr { message }) => {
+                            let text = String::from_utf8_lossy(&message);
+                            emit_live_log_text(color, &task_label, text.as_ref());
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            emit_live_log_error(
+                                &task_label,
+                                &format!("file tail stream error: {error}"),
+                            );
+                            break;
+                        }
+                    }
+                }
+            })
+        }
+    };
+    Ok(LiveLogHandle { label, task })
+}
+
+async fn stop_live_log_handles(handles: Vec<LiveLogHandle>) {
+    for handle in handles {
+        handle.task.abort();
+        match handle.task.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                emit_live_log_error(&handle.label, &format!("live log task failed: {error}"));
+            }
+        }
+    }
+}
+
+async fn start_redis_monitor_capture(
+    docker: Docker,
+    container_id: String,
+    spec: ResolvedActiveLogSpec,
+    output_path: PathBuf,
+    mirror_to_stderr: bool,
+) -> Result<ActiveLogHandle, String> {
+    let label = spec.display_label();
+    let color = spec.color();
+    let task_label = label.clone();
+    let task_output_path = output_path.clone();
+    let mut stream = docker_exec_stream(
+        docker,
+        container_id,
+        vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "command -v redis-cli >/dev/null 2>&1 || exit 127; until redis-cli --raw MONITOR; do sleep 1; done".to_string(),
+        ],
+    )
+    .await?;
+    let task = tokio::spawn(async move {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&task_output_path)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to open monitor artifact {}: {error}",
+                    task_output_path.display()
+                )
+            })?;
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(LogOutput::StdOut { message } | LogOutput::StdErr { message }) => {
+                    let text = String::from_utf8_lossy(&message);
+                    let filtered = filter_redis_monitor_text(text.as_ref());
+                    if filtered.is_empty() {
+                        continue;
+                    }
+                    file.write_all(filtered.as_bytes())
+                        .await
+                        .map_err(|error| format!("failed to write monitor artifact: {error}"))?;
+                    if mirror_to_stderr {
+                        emit_live_log_text(color, &task_label, &filtered);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(format!("redis monitor stream error: {error}"));
+                }
+            }
+        }
+
+        file.flush()
+            .await
+            .map_err(|error| format!("failed to flush monitor artifact: {error}"))?;
+        Ok(())
+    });
+
+    Ok(ActiveLogHandle {
+        kind: "redis_monitor".to_string(),
+        service: spec.service,
+        slot_id: spec.report_slot_id,
+        source_path: None,
+        output: spec.output,
+        output_path,
+        task,
+    })
+}
+
+async fn await_live_tail_ready<S>(stream: &mut S, label: &str, marker: &str) -> Result<String>
+where
+    S: futures_util::Stream<Item = Result<LogOutput, BollardError>> + Unpin,
+{
+    timeout(Duration::from_secs(5), async {
+        let mut buffered = String::new();
+        loop {
+            match stream.next().await {
+                Some(Ok(LogOutput::StdOut { message } | LogOutput::StdErr { message })) => {
+                    buffered.push_str(&String::from_utf8_lossy(&message));
+                    if let Some(pending) = extract_live_tail_pending_text(&buffered, marker) {
+                        return Ok(pending);
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    bail!("file tail stream error before ready: {error}");
+                }
+                None => {
+                    bail!("file tail stream ended before ready");
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for live tail to attach for {label}"))?
+}
+
+fn extract_live_tail_pending_text(buffered: &str, marker: &str) -> Option<String> {
+    buffered.find(marker).map(|index| {
+        let mut pending = &buffered[index + marker.len()..];
+        if let Some(stripped) = pending.strip_prefix("\r\n") {
+            pending = stripped;
+        } else if let Some(stripped) = pending.strip_prefix('\n') {
+            pending = stripped;
+        }
+        pending.to_string()
+    })
+}
+
+async fn stop_active_log_handles(
+    handles: Vec<ActiveLogHandle>,
+) -> Vec<EnvironmentLogArtifactReport> {
+    let mut reports = Vec::new();
+    for handle in handles {
+        let ActiveLogHandle {
+            kind,
+            service,
+            slot_id,
+            source_path,
+            output,
+            output_path,
+            task,
+            ..
+        } = handle;
+        let mut task = task;
+        let task_result = match timeout(Duration::from_secs(2), &mut task).await {
+            Ok(result) => match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) if error.is_cancelled() => None,
+                Err(error) => Some(format!("active log task failed: {error}")),
+            },
+            Err(_) => {
+                task.abort();
+                match task.await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error),
+                    Err(error) if error.is_cancelled() => None,
+                    Err(error) => Some(format!("active log task failed: {error}")),
+                }
+            }
+        };
+
+        let size_bytes = fs::metadata(&output_path)
+            .ok()
+            .map(|metadata| metadata.len());
+        reports.push(EnvironmentLogArtifactReport {
+            kind,
+            service,
+            slot_id,
+            stream: None,
+            source_path,
+            output,
+            status: if task_result.is_some() {
+                "failed".to_string()
+            } else {
+                "passed".to_string()
+            },
+            size_bytes,
+            error: task_result,
+        });
+    }
+    reports
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{
-        EnvironmentRuntimeConfig, MockServerConfig, ProjectConfig, ProjectDefaults, ProjectMetadata,
+        EnvironmentLogSource, EnvironmentRuntimeConfig, MockServerConfig, ProjectConfig,
+        ProjectDefaults, ProjectMetadata,
     };
 
     #[test]
@@ -2377,6 +3302,45 @@ mod tests {
         let error = resolve_report_output_path(&root, "../escape.log")
             .expect_err("parent traversal must fail");
         assert!(error.to_string().contains("cannot escape"));
+    }
+
+    #[test]
+    fn live_log_color_detects_mysql_and_redis_sources() {
+        assert_eq!(
+            live_log_color_for_service("mysql", Some("/var/lib/mysql/general.log")),
+            LiveLogColor::Mysql
+        );
+        assert_eq!(
+            live_log_color_for_service("redis", None),
+            LiveLogColor::Redis
+        );
+        assert_eq!(live_log_color_for_service("app", None), LiveLogColor::App);
+    }
+
+    #[test]
+    fn live_log_styler_keeps_plain_text_when_disabled() {
+        let styler = LiveLogStyler { enabled: false };
+        assert_eq!(
+            styler.format_line(LiveLogColor::Mysql, "[env:mysql]", "SELECT 1"),
+            "[env:mysql] SELECT 1"
+        );
+        assert_eq!(
+            styler.format_error("[env:mysql]", "boom"),
+            "[env:mysql] [error] boom"
+        );
+    }
+
+    #[test]
+    fn live_log_styler_colors_labels_and_source_text_when_enabled() {
+        let styler = LiveLogStyler { enabled: true };
+        assert_eq!(
+            styler.format_line(LiveLogColor::Mysql, "[env:mysql]", "SELECT 1"),
+            "\u{1b}[1;35m[env:mysql]\u{1b}[0m \u{1b}[35mSELECT 1\u{1b}[0m"
+        );
+        assert_eq!(
+            styler.format_line(LiveLogColor::App, "[env:app]", "listening"),
+            "\u{1b}[1;36m[env:app]\u{1b}[0m listening"
+        );
     }
 
     fn test_project_with_container_runtime(service_env: IndexMap<String, String>) -> LoadedProject {
@@ -2502,5 +3466,191 @@ mod tests {
             service_env.get("EXTERNAL_PROVIDER_BASE_URL"),
             Some(&"http://example.com:18081".to_string())
         );
+    }
+
+    #[test]
+    fn live_log_specs_follow_declared_sources_without_fallbacks() {
+        let project = test_project_with_docker_compose_runtime(vec![
+            EnvironmentLogSource::ContainerFile {
+                service: "mysql".to_string(),
+                path: "/var/lib/mysql/general.log".to_string(),
+                output: "env/mysql-query.log".to_string(),
+            },
+            EnvironmentLogSource::RedisMonitor {
+                service: "redis".to_string(),
+                output: "env/redis-monitor.log".to_string(),
+            },
+        ]);
+
+        let specs =
+            resolve_live_log_specs_for_project(&project, "run-1", 0, None).expect("live specs");
+
+        assert_eq!(
+            specs,
+            vec![ResolvedLiveLogSpec::ContainerFile {
+                slot_id: 0,
+                report_slot_id: None,
+                service: "mysql".to_string(),
+                path: "/var/lib/mysql/general.log".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn active_log_specs_capture_redis_monitor_sources() {
+        let project = test_project_with_docker_compose_runtime(vec![
+            EnvironmentLogSource::ContainerFile {
+                service: "mysql".to_string(),
+                path: "/var/lib/mysql/general.log".to_string(),
+                output: "env/mysql-query.log".to_string(),
+            },
+            EnvironmentLogSource::RedisMonitor {
+                service: "redis".to_string(),
+                output: "env/redis-monitor.log".to_string(),
+            },
+        ]);
+
+        let specs =
+            resolve_active_log_specs_for_project(&project, "run-1", 0, None).expect("active specs");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].service, "redis");
+        assert_eq!(specs[0].output, "env/redis-monitor.log");
+        assert_eq!(specs[0].display_label(), "[env:redis:monitor]");
+    }
+
+    #[test]
+    fn live_log_specs_keep_multiple_sources_for_same_service() {
+        let project = test_project_with_docker_compose_runtime(vec![
+            EnvironmentLogSource::ContainerFile {
+                service: "mysql".to_string(),
+                path: "/var/lib/mysql/general.log".to_string(),
+                output: "env/mysql-query.log".to_string(),
+            },
+            EnvironmentLogSource::ComposeService {
+                service: "mysql".to_string(),
+                stream: ComposeLogStream::Stdout,
+                output: "env/mysql.log".to_string(),
+            },
+            EnvironmentLogSource::ContainerFile {
+                service: "mysql".to_string(),
+                path: "/var/lib/mysql/slow.log".to_string(),
+                output: "env/mysql-slow.log".to_string(),
+            },
+        ]);
+
+        let specs =
+            resolve_live_log_specs_for_project(&project, "run-1", 0, None).expect("live specs");
+
+        assert_eq!(
+            specs,
+            vec![
+                ResolvedLiveLogSpec::ContainerFile {
+                    slot_id: 0,
+                    report_slot_id: None,
+                    service: "mysql".to_string(),
+                    path: "/var/lib/mysql/general.log".to_string(),
+                },
+                ResolvedLiveLogSpec::ComposeService {
+                    slot_id: 0,
+                    report_slot_id: None,
+                    service: "mysql".to_string(),
+                    stream: ComposeLogStream::Stdout,
+                },
+                ResolvedLiveLogSpec::ContainerFile {
+                    slot_id: 0,
+                    report_slot_id: None,
+                    service: "mysql".to_string(),
+                    path: "/var/lib/mysql/slow.log".to_string(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn live_log_labels_include_slot_and_stream_context() {
+        assert_eq!(
+            ResolvedLiveLogSpec::ComposeService {
+                slot_id: 0,
+                report_slot_id: None,
+                service: "redis".to_string(),
+                stream: ComposeLogStream::Combined,
+            }
+            .display_label(),
+            "[env:redis]"
+        );
+        assert_eq!(
+            ResolvedLiveLogSpec::ComposeService {
+                slot_id: 2,
+                report_slot_id: Some(2),
+                service: "mysql".to_string(),
+                stream: ComposeLogStream::Stdout,
+            }
+            .display_label(),
+            "[env:slot-2:mysql]:stdout"
+        );
+        assert_eq!(
+            ResolvedLiveLogSpec::ContainerFile {
+                slot_id: 1,
+                report_slot_id: Some(1),
+                service: "mysql".to_string(),
+                path: "/var/lib/mysql/general.log".to_string(),
+            }
+            .display_label(),
+            "[env:slot-1:mysql]:general.log"
+        );
+    }
+
+    #[test]
+    fn redis_monitor_filter_removes_connection_noise() {
+        let filtered = filter_redis_monitor_text(
+            "OK\n177 foo \"CLIENT\" \"SETINFO\" \"LIB-NAME\" \"redis-rs\"\n177 bar \"SETEX\" \"sms\" \"300\" \"1234\"\nError: Server closed the connection\n",
+        );
+        assert_eq!(filtered, "177 bar \"SETEX\" \"sms\" \"300\" \"1234\"\n");
+    }
+
+    fn test_project_with_docker_compose_runtime(logs: Vec<EnvironmentLogSource>) -> LoadedProject {
+        LoadedProject {
+            root: PathBuf::from("/tmp/project"),
+            runner_root: PathBuf::from("/tmp/project/.testrunner"),
+            project: ProjectConfig {
+                version: 1,
+                project: ProjectMetadata {
+                    name: "sample".to_string(),
+                },
+                defaults: ProjectDefaults::default(),
+                mock: MockServerConfig {
+                    enabled: true,
+                    host: "127.0.0.1".to_string(),
+                    port: 18081,
+                },
+            },
+            environment_name: "docker".to_string(),
+            environment: EnvironmentConfig {
+                name: Some("docker".to_string()),
+                base_url: "http://127.0.0.1:18080".to_string(),
+                headers: Default::default(),
+                variables: Default::default(),
+                runtime: Some(EnvironmentRuntimeConfig {
+                    kind: EnvironmentRuntimeKind::DockerCompose,
+                    project_directory: ".".to_string(),
+                    files: vec!["docker-compose.yml".to_string()],
+                    project_name: Some("sample".to_string()),
+                    up: vec!["-d".to_string()],
+                    down: vec!["-v".to_string()],
+                    cleanup: EnvironmentRuntimeCleanupPolicy::Always,
+                    services: Vec::new(),
+                    network_name: None,
+                    parallel: None,
+                }),
+                readiness: Vec::new(),
+                logs,
+            },
+            datasources: Default::default(),
+            apis: Default::default(),
+            cases: Vec::new(),
+            workflows: Default::default(),
+            mock_routes: Vec::new(),
+        }
     }
 }
