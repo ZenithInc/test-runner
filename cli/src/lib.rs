@@ -1,5 +1,5 @@
-pub mod cli;
 pub mod callback;
+pub mod cli;
 pub mod config;
 pub mod dsl;
 pub mod environment;
@@ -7,6 +7,7 @@ pub mod init;
 pub mod mock;
 pub mod runner;
 pub mod runtime;
+pub mod url_rewrite;
 pub mod workflow;
 
 use anyhow::Result;

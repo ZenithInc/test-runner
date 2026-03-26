@@ -86,6 +86,7 @@ test-runner test workflow --all --root sample-projects --env containers --parall
 - `test api` / `test dir` / `test all`：按 **case** 分配 slot
 - `test workflow --all`：按 **workflow** 分配 slot
 - 单个 workflow 内部的 steps 仍保持串行
+- 如果应用通过容器环境变量读取 mock / provider URL，把占位地址显式写到 `runtime.services[*].env`；并行 + 内嵌 mock 时，运行器会自动改写到当前 slot 的实际端口
 
 ## 一个推荐的接入顺序
 

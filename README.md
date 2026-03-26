@@ -1428,7 +1428,7 @@ cargo run -p test-runner -- test workflow payment-callback-flow --root sample-pr
 sample-projects/.testrunner/reports/env/
 ```
 
-默认会把应用暴露在 `127.0.0.1:18080`，把 MySQL 暴露在 `127.0.0.1:13306`，把 Redis 暴露在 `127.0.0.1:16379`。另外，`test-runner` 的内嵌 Mock Server 会在 `18081` 启动，样例项目的默认 `docker` / `local` 环境已经分别把短信服务地址指向 `host.docker.internal:18081` 和 `127.0.0.1:18081`。
+默认会把应用暴露在 `127.0.0.1:18080`，把 MySQL 暴露在 `127.0.0.1:13306`，把 Redis 暴露在 `127.0.0.1:16379`。另外，`test-runner` 的内嵌 Mock Server 在单 slot / 本地场景下默认会监听 `18081`；如果你使用 `containers` 并行 slot，运行器会为每个 slot 预留独立的 mock 端口，并把 DSL 中显式声明的 mock URL 自动改写到对应端口。样例项目的默认 `docker` / `local` 环境已经分别把短信服务地址指向 `host.docker.internal:18081` 和 `127.0.0.1:18081`。
 
 ### 16.2 仅本地启动 Rust 服务
 

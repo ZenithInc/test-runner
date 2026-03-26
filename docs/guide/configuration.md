@@ -113,7 +113,7 @@ logs:
     - `context`：构建上下文目录（相对于项目根目录）。
     - `dockerfile`：可选，Dockerfile 路径（相对于 context）。
   - `ports`：端口映射（`"host:container"` 或 `"container"`）。
-  - `env`：环境变量。
+  - `env`：环境变量。如果应用从进程环境变量读取 mock / provider 地址，推荐把占位 URL 显式声明在这里，例如 `http://host.docker.internal:18081`。
   - `command`：覆盖容器启动命令。
   - `volumes`：卷挂载。
   - `extra_hosts`：额外 hosts 映射（如 `"host.docker.internal:host-gateway"`）。
@@ -123,6 +123,8 @@ logs:
 - `cleanup`：同上。
 
 > 动态端口映射会注入到 `env.variables.runtime_ports`，可在 DSL 中引用，如 <code v-pre>{{ env.variables.runtime_ports.mysql.3306 }}</code>。
+>
+> 对只声明 `image:` 的服务，当前拉镜像语义接近 `IfNotPresent`：本地已存在就直接复用；只有本地不存在时才会 pull。
 
 #### `containers` 并行 slot
 
@@ -142,7 +144,15 @@ runtime:
 - 单个 workflow 内部的 steps 仍然保持串行
 - `--jobs N` 会覆盖 `parallel.slots`
 
-在多 slot 模式下，原本写在环境、API、datasource 里的固定 host 端口会自动改写为当前 slot 的实际端口；日志产物则会落到 `.testrunner/reports/slot-<id>/...`。
+在多 slot 模式下，原本显式写在环境、API、datasource 以及 `runtime.services[*].env` 里的固定 host 端口 / mock URL 会自动改写为当前 slot 的实际端口；日志产物则会落到 `.testrunner/reports/slot-<id>/...`。
+
+这条自动改写只覆盖 **test-runner 已经托管的 DSL 配置面**，不会自动扫描：
+
+- 镜像内部的 `.env` / 配置文件
+- 挂载进容器但未通过 DSL 显式声明的外部配置文件
+- 容器启动脚本里自行拼接的地址
+
+如果你的应用通过配置文件而不是 `runtime.services[*].env` 消费 mock URL，需要后续再引入显式的文件模板渲染 / 挂载能力。
 
 ### `readiness`
 

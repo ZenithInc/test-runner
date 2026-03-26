@@ -203,6 +203,33 @@ test-runner test all --root sample-projects --env containers --parallel
 test-runner test workflow --all --root sample-projects --env containers --parallel --jobs 4
 ```
 
+如果你想专门验证“应用通过 `runtime.services[*].env` 读取 mock URL”这条链路，可以基于 `sample-projects` 做一份临时副本，然后：
+
+1. 在 `.testrunner/env/containers.yaml` 的 `app` 服务下加上：
+
+   ```yaml
+   env:
+     PAYMENT_PROVIDER_BASE_URL: "http://host.docker.internal:18081"
+   extra_hosts:
+     - "host.docker.internal:host-gateway"
+   ```
+
+2. 复制 `payment/provider-callback-via-mock.yaml`，并删除请求体里的：
+
+   ```yaml
+   provider_base_url: "${env.variables.payment_provider_base_url}"
+   ```
+
+   这样应用就会回退到容器进程环境变量里的 `PAYMENT_PROVIDER_BASE_URL`。
+
+3. 准备两条 payment case 后，执行：
+
+   ```bash
+   test-runner test dir payment --root /path/to/your-sample-copy --env containers --parallel --jobs 2
+   ```
+
+如果这条链路配置正确，你会看到两条 payment case 分别落到不同 slot，并且每个 slot 都能通过各自的 mock server 完成 callback。
+
 如果你只是想看看执行计划，不想真的启动环境，也可以继续使用：
 
 ```bash

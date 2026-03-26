@@ -139,11 +139,13 @@ runtime:
 
 运行器会通过 Docker Engine API 直接管理容器生命周期：
 
-1. 自动拉取镜像（或从 Dockerfile 构建镜像）
+1. 若本地不存在则自动拉取镜像（或从 Dockerfile 构建镜像）
 2. 创建隔离的 Docker 网络（容器间可通过服务名互访）
 3. 依次创建并启动容器
 4. 按 `wait_for` 策略等待每个容器就绪
 5. 测试完成后按 `cleanup` 策略清理
+
+> 对只声明 `image:` 的服务，当前拉镜像语义接近 `IfNotPresent`：本地已存在就直接复用；只有 Docker 返回“本地不存在”（404）时才会 pull。
 
 **`services` 字段说明：**
 
@@ -221,8 +223,46 @@ runtime:
 每个 slot 都会拥有自己的网络、端口映射、callback runtime 和内嵌 mock server，所以：
 
 - 不需要修改应用代码
-- 固定 host 端口会自动改写到当前 slot 的实际端口
+- 在环境、API、datasource 以及 `runtime.services[*].env` 里显式声明的固定 host 端口 / mock URL，会自动改写到当前 slot 的实际端口
 - 日志会写到 `.testrunner/reports/slot-<id>/...`
+
+#### 内嵌 mock + `runtime.services[*].env`
+
+如果你的应用不是在 case 里显式传 `provider_base_url`，而是直接从容器进程环境变量读取第三方 / mock 地址，那么推荐把**占位 URL** 明确写在 `runtime.services[*].env`：
+
+```yaml
+runtime:
+  kind: containers
+  parallel:
+    slots: 2
+  services:
+    - name: app
+      build:
+        context: .
+      env:
+        PAYMENT_PROVIDER_BASE_URL: "http://host.docker.internal:18081"
+      extra_hosts:
+        - "host.docker.internal:host-gateway"
+```
+
+在 `containers + --parallel + 内嵌 mock` 场景下，运行器会按下面的顺序处理：
+
+1. 先为每个 slot 预留一个宿主机 mock 端口
+2. 在容器启动前，把 `runtime.services[*].env` 里显式声明的占位 URL 改写为当前 slot 的实际 mock URL
+3. 启动容器并执行 readiness
+4. 再在这些预留端口上真正启动每个 slot 的 mock server
+5. 同时继续把执行上下文里的环境、API、datasource、readiness URL 改写到当前 slot
+
+这条自动改写**只覆盖 DSL 里显式声明的位置**：
+
+- `environment.base_url`
+- `environment.variables`
+- `environment.readiness`
+- `apis[*].base_url`
+- `datasources[*].url`
+- `runtime.services[*].env`
+
+它**不会**自动扫描应用镜像内部的 `.env`、配置文件或启动脚本；如果你的应用通过文件读取 mock 地址，这属于后续“显式文件注入 / 模板渲染”能力的范围。
 
 **两种模式对比：**
 
@@ -278,14 +318,15 @@ test-runner test workflow register-login-create-order --root sample-projects --e
 运行器的顺序大致是：
 
 1. 加载 `env/docker.yaml`
-2. 启动 runtime（`docker compose up ...` 或 Docker API 容器）
-3. 逐条执行 readiness 检查
-4. 如果启用了内嵌 mock，启动 1 个或 N 个 slot 级 mock，并把实际地址回写到执行上下文
-5. 运行 case 或 workflow
-6. 刷新 callback 队列
-7. 收集 `logs:` 里声明的产物
-8. 按 `cleanup` 策略回收环境
-9. 把环境元数据写进最终报告
+2. 如果是 `containers + parallel + 内嵌 mock`，先为每个 slot 预留 mock 端点，并把 `runtime.services[*].env` 里的显式占位 URL 改写到对应 slot
+3. 启动 runtime（`docker compose up ...` 或 Docker API 容器）
+4. 逐条执行 readiness 检查
+5. 如果启用了内嵌 mock，启动 1 个或 N 个 slot 级 mock，并把实际地址回写到执行上下文
+6. 运行 case 或 workflow
+7. 刷新 callback 队列
+8. 收集 `logs:` 里声明的产物
+9. 按 `cleanup` 策略回收环境
+10. 把环境元数据写进最终报告
 
 这意味着“环境是否 ready”“环境日志是否采集到”“环境回收是否成功”都会和测试结果一起进入报告。
 

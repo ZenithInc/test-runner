@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use indexmap::IndexMap;
 use reqwest::header::HeaderMap;
@@ -24,14 +24,14 @@ use tokio::time::{Duration, sleep};
 use url::Url;
 
 use crate::callback::{
-    CallbackReport, CallbackRuntime, CallbackSummaryReport, PreparedRequest,
-    PreparedRequestBody, RequestPreparationContext, ScheduledCallback, prepare_callback_request,
-    prepare_case_request,
+    CallbackReport, CallbackRuntime, CallbackSummaryReport, PreparedRequest, PreparedRequestBody,
+    RequestPreparationContext, ScheduledCallback, prepare_callback_request, prepare_case_request,
 };
 use crate::cli::{CommonTestArgs, ReportFormat, TestCommand, TestWorkflowArgs};
 use crate::config::{
-    DatasourceDefinition, EnvironmentConfig, LoadedApi, LoadedCase, LoadedProject, LoadedWorkflow,
-    TESTRUNNER_DIR, environment_context_value, load_data_tree, load_project,
+    DatasourceDefinition, EnvironmentConfig, EnvironmentRuntimeKind, LoadedApi, LoadedCase,
+    LoadedProject, LoadedWorkflow, TESTRUNNER_DIR, environment_context_value, load_data_tree,
+    load_project,
 };
 use crate::dsl::{
     CallbackStep, ConditionalStep, ForeachStep, QueryDbStep, QueryRedisStep, RedisCommandStep,
@@ -40,6 +40,7 @@ use crate::dsl::{
 use crate::environment::{EnvironmentArtifactsReport, EnvironmentSession};
 use crate::mock;
 use crate::runtime::{RuntimeContext, apply_assertions, value_to_string};
+use crate::url_rewrite::{rewrite_url_base_in_place, rewrite_value_url_bases};
 use crate::workflow::{CleanupPolicy, WorkflowStep};
 
 pub async fn run(command: TestCommand) -> Result<()> {
@@ -99,8 +100,28 @@ pub async fn run(command: TestCommand) -> Result<()> {
         && !project.mock_routes.is_empty();
     let manages_environment = manages_environment(&project.environment);
 
-    let mut environment_session = match EnvironmentSession::new(&project, parallel_jobs.unwrap_or(1)) {
-        Ok(session) => session,
+    let mut environment_session =
+        match EnvironmentSession::new(&project, parallel_jobs.unwrap_or(1)) {
+            Ok(session) => session,
+            Err(error) => {
+                if manages_environment {
+                    console.environment_failed(&project.environment_name, &error);
+                }
+                return Err(error);
+            }
+        };
+    if manages_environment {
+        console.environment_starting(&project.environment_name, &project.environment);
+    }
+    let reserved_mock_endpoints = match prepare_slot_mock_endpoints(
+        &project,
+        should_start_mock,
+        parallel_jobs.unwrap_or(1),
+        &mut environment_session,
+    )
+    .await
+    {
+        Ok(endpoints) => endpoints,
         Err(error) => {
             if manages_environment {
                 console.environment_failed(&project.environment_name, &error);
@@ -108,16 +129,20 @@ pub async fn run(command: TestCommand) -> Result<()> {
             return Err(error);
         }
     };
-    if manages_environment {
-        console.environment_starting(&project.environment_name, &project.environment);
-    }
     let mut mock_servers: Vec<mock::MockServerHandle> = Vec::new();
     let execution_result = match environment_session.prepare().await {
         Ok(()) => {
             if manages_environment {
                 console.environment_ready(&project.environment_name);
             }
-            match build_slot_execution_contexts(&environment_session, should_start_mock, &console).await {
+            match build_slot_execution_contexts(
+                &environment_session,
+                should_start_mock,
+                &console,
+                reserved_mock_endpoints,
+            )
+            .await
+            {
                 Ok((slot_contexts, servers)) => {
                     mock_servers = servers;
                     if let Some(jobs) = parallel_jobs {
@@ -231,8 +256,28 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
         && !project.mock_routes.is_empty();
     let manages_environment = manages_environment(&project.environment);
 
-    let mut environment_session = match EnvironmentSession::new(&project, parallel_jobs.unwrap_or(1)) {
-        Ok(session) => session,
+    let mut environment_session =
+        match EnvironmentSession::new(&project, parallel_jobs.unwrap_or(1)) {
+            Ok(session) => session,
+            Err(error) => {
+                if manages_environment {
+                    console.environment_failed(&project.environment_name, &error);
+                }
+                return Err(error);
+            }
+        };
+    if manages_environment {
+        console.environment_starting(&project.environment_name, &project.environment);
+    }
+    let reserved_mock_endpoints = match prepare_slot_mock_endpoints(
+        &project,
+        should_start_mock,
+        parallel_jobs.unwrap_or(1),
+        &mut environment_session,
+    )
+    .await
+    {
+        Ok(endpoints) => endpoints,
         Err(error) => {
             if manages_environment {
                 console.environment_failed(&project.environment_name, &error);
@@ -240,16 +285,20 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
             return Err(error);
         }
     };
-    if manages_environment {
-        console.environment_starting(&project.environment_name, &project.environment);
-    }
     let mut mock_servers: Vec<mock::MockServerHandle> = Vec::new();
     let execution_result = match environment_session.prepare().await {
         Ok(()) => {
             if manages_environment {
                 console.environment_ready(&project.environment_name);
             }
-            match build_slot_execution_contexts(&environment_session, should_start_mock, &console).await {
+            match build_slot_execution_contexts(
+                &environment_session,
+                should_start_mock,
+                &console,
+                reserved_mock_endpoints,
+            )
+            .await
+            {
                 Ok((slot_contexts, servers)) => {
                     mock_servers = servers;
                     if workflows.len() == 1 && parallel_jobs.is_none() {
@@ -263,7 +312,9 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
                             slot_context.callback_runtime,
                             None,
                         );
-                        runner.execute_workflow(&workflows[0].id, &workflows[0], options).await
+                        runner
+                            .execute_workflow(&workflows[0].id, &workflows[0], options)
+                            .await
                     } else if let Some(jobs) = parallel_jobs {
                         let report = execute_workflows_parallel(
                             slot_contexts,
@@ -280,7 +331,8 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
                             .next()
                             .context("no execution slot was prepared")?;
                         let report =
-                            execute_workflows_serial(slot_context, &workflows, options, &console).await?;
+                            execute_workflows_serial(slot_context, &workflows, options, &console)
+                                .await?;
                         Err(anyhow::anyhow!(WorkflowBatchError(report)))
                     }
                 }
@@ -303,7 +355,9 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
         .map(|error| error.0);
     let execution_succeeded = match (&execution_result, &batch_report) {
         (Ok(report), _) => report.status == "passed" && report.callback_summary.failed == 0,
-        (_, Some(report)) => report.summary.failed_workflows == 0 && report.callback_summary.failed == 0,
+        (_, Some(report)) => {
+            report.summary.failed_workflows == 0 && report.callback_summary.failed == 0
+        }
         _ => false,
     };
     let environment_artifacts = environment_session.finish(execution_succeeded).await;
@@ -601,12 +655,18 @@ impl SummaryConsole {
         }
         println!(
             "{}",
-            self.styler
-                .phase(format!("==> Running workflow `{workflow_id}` in env `{env_name}`"))
+            self.styler.phase(format!(
+                "==> Running workflow `{workflow_id}` in env `{env_name}`"
+            ))
         );
     }
 
-    fn workflows_started(&self, workflow_count: usize, env_name: &str, parallel_jobs: Option<usize>) {
+    fn workflows_started(
+        &self,
+        workflow_count: usize,
+        env_name: &str,
+        parallel_jobs: Option<usize>,
+    ) {
         if !self.enabled {
             return;
         }
@@ -644,8 +704,9 @@ impl SummaryConsole {
         }
         println!(
             "{}",
-            self.styler
-                .phase(format!("==> {slot_count} embedded mock server slot(s) ready"))
+            self.styler.phase(format!(
+                "==> {slot_count} embedded mock server slot(s) ready"
+            ))
         );
     }
 
@@ -744,7 +805,8 @@ impl SummaryConsole {
             self.styler.status(&report.status),
             report.workflow_id,
             slot_suffix,
-            self.styler.muted(format_duration(report.summary.duration_ms))
+            self.styler
+                .muted(format_duration(report.summary.duration_ms))
         );
         if let Some(error) = &report.error {
             println!("    {error}");
@@ -785,6 +847,11 @@ struct SlotExecutionContext {
     slot_id: usize,
     project: LoadedProject,
     callback_runtime: CallbackRuntime,
+}
+
+struct SlotReservedMockEndpoint {
+    slot_id: usize,
+    endpoint: mock::ReservedMockEndpoint,
 }
 
 #[derive(Clone)]
@@ -1029,7 +1096,10 @@ impl Runner {
         let failed_steps = step_reports.iter().filter(|report| !report.passed).count();
         let mut error_parts = Vec::new();
         if failed_steps > 0 {
-            error_parts.push(format!("{failed_steps} of {} step(s) failed", step_reports.len()));
+            error_parts.push(format!(
+                "{failed_steps} of {} step(s) failed",
+                step_reports.len()
+            ));
         }
         if callback_summary.failed > 0 {
             error_parts.push(format!(
@@ -1140,10 +1210,8 @@ impl Runner {
                         }
 
                         *executed_run_case_steps += 1;
-                        self.console.workflow_step_finished(
-                            *executed_run_case_steps,
-                            &outcome.step_report,
-                        );
+                        self.console
+                            .workflow_step_finished(*executed_run_case_steps, &outcome.step_report);
                         step_reports.push(outcome.step_report);
                     }
                     WorkflowStep::Conditional(cond) => {
@@ -1904,7 +1972,10 @@ fn resolve_parallel_jobs(
     Ok(Some(jobs.min(unit_count)))
 }
 
-fn select_workflows(project: &LoadedProject, args: &TestWorkflowArgs) -> Result<Vec<LoadedWorkflow>> {
+fn select_workflows(
+    project: &LoadedProject,
+    args: &TestWorkflowArgs,
+) -> Result<Vec<LoadedWorkflow>> {
     if args.all {
         let workflows = project.workflows.values().cloned().collect::<Vec<_>>();
         if workflows.is_empty() {
@@ -1944,11 +2015,16 @@ async fn build_slot_execution_contexts(
     session: &EnvironmentSession,
     should_start_mock: bool,
     console: &SummaryConsole,
+    reserved_mock_endpoints: Vec<SlotReservedMockEndpoint>,
 ) -> Result<(Vec<SlotExecutionContext>, Vec<mock::MockServerHandle>)> {
     let slot_ids = if session.slots().is_empty() {
         vec![0]
     } else {
-        session.slots().iter().map(|slot| slot.slot_id).collect::<Vec<_>>()
+        session
+            .slots()
+            .iter()
+            .map(|slot| slot.slot_id)
+            .collect::<Vec<_>>()
     };
 
     let mut contexts = Vec::new();
@@ -1960,6 +2036,11 @@ async fn build_slot_execution_contexts(
     }
 
     let multi_slot_mock = should_start_mock && slot_ids.len() > 1;
+    let using_reserved_mock_endpoints = !reserved_mock_endpoints.is_empty();
+    let mut reserved_mock_endpoints = reserved_mock_endpoints
+        .into_iter()
+        .map(|reservation| (reservation.slot_id, reservation.endpoint))
+        .collect::<HashMap<_, _>>();
 
     for slot_id in slot_ids {
         let base_project = match session.project_for_slot(slot_id) {
@@ -1975,17 +2056,38 @@ async fn build_slot_execution_contexts(
         let mut execution_project = base_project.clone();
 
         if should_start_mock {
+            let reserved_endpoint = reserved_mock_endpoints.remove(&slot_id);
+            if using_reserved_mock_endpoints && reserved_endpoint.is_none() {
+                for server in mock_servers.drain(..) {
+                    server.shutdown().await;
+                }
+                return Err(anyhow!(
+                    "no reserved mock endpoint found for slot `{slot_id}`"
+                ));
+            }
+
             let mut mock_project = base_project.clone();
-            if multi_slot_mock {
+            if let Some(endpoint) = reserved_endpoint.as_ref() {
+                mock_project.project.mock.port = endpoint.port;
+            } else if multi_slot_mock {
                 mock_project.project.mock.port = 0;
             }
-            let handle = match mock::start(
-                &mock_project,
-                RequestPreparationContext::from_project(&mock_project),
-                callback_runtime.clone(),
-            )
-            .await
-            {
+            let handle = match if let Some(endpoint) = reserved_endpoint {
+                mock::start_reserved(
+                    &mock_project,
+                    RequestPreparationContext::from_project(&mock_project),
+                    callback_runtime.clone(),
+                    endpoint,
+                )
+                .await
+            } else {
+                mock::start(
+                    &mock_project,
+                    RequestPreparationContext::from_project(&mock_project),
+                    callback_runtime.clone(),
+                )
+                .await
+            } {
                 Ok(handle) => handle,
                 Err(error) => {
                     for server in mock_servers.drain(..) {
@@ -2019,6 +2121,68 @@ async fn build_slot_execution_contexts(
     Ok((contexts, mock_servers))
 }
 
+async fn prepare_slot_mock_endpoints(
+    project: &LoadedProject,
+    should_start_mock: bool,
+    slot_count: usize,
+    session: &mut EnvironmentSession,
+) -> Result<Vec<SlotReservedMockEndpoint>> {
+    let endpoints = reserve_slot_mock_endpoints(project, should_start_mock, slot_count).await?;
+    if endpoints.is_empty() {
+        return Ok(endpoints);
+    }
+
+    session.set_slot_mock_base_urls(
+        project.project.mock.port,
+        container_slot_mock_base_urls(&endpoints)?,
+    )?;
+    Ok(endpoints)
+}
+
+async fn reserve_slot_mock_endpoints(
+    project: &LoadedProject,
+    should_start_mock: bool,
+    slot_count: usize,
+) -> Result<Vec<SlotReservedMockEndpoint>> {
+    let uses_containers_runtime = matches!(
+        project
+            .environment
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.kind),
+        Some(EnvironmentRuntimeKind::Containers)
+    );
+    if !should_start_mock || !uses_containers_runtime {
+        return Ok(Vec::new());
+    }
+
+    let mut endpoints = Vec::new();
+    for slot_id in 0..slot_count {
+        let port = if slot_count > 1 {
+            0
+        } else {
+            project.project.mock.port
+        };
+        let endpoint = mock::reserve_endpoint(&project.project.mock.host, port).await?;
+        endpoints.push(SlotReservedMockEndpoint { slot_id, endpoint });
+    }
+    Ok(endpoints)
+}
+
+fn container_slot_mock_base_urls(
+    reserved_mock_endpoints: &[SlotReservedMockEndpoint],
+) -> Result<HashMap<usize, String>> {
+    reserved_mock_endpoints
+        .iter()
+        .map(|endpoint| {
+            Ok((
+                endpoint.slot_id,
+                container_visible_mock_base_url(&endpoint.endpoint.base_url)?,
+            ))
+        })
+        .collect()
+}
+
 fn apply_mock_base_url(project: &mut LoadedProject, handle: &mock::MockServerHandle) -> Result<()> {
     let local_base_url = handle.base_url.clone();
     project.environment.variables.insert(
@@ -2036,7 +2200,8 @@ fn apply_mock_base_url(project: &mut LoadedProject, handle: &mock::MockServerHan
 }
 
 fn container_visible_mock_base_url(base_url: &str) -> Result<String> {
-    let url = Url::parse(base_url).with_context(|| format!("invalid mock base URL `{base_url}`"))?;
+    let url =
+        Url::parse(base_url).with_context(|| format!("invalid mock base URL `{base_url}`"))?;
     let port = url
         .port()
         .with_context(|| format!("mock base URL `{base_url}` does not contain a port"))?;
@@ -2044,65 +2209,27 @@ fn container_visible_mock_base_url(base_url: &str) -> Result<String> {
 }
 
 fn rewrite_mock_urls(project: &mut LoadedProject, original_port: u16, replacement_base_url: &str) {
-    rewrite_mock_url_in_place(&mut project.environment.base_url, original_port, replacement_base_url);
+    rewrite_url_base_in_place(
+        &mut project.environment.base_url,
+        original_port,
+        replacement_base_url,
+    );
     for value in project.environment.variables.values_mut() {
-        rewrite_mock_value(value, original_port, replacement_base_url);
+        rewrite_value_url_bases(value, original_port, replacement_base_url);
     }
     for api in project.apis.values_mut() {
         if let Some(base_url) = api.definition.base_url.as_mut() {
-            rewrite_mock_url_in_place(base_url, original_port, replacement_base_url);
+            rewrite_url_base_in_place(base_url, original_port, replacement_base_url);
         }
     }
-}
-
-fn rewrite_mock_value(value: &mut Value, original_port: u16, replacement_base_url: &str) {
-    match value {
-        Value::String(text) => rewrite_mock_url_in_place(text, original_port, replacement_base_url),
-        Value::Array(items) => {
-            for item in items {
-                rewrite_mock_value(item, original_port, replacement_base_url);
+    if let Some(runtime) = project.environment.runtime.as_mut()
+        && runtime.kind == EnvironmentRuntimeKind::Containers
+    {
+        for service in &mut runtime.services {
+            for value in service.environment.values_mut() {
+                rewrite_url_base_in_place(value, original_port, replacement_base_url);
             }
         }
-        Value::Object(object) => {
-            for item in object.values_mut() {
-                rewrite_mock_value(item, original_port, replacement_base_url);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn rewrite_mock_url_in_place(text: &mut String, original_port: u16, replacement_base_url: &str) {
-    let Ok(mut url) = Url::parse(text) else {
-        return;
-    };
-    let Some(host) = url.host_str() else {
-        return;
-    };
-    if !matches!(
-        host,
-        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "host.docker.internal"
-    ) {
-        return;
-    }
-    if url.port() != Some(original_port) {
-        return;
-    }
-    let Ok(replacement) = Url::parse(replacement_base_url) else {
-        return;
-    };
-    let _ = url.set_scheme(replacement.scheme());
-    let _ = url.set_host(replacement.host_str());
-    let _ = url.set_port(replacement.port());
-    *text = render_url_without_root_slash(&url);
-}
-
-fn render_url_without_root_slash(url: &Url) -> String {
-    let rendered = url.to_string();
-    if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
-        rendered.trim_end_matches('/').to_string()
-    } else {
-        rendered
     }
 }
 
@@ -2223,7 +2350,9 @@ async fn spawn_case_task(
             slot.callback_runtime,
             Some(slot.slot_id),
         );
-        let run_report = runner.execute(std::slice::from_ref(&case), &options, &target).await?;
+        let run_report = runner
+            .execute(std::slice::from_ref(&case), &options, &target)
+            .await?;
         let case_report = run_report
             .cases
             .into_iter()
@@ -2258,7 +2387,9 @@ async fn execute_workflows_serial(
             slot_context.callback_runtime.clone(),
             None,
         );
-        let report = runner.execute_workflow(&workflow.id, workflow, options).await?;
+        let report = runner
+            .execute_workflow(&workflow.id, workflow, options)
+            .await?;
         console.workflow_finished(index + 1, workflows.len(), &report);
         if report.status == "failed" {
             failed += 1;
@@ -2868,7 +2999,9 @@ fn print_workflow_batch_report(
 }
 
 fn manages_environment(environment: &EnvironmentConfig) -> bool {
-    environment.runtime.is_some() || !environment.readiness.is_empty() || !environment.logs.is_empty()
+    environment.runtime.is_some()
+        || !environment.readiness.is_empty()
+        || !environment.logs.is_empty()
 }
 
 fn count_run_case_steps(steps: &[WorkflowStep]) -> usize {
@@ -2890,7 +3023,10 @@ fn print_summary_header(styler: &TerminalStyler) {
 
 fn print_summary_metadata(styler: &TerminalStyler, report_path: &Path, duration_ms: u128) {
     println!("  Duration: {}", styler.muted(format_duration(duration_ms)));
-    println!("  Report: {}", styler.muted(report_path.display().to_string()));
+    println!(
+        "  Report: {}",
+        styler.muted(report_path.display().to_string())
+    );
 }
 
 fn print_environment_summary(
@@ -3060,6 +3196,10 @@ where
 mod tests {
     use super::*;
     use crate::cli::{EnvTemplate, InitArgs};
+    use crate::config::{
+        ContainerServiceConfig, EnvironmentRuntimeCleanupPolicy, EnvironmentRuntimeConfig,
+        MockServerConfig, ProjectConfig, ProjectDefaults, ProjectMetadata,
+    };
     use crate::init;
     use tempfile::tempdir;
 
@@ -3192,7 +3332,10 @@ steps:
         .expect("select workflows");
 
         assert!(workflows.len() >= 2);
-        let workflow_ids = workflows.iter().map(|workflow| workflow.id.as_str()).collect::<Vec<_>>();
+        let workflow_ids = workflows
+            .iter()
+            .map(|workflow| workflow.id.as_str())
+            .collect::<Vec<_>>();
         assert!(workflow_ids.contains(&"login-flow"));
         assert!(workflow_ids.contains(&"smoke-flow"));
     }
@@ -3209,5 +3352,85 @@ steps:
         let styler = TerminalStyler { enabled: true };
         assert_eq!(styler.failure("FAIL"), "\u{1b}[1;31mFAIL\u{1b}[0m");
         assert_eq!(styler.muted("12ms"), "\u{1b}[2m12ms\u{1b}[0m");
+    }
+
+    fn test_project_with_container_service_env(
+        service_env: IndexMap<String, String>,
+    ) -> LoadedProject {
+        LoadedProject {
+            root: PathBuf::from("/tmp/project"),
+            runner_root: PathBuf::from("/tmp/project/.testrunner"),
+            project: ProjectConfig {
+                version: 1,
+                project: ProjectMetadata {
+                    name: "sample".to_string(),
+                },
+                defaults: ProjectDefaults::default(),
+                mock: MockServerConfig {
+                    enabled: true,
+                    host: "127.0.0.1".to_string(),
+                    port: 18081,
+                },
+            },
+            environment_name: "containers".to_string(),
+            environment: EnvironmentConfig {
+                name: Some("containers".to_string()),
+                base_url: "http://127.0.0.1:18080".to_string(),
+                headers: Default::default(),
+                variables: Default::default(),
+                runtime: Some(EnvironmentRuntimeConfig {
+                    kind: EnvironmentRuntimeKind::Containers,
+                    project_directory: ".".to_string(),
+                    files: Vec::new(),
+                    project_name: None,
+                    up: Vec::new(),
+                    down: Vec::new(),
+                    cleanup: EnvironmentRuntimeCleanupPolicy::Always,
+                    services: vec![ContainerServiceConfig {
+                        name: "app".to_string(),
+                        image: "sample/app:latest".to_string(),
+                        build: None,
+                        ports: vec!["18080:3000".to_string()],
+                        environment: service_env,
+                        command: Vec::new(),
+                        volumes: Vec::new(),
+                        extra_hosts: Vec::new(),
+                        wait_for: None,
+                    }],
+                    network_name: None,
+                    parallel: None,
+                }),
+                readiness: Vec::new(),
+                logs: Vec::new(),
+            },
+            datasources: Default::default(),
+            apis: Default::default(),
+            cases: Vec::new(),
+            workflows: Default::default(),
+            mock_routes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rewrite_mock_urls_updates_runtime_service_env_values() {
+        let mut project = test_project_with_container_service_env(IndexMap::from([(
+            "SMS_PROVIDER_BASE_URL".to_string(),
+            "http://host.docker.internal:18081".to_string(),
+        )]));
+
+        rewrite_mock_urls(&mut project, 18081, "http://host.docker.internal:29001");
+
+        let runtime = project
+            .environment
+            .runtime
+            .as_ref()
+            .expect("runtime should exist");
+        assert_eq!(
+            runtime.services[0]
+                .environment
+                .get("SMS_PROVIDER_BASE_URL")
+                .expect("service env"),
+            "http://host.docker.internal:29001"
+        );
     }
 }

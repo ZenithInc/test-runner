@@ -1,15 +1,17 @@
 use anyhow::{Context, Result, bail};
 use bollard::Docker;
 use bollard::container::{
-    Config as ContainerConfig, CreateContainerOptions, LogOutput, LogsOptions,
-    RemoveContainerOptions, StartContainerOptions, InspectContainerOptions,
+    Config as ContainerConfig, CreateContainerOptions, InspectContainerOptions, LogOutput,
+    LogsOptions, RemoveContainerOptions, StartContainerOptions,
 };
+use bollard::errors::Error as BollardError;
 use bollard::image::CreateImageOptions;
 use bollard::network::{CreateNetworkOptions, InspectNetworkOptions};
 use chrono::Utc;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use futures_util::StreamExt;
+use indexmap::IndexMap;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -26,6 +28,9 @@ use crate::config::{
     environment_context_value,
 };
 use crate::runtime::{RuntimeContext, value_to_string};
+use crate::url_rewrite::{
+    is_rewritable_host, render_url_without_root_slash, rewrite_url_base_in_place,
+};
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct EnvironmentArtifactsReport {
@@ -149,6 +154,7 @@ struct ResolvedContainersRuntime {
     cleanup: EnvironmentRuntimeCleanupPolicy,
     slot_count: usize,
     slots: Vec<ResolvedContainerSlot>,
+    slot_mock_rewrite: Option<SlotMockRewrite>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +163,12 @@ struct ResolvedContainerSlot {
     network_name: String,
     container_ids: Vec<(String, String)>,
     port_mappings: HashMap<String, HashMap<u16, u16>>,
+}
+
+#[derive(Debug, Clone)]
+struct SlotMockRewrite {
+    original_port: u16,
+    base_urls: HashMap<usize, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +224,13 @@ impl EnvironmentSession {
             .runtime
             .as_ref()
             .map(|runtime_config| {
-                resolve_runtime(project, runtime_config, &render_context, &run_id, requested_slots)
+                resolve_runtime(
+                    project,
+                    runtime_config,
+                    &render_context,
+                    &run_id,
+                    requested_slots,
+                )
             })
             .transpose()?;
         let report = runtime.as_ref().map(|resolved| match resolved {
@@ -287,6 +305,40 @@ impl EnvironmentSession {
 
     pub fn slots(&self) -> &[EnvironmentSlot] {
         &self.slots
+    }
+
+    pub fn set_slot_mock_base_urls(
+        &mut self,
+        original_port: u16,
+        base_urls: HashMap<usize, String>,
+    ) -> Result<()> {
+        if base_urls.is_empty() {
+            return Ok(());
+        }
+
+        let Some(ResolvedRuntime::Containers(runtime)) = self.runtime.as_mut() else {
+            return Ok(());
+        };
+
+        if base_urls.len() != runtime.slot_count {
+            bail!(
+                "expected {} slot mock base URL(s), got {}",
+                runtime.slot_count,
+                base_urls.len()
+            );
+        }
+
+        for slot_id in 0..runtime.slot_count {
+            if !base_urls.contains_key(&slot_id) {
+                bail!("missing slot mock base URL for slot `{slot_id}`");
+            }
+        }
+
+        runtime.slot_mock_rewrite = Some(SlotMockRewrite {
+            original_port,
+            base_urls,
+        });
+        Ok(())
     }
 
     pub fn project_for_slot(&self, slot_id: usize) -> Result<LoadedProject> {
@@ -483,26 +535,37 @@ impl EnvironmentSession {
                 let artifact = match (&spec, &runtime) {
                     (
                         ResolvedLogSpec::ComposeService {
-                            service,
-                            stream,
-                            ..
+                            service, stream, ..
                         },
                         ResolvedRuntime::DockerCompose(dc),
                     ) => {
-                        collect_compose_service_logs(&self.runner_root, dc, service, *stream, &output)
-                            .await
+                        collect_compose_service_logs(
+                            &self.runner_root,
+                            dc,
+                            service,
+                            *stream,
+                            &output,
+                        )
+                        .await
                     }
                     (
                         ResolvedLogSpec::ContainerFile { service, path, .. },
                         ResolvedRuntime::DockerCompose(dc),
-                    ) => collect_container_file(&self.runner_root, dc, service, path, &output).await,
+                    ) => {
+                        collect_container_file(&self.runner_root, dc, service, path, &output).await
+                    }
                     (
                         ResolvedLogSpec::ComposeService { service, .. },
                         ResolvedRuntime::Containers(ct),
                     ) => match ct.slots.iter().find(|slot| slot.slot_id == slot_id) {
                         Some(slot) => {
-                            collect_container_logs_bollard(&self.runner_root, slot, service, &output)
-                                .await
+                            collect_container_logs_bollard(
+                                &self.runner_root,
+                                slot,
+                                service,
+                                &output,
+                            )
+                            .await
                         }
                         None => EnvironmentLogArtifactReport {
                             kind: "containers".to_string(),
@@ -521,8 +584,14 @@ impl EnvironmentSession {
                         ResolvedRuntime::Containers(ct),
                     ) => match ct.slots.iter().find(|slot| slot.slot_id == slot_id) {
                         Some(slot) => {
-                            collect_container_file_bollard(&self.runner_root, slot, service, path, &output)
-                                .await
+                            collect_container_file_bollard(
+                                &self.runner_root,
+                                slot,
+                                service,
+                                path,
+                                &output,
+                            )
+                            .await
                         }
                         None => EnvironmentLogArtifactReport {
                             kind: "container_file".to_string(),
@@ -709,8 +778,7 @@ fn resolve_docker_compose_runtime(
         .unwrap_or_else(|| {
             sanitize_project_name(&format!(
                 "test-runner-{}-{}",
-                project.project.project.name,
-                run_id
+                project.project.project.name, run_id
             ))
         });
     let project_name = if project_name.is_empty() {
@@ -750,8 +818,7 @@ fn resolve_containers_runtime(
         .unwrap_or_else(|| {
             sanitize_project_name(&format!(
                 "test-runner-{}-{}",
-                project.project.project.name,
-                run_id
+                project.project.project.name, run_id
             ))
         });
 
@@ -761,6 +828,7 @@ fn resolve_containers_runtime(
         cleanup: runtime.cleanup,
         slot_count: requested_slots.max(1),
         slots: Vec::new(),
+        slot_mock_rewrite: None,
     })
 }
 
@@ -794,7 +862,10 @@ fn resolve_readiness(
     })
 }
 
-fn resolve_log_spec(log: &EnvironmentLogSource, context: &RuntimeContext) -> Result<ResolvedLogSpec> {
+fn resolve_log_spec(
+    log: &EnvironmentLogSource,
+    context: &RuntimeContext,
+) -> Result<ResolvedLogSpec> {
     Ok(match log {
         EnvironmentLogSource::ComposeService {
             service,
@@ -902,6 +973,15 @@ fn apply_slot_endpoint_overrides(
             }
         }
     }
+    if let Some(runtime_config) = project.environment.runtime.as_mut()
+        && runtime_config.kind == EnvironmentRuntimeKind::Containers
+    {
+        for service in &mut runtime_config.services {
+            for value in service.environment.values_mut() {
+                rewrite_local_url_in_place(value, &rewrite_rules, slot);
+            }
+        }
+    }
 }
 
 fn configured_port_rewrite_rules(
@@ -972,19 +1052,13 @@ fn rewrite_local_url_in_place(
     }
 }
 
-fn is_rewritable_host(host: &str) -> bool {
-    matches!(
-        host,
-        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "host.docker.internal"
-    )
-}
-
-fn render_url_without_root_slash(url: &Url) -> String {
-    let rendered = url.to_string();
-    if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
-        rendered.trim_end_matches('/').to_string()
-    } else {
-        rendered
+fn rewrite_service_environment_mock_urls(
+    environment: &mut IndexMap<String, String>,
+    original_port: u16,
+    replacement_base_url: &str,
+) {
+    for value in environment.values_mut() {
+        rewrite_url_base_in_place(value, original_port, replacement_base_url);
     }
 }
 
@@ -1175,7 +1249,10 @@ async fn collect_compose_service_logs(
                     output: output.to_string(),
                     status: "failed".to_string(),
                     size_bytes: Some(size_bytes),
-                    error: Some(format_command_failure("docker compose logs", &command_output)),
+                    error: Some(format_command_failure(
+                        "docker compose logs",
+                        &command_output,
+                    )),
                 },
                 (false, Err(error)) => EnvironmentLogArtifactReport {
                     kind: "compose_service".to_string(),
@@ -1328,8 +1405,12 @@ async fn collect_container_file(
     }
 }
 
-async fn compose_container_id(runtime: &ResolvedDockerComposeRuntime, service: &str) -> Result<String> {
-    let output = run_compose_command(runtime, "ps", &["-q".to_string(), service.to_string()]).await?;
+async fn compose_container_id(
+    runtime: &ResolvedDockerComposeRuntime,
+    service: &str,
+) -> Result<String> {
+    let output =
+        run_compose_command(runtime, "ps", &["-q".to_string(), service.to_string()]).await?;
     if !output.success() {
         bail!(format_command_failure("docker compose ps", &output));
     }
@@ -1345,7 +1426,11 @@ async fn run_compose_command(
     subcommand: &str,
     extra_args: &[String],
 ) -> Result<CommandCapture> {
-    let mut args = vec!["compose".to_string(), "-p".to_string(), runtime.project_name.clone()];
+    let mut args = vec![
+        "compose".to_string(),
+        "-p".to_string(),
+        runtime.project_name.clone(),
+    ];
     for file in &runtime.files {
         args.push("-f".to_string());
         args.push(file.display().to_string());
@@ -1391,14 +1476,17 @@ fn parse_port_mapping(spec: &str) -> Result<(u16, Option<u16>)> {
     let parts: Vec<&str> = spec.split(':').collect();
     match parts.len() {
         1 => {
-            let container_port = parts[0].parse::<u16>()
+            let container_port = parts[0]
+                .parse::<u16>()
                 .with_context(|| format!("invalid port `{spec}`"))?;
             Ok((container_port, None))
         }
         2 => {
-            let host_port = parts[0].parse::<u16>()
+            let host_port = parts[0]
+                .parse::<u16>()
                 .with_context(|| format!("invalid host port in `{spec}`"))?;
-            let container_port = parts[1].parse::<u16>()
+            let container_port = parts[1]
+                .parse::<u16>()
                 .with_context(|| format!("invalid container port in `{spec}`"))?;
             Ok((container_port, Some(host_port)))
         }
@@ -1422,19 +1510,28 @@ async fn resolve_service_image(
         build_container_image(docker, build_config, &image_tag, runner_root).await?;
         Ok(image_tag)
     } else {
-        // Pull pre-built image
-        let mut pull_stream = docker.create_image(
-            Some(CreateImageOptions {
-                from_image: service.image.as_str(),
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-        while let Some(result) = pull_stream.next().await {
-            result.with_context(|| format!("failed to pull image `{}`", service.image))?;
+        match docker.inspect_image(&service.image).await {
+            Ok(_) => Ok(service.image.clone()),
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                let mut pull_stream = docker.create_image(
+                    Some(CreateImageOptions {
+                        from_image: service.image.as_str(),
+                        ..Default::default()
+                    }),
+                    None,
+                    None,
+                );
+                while let Some(result) = pull_stream.next().await {
+                    result.with_context(|| format!("failed to pull image `{}`", service.image))?;
+                }
+                Ok(service.image.clone())
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to inspect image `{}`", service.image))
+            }
         }
-        Ok(service.image.clone())
     }
 }
 
@@ -1456,8 +1553,12 @@ async fn build_container_image(
     }
 
     // Create a tar archive of the build context
-    let tar_bytes = create_build_context_tar(&context_path)
-        .with_context(|| format!("failed to create tar for build context `{}`", context_path.display()))?;
+    let tar_bytes = create_build_context_tar(&context_path).with_context(|| {
+        format!(
+            "failed to create tar for build context `{}`",
+            context_path.display()
+        )
+    })?;
 
     let mut build_opts = bollard::image::BuildImageOptions {
         t: tag.to_string(),
@@ -1468,11 +1569,7 @@ async fn build_container_image(
         build_opts.dockerfile = dockerfile.clone();
     }
 
-    let mut build_stream = docker.build_image(
-        build_opts,
-        None,
-        Some(tar_bytes.into()),
-    );
+    let mut build_stream = docker.build_image(build_opts, None, Some(tar_bytes.into()));
 
     while let Some(result) = build_stream.next().await {
         let info = result.with_context(|| format!("failed to build image `{tag}`"))?;
@@ -1495,7 +1592,8 @@ fn create_build_context_tar(context_path: &Path) -> Result<Vec<u8>> {
     let enc = archive
         .into_inner()
         .with_context(|| "failed to finalize build context tar")?;
-    enc.finish().with_context(|| "failed to compress build context tar")
+    enc.finish()
+        .with_context(|| "failed to compress build context tar")
 }
 
 /// Start all containers for the containers runtime.
@@ -1507,7 +1605,14 @@ async fn start_containers(
     let mut slots = Vec::new();
 
     for slot_id in 0..runtime.slot_count {
-        let network_name = slot_network_name(&runtime.network_name_prefix, slot_id, runtime.slot_count);
+        let network_name =
+            slot_network_name(&runtime.network_name_prefix, slot_id, runtime.slot_count);
+        let slot_mock_rewrite = runtime.slot_mock_rewrite.as_ref().and_then(|rewrite| {
+            rewrite
+                .base_urls
+                .get(&slot_id)
+                .map(|base_url| (rewrite.original_port, base_url.clone()))
+        });
         let network_exists = docker
             .inspect_network(&network_name, None::<InspectNetworkOptions<String>>)
             .await
@@ -1550,8 +1655,16 @@ async fn start_containers(
                 );
             }
 
-            let env_vars: Vec<String> = service
-                .environment
+            let mut service_environment = service.environment.clone();
+            if let Some((original_port, replacement_base_url)) = &slot_mock_rewrite {
+                rewrite_service_environment_mock_urls(
+                    &mut service_environment,
+                    *original_port,
+                    replacement_base_url,
+                );
+            }
+
+            let env_vars: Vec<String> = service_environment
                 .iter()
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect();
@@ -1677,9 +1790,7 @@ async fn wait_for_container(
         ContainerWaitFor::LogMessage {
             pattern,
             timeout_ms,
-        } => {
-            wait_for_log_message(docker, container_id, service_name, pattern, *timeout_ms).await
-        }
+        } => wait_for_log_message(docker, container_id, service_name, pattern, *timeout_ms).await,
         ContainerWaitFor::Tcp {
             port,
             timeout_ms,
@@ -1698,12 +1809,23 @@ async fn wait_for_container(
         } => {
             let host_port = resolve_host_port(docker, container_id, *port).await?;
             let url = format!("http://127.0.0.1:{host_port}{path}");
-            wait_for_http(service_name, &url, *expect_status, *timeout_ms, *interval_ms).await
+            wait_for_http(
+                service_name,
+                &url,
+                *expect_status,
+                *timeout_ms,
+                *interval_ms,
+            )
+            .await
         }
     }
 }
 
-async fn resolve_host_port(docker: &Docker, container_id: &str, container_port: u16) -> Result<u16> {
+async fn resolve_host_port(
+    docker: &Docker,
+    container_id: &str,
+    container_port: u16,
+) -> Result<u16> {
     let inspect = docker
         .inspect_container(container_id, None::<InspectContainerOptions>)
         .await
@@ -1719,7 +1841,9 @@ async fn resolve_host_port(docker: &Docker, container_id: &str, container_port: 
         .and_then(|bindings| bindings.first())
         .and_then(|binding| binding.host_port.as_ref())
         .and_then(|p| p.parse::<u16>().ok())
-        .with_context(|| format!("no host port mapping found for container port {container_port}"))?;
+        .with_context(|| {
+            format!("no host port mapping found for container port {container_port}")
+        })?;
 
     Ok(port)
 }
@@ -1769,14 +1893,10 @@ async fn wait_for_log_message(
                 }
             }
             Ok(Some(Err(error))) => {
-                bail!(
-                    "error reading logs from container `{service_name}`: {error}"
-                );
+                bail!("error reading logs from container `{service_name}`: {error}");
             }
             Ok(None) => {
-                bail!(
-                    "container `{service_name}` log stream ended before matching `{pattern}`"
-                );
+                bail!("container `{service_name}` log stream ended before matching `{pattern}`");
             }
             Err(_) => {
                 bail!(
@@ -2070,11 +2190,7 @@ async fn collect_container_file_bollard(
     let source = format!("{container_id}:{path}");
     match run_command(
         "docker",
-        &[
-            "cp".to_string(),
-            source,
-            output_path.display().to_string(),
-        ],
+        &["cp".to_string(), source, output_path.display().to_string()],
         None,
     )
     .await
@@ -2240,6 +2356,9 @@ fn stream_label(stream: ComposeLogStream) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{
+        EnvironmentRuntimeConfig, MockServerConfig, ProjectConfig, ProjectDefaults, ProjectMetadata,
+    };
 
     #[test]
     fn sanitize_project_name_normalizes_runtime_identifiers() {
@@ -2258,5 +2377,130 @@ mod tests {
         let error = resolve_report_output_path(&root, "../escape.log")
             .expect_err("parent traversal must fail");
         assert!(error.to_string().contains("cannot escape"));
+    }
+
+    fn test_project_with_container_runtime(service_env: IndexMap<String, String>) -> LoadedProject {
+        LoadedProject {
+            root: PathBuf::from("/tmp/project"),
+            runner_root: PathBuf::from("/tmp/project/.testrunner"),
+            project: ProjectConfig {
+                version: 1,
+                project: ProjectMetadata {
+                    name: "sample".to_string(),
+                },
+                defaults: ProjectDefaults::default(),
+                mock: MockServerConfig {
+                    enabled: true,
+                    host: "127.0.0.1".to_string(),
+                    port: 18081,
+                },
+            },
+            environment_name: "containers".to_string(),
+            environment: EnvironmentConfig {
+                name: Some("containers".to_string()),
+                base_url: "http://127.0.0.1:18080".to_string(),
+                headers: Default::default(),
+                variables: Default::default(),
+                runtime: Some(EnvironmentRuntimeConfig {
+                    kind: EnvironmentRuntimeKind::Containers,
+                    project_directory: ".".to_string(),
+                    files: Vec::new(),
+                    project_name: None,
+                    up: Vec::new(),
+                    down: Vec::new(),
+                    cleanup: EnvironmentRuntimeCleanupPolicy::Always,
+                    services: vec![ContainerServiceConfig {
+                        name: "app".to_string(),
+                        image: "sample/app:latest".to_string(),
+                        build: None,
+                        ports: vec!["18080:3000".to_string()],
+                        environment: service_env,
+                        command: Vec::new(),
+                        volumes: Vec::new(),
+                        extra_hosts: Vec::new(),
+                        wait_for: None,
+                    }],
+                    network_name: None,
+                    parallel: None,
+                }),
+                readiness: Vec::new(),
+                logs: Vec::new(),
+            },
+            datasources: Default::default(),
+            apis: Default::default(),
+            cases: Vec::new(),
+            workflows: Default::default(),
+            mock_routes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn apply_slot_endpoint_overrides_rewrites_runtime_service_env_urls() {
+        let mut project = test_project_with_container_runtime(IndexMap::from([(
+            "APP_BASE_URL".to_string(),
+            "http://127.0.0.1:18080".to_string(),
+        )]));
+        let runtime = ResolvedRuntime::Containers(ResolvedContainersRuntime {
+            services: project
+                .environment
+                .runtime
+                .as_ref()
+                .expect("runtime")
+                .services
+                .clone(),
+            network_name_prefix: "sample".to_string(),
+            cleanup: EnvironmentRuntimeCleanupPolicy::Always,
+            slot_count: 2,
+            slots: Vec::new(),
+            slot_mock_rewrite: None,
+        });
+        let slot = EnvironmentSlot {
+            slot_id: 1,
+            port_mappings: HashMap::from([("app".to_string(), HashMap::from([(3000, 28080)]))]),
+        };
+
+        apply_slot_endpoint_overrides(&mut project, &runtime, &slot);
+
+        let runtime = project
+            .environment
+            .runtime
+            .as_ref()
+            .expect("runtime should exist");
+        assert_eq!(
+            runtime.services[0]
+                .environment
+                .get("APP_BASE_URL")
+                .expect("service env"),
+            "http://127.0.0.1:28080"
+        );
+    }
+
+    #[test]
+    fn rewrite_service_environment_mock_urls_updates_local_targets_only() {
+        let mut service_env = IndexMap::from([
+            (
+                "SMS_PROVIDER_BASE_URL".to_string(),
+                "http://host.docker.internal:18081".to_string(),
+            ),
+            (
+                "EXTERNAL_PROVIDER_BASE_URL".to_string(),
+                "http://example.com:18081".to_string(),
+            ),
+        ]);
+
+        rewrite_service_environment_mock_urls(
+            &mut service_env,
+            18081,
+            "http://host.docker.internal:29001",
+        );
+
+        assert_eq!(
+            service_env.get("SMS_PROVIDER_BASE_URL"),
+            Some(&"http://host.docker.internal:29001".to_string())
+        );
+        assert_eq!(
+            service_env.get("EXTERNAL_PROVIDER_BASE_URL"),
+            Some(&"http://example.com:18081".to_string())
+        );
     }
 }

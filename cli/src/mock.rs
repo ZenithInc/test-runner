@@ -32,6 +32,13 @@ pub struct MockServerHandle {
     join_handle: JoinHandle<()>,
 }
 
+#[derive(Debug)]
+pub struct ReservedMockEndpoint {
+    pub base_url: String,
+    pub port: u16,
+    listener: TcpListener,
+}
+
 #[derive(Debug, Clone)]
 struct MockRoute {
     method: Method,
@@ -59,23 +66,8 @@ struct RenderedMockResponse {
     body: String,
 }
 
-pub async fn start(
-    project: &LoadedProject,
-    request_context: RequestPreparationContext,
-    callback_runtime: CallbackRuntime,
-) -> Result<MockServerHandle> {
-    let state = MockState {
-        routes: Arc::new(load_routes(project)?),
-        base_root: Arc::new(build_base_root(project)?),
-        runner_root: Arc::new(project.runner_root.clone()),
-        request_context,
-        callback_runtime,
-    };
-
-    let address = format!(
-        "{}:{}",
-        project.project.mock.host, project.project.mock.port
-    );
+pub async fn reserve_endpoint(host: &str, port: u16) -> Result<ReservedMockEndpoint> {
+    let address = format!("{host}:{port}");
     let socket_addr: SocketAddr = address.parse()?;
     let listener = TcpListener::bind(socket_addr)
         .await
@@ -87,6 +79,38 @@ pub async fn start(
         local_addr.ip().to_string()
     };
 
+    Ok(ReservedMockEndpoint {
+        base_url: format!("http://{advertised_host}:{}", local_addr.port()),
+        port: local_addr.port(),
+        listener,
+    })
+}
+
+pub async fn start(
+    project: &LoadedProject,
+    request_context: RequestPreparationContext,
+    callback_runtime: CallbackRuntime,
+) -> Result<MockServerHandle> {
+    let endpoint = reserve_endpoint(&project.project.mock.host, project.project.mock.port).await?;
+    start_reserved(project, request_context, callback_runtime, endpoint).await
+}
+
+pub async fn start_reserved(
+    project: &LoadedProject,
+    request_context: RequestPreparationContext,
+    callback_runtime: CallbackRuntime,
+    endpoint: ReservedMockEndpoint,
+) -> Result<MockServerHandle> {
+    let state = MockState {
+        routes: Arc::new(load_routes(project)?),
+        base_root: Arc::new(build_base_root(project)?),
+        runner_root: Arc::new(project.runner_root.clone()),
+        request_context,
+        callback_runtime,
+    };
+    let ReservedMockEndpoint {
+        base_url, listener, ..
+    } = endpoint;
     let app = Router::new()
         .fallback(any(handle_request))
         .with_state(state);
@@ -102,7 +126,7 @@ pub async fn start(
     });
 
     Ok(MockServerHandle {
-        base_url: format!("http://{advertised_host}:{}", local_addr.port()),
+        base_url,
         shutdown: Some(shutdown_tx),
         join_handle,
     })
@@ -629,7 +653,9 @@ mod tests {
         use std::sync::Mutex;
 
         let temp = tempdir().expect("tempdir");
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind callback target");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback target");
         let addr = listener.local_addr().expect("local addr");
         let received = Arc::new(Mutex::new(Vec::<Value>::new()));
         let state = received.clone();
@@ -644,7 +670,9 @@ mod tests {
                     }
                 }),
             );
-            axum::serve(listener, app).await.expect("serve callback target");
+            axum::serve(listener, app)
+                .await
+                .expect("serve callback target");
         });
 
         let callback_runtime = CallbackRuntime::new(reqwest::Client::new());
@@ -677,7 +705,10 @@ mod tests {
             path: "/payments/create".to_string(),
             priority: 0,
             when: Vec::new(),
-            extract: IndexMap::from([("order_no".to_string(), "request.json.order_no".to_string())]),
+            extract: IndexMap::from([(
+                "order_no".to_string(),
+                "request.json.order_no".to_string(),
+            )]),
             steps: vec![Step::Callback(CallbackStep {
                 after_ms: 10,
                 request: crate::dsl::RequestSpec {
