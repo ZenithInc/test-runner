@@ -282,7 +282,7 @@ sample-projects/.testrunner/reports/slot-<id>/
 在给团队推广之前，建议先明确这些边界：
 
 - 默认仍以串行为主；只有 `containers + parallel.slots + --parallel` 会启用 slot 并行调度。
-- `report-format=junit` 尚未实现。
+
 - `api.timeout_ms` 目前不会覆盖全局 HTTP 超时。
 - Redis `key_prefix` 只是配置字段，不会自动拼接到命令参数。
 - `hooks/setup` 和 `hooks/teardown` 只是预留目录，运行器还没有自动执行它们。

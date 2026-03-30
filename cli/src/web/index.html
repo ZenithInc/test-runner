@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>test-runner Web UI</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        --bg: #111827;
+        --panel: #1f2937;
+        --panel-muted: #111827;
+        --border: #374151;
+        --text: #f3f4f6;
+        --text-muted: #9ca3af;
+        --accent: #60a5fa;
+        --accent-strong: #2563eb;
+        --success: #34d399;
+        --warning: #fbbf24;
+        --danger: #f87171;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      .page {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 360px 1fr;
+        gap: 20px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px;
+      }
+
+      .stack {
+        display: grid;
+        gap: 12px;
+      }
+
+      .row {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      .row > label {
+        min-width: 96px;
+      }
+
+      input,
+      select,
+      button,
+      textarea {
+        background: var(--panel-muted);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px 12px;
+        font: inherit;
+      }
+
+      input,
+      select,
+      textarea {
+        width: 100%;
+      }
+
+      button {
+        cursor: pointer;
+      }
+
+      button.primary {
+        background: var(--accent-strong);
+        border-color: var(--accent-strong);
+      }
+
+      button.secondary {
+        background: transparent;
+      }
+
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+
+      .dir-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        display: grid;
+        gap: 8px;
+        max-height: 320px;
+        overflow: auto;
+      }
+
+      .dir-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 12px;
+        background: var(--panel-muted);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+      }
+
+      .dir-item code {
+        color: var(--text);
+        word-break: break-all;
+      }
+
+      .meta {
+        color: var(--text-muted);
+        font-size: 0.92rem;
+      }
+
+      .status {
+        padding: 10px 12px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: var(--panel-muted);
+      }
+
+      .status.error {
+        border-color: rgba(248, 113, 113, 0.5);
+        color: var(--danger);
+      }
+
+      .status.success {
+        border-color: rgba(52, 211, 153, 0.5);
+        color: var(--success);
+      }
+
+      .grid-2 {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .grid-3 {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .checkbox {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 42px;
+      }
+
+      .checkbox input {
+        width: auto;
+      }
+
+      .logs {
+        background: #020617;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        min-height: 420px;
+        max-height: 640px;
+        overflow: auto;
+        padding: 12px;
+        font-family:
+          ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", monospace;
+        font-size: 13px;
+        line-height: 1.55;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .log-line {
+        margin: 0 0 6px;
+      }
+
+      .log-line.stdout {
+        color: #d1d5db;
+      }
+
+      .log-line.stderr {
+        color: #fca5a5;
+      }
+
+      .log-line.status,
+      .log-line.command {
+        color: #93c5fd;
+      }
+
+      .log-line.error,
+      .log-line.finished {
+        color: #fbbf24;
+      }
+
+      .hidden {
+        display: none !important;
+      }
+
+      code.inline {
+        font-family:
+          ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", monospace;
+      }
+
+      @media (max-width: 1000px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+
+        .grid-3,
+        .grid-2 {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <div class="stack">
+        <div>
+          <h1>test-runner Web UI</h1>
+          <p class="meta">
+            通过本地页面选择项目路径、运行参数，并实时查看命令输出日志。
+          </p>
+        </div>
+
+        <div class="layout">
+          <aside class="stack">
+            <section class="panel stack">
+              <div>
+                <h2>路径浏览</h2>
+                <p class="meta">
+                  在输入框里填一个目录，例如
+                  <code class="inline">/usr</code>，后端会返回它下面的子目录供你继续选择。
+                </p>
+              </div>
+
+              <div class="stack">
+                <label for="rootPath">项目根目录</label>
+                <input id="rootPath" placeholder="/path/to/project" />
+              </div>
+
+              <div class="row">
+                <button id="browseButton" type="button" class="secondary">
+                  浏览子目录
+                </button>
+                <button id="parentButton" type="button" class="secondary">
+                  上一级
+                </button>
+                <button id="loadProjectButton" type="button" class="primary">
+                  读取项目信息
+                </button>
+              </div>
+
+              <div id="browseStatus" class="status meta">
+                正在准备目录浏览器...
+              </div>
+
+              <ul id="directoryList" class="dir-list"></ul>
+            </section>
+
+            <section class="panel stack">
+              <div>
+                <h2>项目信息</h2>
+                <p class="meta">
+                  读取成功后，会自动填充 env、API、workflow 和目录前缀选项。
+                </p>
+              </div>
+
+              <div id="projectStatus" class="status meta">
+                还没有加载任何 `.testrunner` 项目。
+              </div>
+
+              <div class="stack">
+                <div class="row">
+                  <label for="envSelect">环境</label>
+                  <select id="envSelect"></select>
+                </div>
+
+                <div class="meta" id="projectSummary"></div>
+              </div>
+            </section>
+          </aside>
+
+          <main class="stack">
+            <section class="panel stack">
+              <div>
+                <h2>运行参数</h2>
+                <p class="meta">
+                  页面会调用当前的 CLI 可执行文件启动一个子进程，输出会实时推送到下面的日志区域。
+                </p>
+              </div>
+
+              <form id="runForm" class="stack">
+                <div class="grid-3">
+                  <div class="stack">
+                    <label for="targetType">目标类型</label>
+                    <select id="targetType">
+                      <option value="all">all</option>
+                      <option value="api">api</option>
+                      <option value="dir">dir</option>
+                      <option value="workflow">workflow</option>
+                    </select>
+                  </div>
+
+                  <div class="stack" id="targetValueGroup">
+                    <label for="targetValue">目标值</label>
+                    <input
+                      id="targetValue"
+                      list="targetOptions"
+                      placeholder="例如 user/get-user"
+                    />
+                    <datalist id="targetOptions"></datalist>
+                  </div>
+
+                  <div class="stack hidden" id="workflowAllGroup">
+                    <label>&nbsp;</label>
+                    <label class="checkbox">
+                      <input id="workflowAll" type="checkbox" />
+                      <span>运行全部 workflow</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="grid-3">
+                  <div class="stack">
+                    <label for="tagInput">标签过滤</label>
+                    <input id="tagInput" placeholder="smoke, user" />
+                  </div>
+
+                  <div class="stack">
+                    <label for="casePattern">用例过滤</label>
+                    <input id="casePattern" placeholder="case id 或名称片段" />
+                  </div>
+
+                  <div class="stack">
+                    <label for="mockMode">Mock 覆盖</label>
+                    <select id="mockMode">
+                      <option value="default">默认配置</option>
+                      <option value="enabled">强制启用</option>
+                      <option value="disabled">强制禁用</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="grid-3">
+                  <label class="checkbox">
+                    <input id="failFast" type="checkbox" />
+                    <span>fail fast</span>
+                  </label>
+
+                  <label class="checkbox">
+                    <input id="parallel" type="checkbox" />
+                    <span>并行执行</span>
+                  </label>
+
+                  <label class="checkbox">
+                    <input id="dryRun" type="checkbox" />
+                    <span>dry run</span>
+                  </label>
+
+                  <label class="checkbox">
+                    <input id="followEnvLogs" type="checkbox" />
+                    <span>跟随环境日志</span>
+                  </label>
+
+                  <div class="stack">
+                    <label for="jobs">jobs</label>
+                    <input id="jobs" type="number" min="1" placeholder="可留空" />
+                  </div>
+                </div>
+
+                <div class="row">
+                  <button id="runButton" type="submit" class="primary">
+                    执行
+                  </button>
+                  <button id="clearLogsButton" type="button" class="secondary">
+                    清空日志
+                  </button>
+                </div>
+              </form>
+            </section>
+
+            <section class="panel stack">
+              <div class="row">
+                <div>
+                  <h2>实时日志</h2>
+                  <p class="meta">stdout / stderr / 状态事件都会显示在这里。</p>
+                </div>
+              </div>
+
+              <div id="runStatus" class="status meta">尚未开始执行。</div>
+              <div id="commandText" class="meta"></div>
+              <div id="logs" class="logs"></div>
+            </section>
+          </main>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const rootPathInput = document.getElementById('rootPath')
+      const browseButton = document.getElementById('browseButton')
+      const parentButton = document.getElementById('parentButton')
+      const loadProjectButton = document.getElementById('loadProjectButton')
+      const browseStatus = document.getElementById('browseStatus')
+      const directoryList = document.getElementById('directoryList')
+      const projectStatus = document.getElementById('projectStatus')
+      const projectSummary = document.getElementById('projectSummary')
+      const envSelect = document.getElementById('envSelect')
+      const targetType = document.getElementById('targetType')
+      const targetValue = document.getElementById('targetValue')
+      const targetValueGroup = document.getElementById('targetValueGroup')
+      const targetOptions = document.getElementById('targetOptions')
+      const workflowAll = document.getElementById('workflowAll')
+      const workflowAllGroup = document.getElementById('workflowAllGroup')
+      const tagInput = document.getElementById('tagInput')
+      const casePattern = document.getElementById('casePattern')
+      const mockMode = document.getElementById('mockMode')
+      const failFast = document.getElementById('failFast')
+      const parallel = document.getElementById('parallel')
+      const dryRun = document.getElementById('dryRun')
+      const followEnvLogs = document.getElementById('followEnvLogs')
+      const jobs = document.getElementById('jobs')
+      const runForm = document.getElementById('runForm')
+      const runButton = document.getElementById('runButton')
+      const clearLogsButton = document.getElementById('clearLogsButton')
+      const runStatus = document.getElementById('runStatus')
+      const commandText = document.getElementById('commandText')
+      const logs = document.getElementById('logs')
+
+      let currentBrowsePath = ''
+      let currentProject = null
+      let currentEventSource = null
+
+      function setStatus(element, message, type = 'meta') {
+        element.textContent = message
+        element.className = `status ${type}`.trim()
+      }
+
+      function resetProjectState(errorMessage) {
+        currentProject = null
+        envSelect.innerHTML = ''
+        projectSummary.textContent = ''
+        targetOptions.innerHTML = ''
+        if (errorMessage) {
+          setStatus(projectStatus, errorMessage, 'error')
+        }
+        updateTargetInputs()
+      }
+
+      function renderDirectories(payload) {
+        currentBrowsePath = payload.current_path
+        rootPathInput.value = payload.current_path
+        parentButton.disabled = !payload.parent_path
+        directoryList.innerHTML = ''
+
+        if (!payload.directories.length) {
+          const empty = document.createElement('li')
+          empty.className = 'dir-item'
+          empty.innerHTML = '<span class="meta">当前目录下没有子目录。</span>'
+          directoryList.appendChild(empty)
+          return
+        }
+
+        for (const entry of payload.directories) {
+          const item = document.createElement('li')
+          item.className = 'dir-item'
+
+          const label = document.createElement('code')
+          label.textContent = entry.path
+
+          const action = document.createElement('button')
+          action.type = 'button'
+          action.className = 'secondary'
+          action.textContent = '进入'
+          action.addEventListener('click', () => browse(entry.path))
+
+          item.append(label, action)
+          directoryList.appendChild(item)
+        }
+      }
+
+      async function requestJson(url, options = {}) {
+        const response = await fetch(url, options)
+        let payload
+        try {
+          payload = await response.json()
+        } catch (_) {
+          payload = { error: `请求失败：${response.status}` }
+        }
+
+        if (!response.ok) {
+          throw new Error(payload.error || `请求失败：${response.status}`)
+        }
+        return payload
+      }
+
+      async function browse(path = rootPathInput.value) {
+        setStatus(browseStatus, '正在读取目录...', 'meta')
+        try {
+          const query = new URLSearchParams()
+          if (path) {
+            query.set('path', path)
+          }
+          const payload = await requestJson(`/api/fs/children?${query.toString()}`)
+          renderDirectories(payload)
+          setStatus(
+            browseStatus,
+            `当前目录：${payload.current_path}，共 ${payload.directories.length} 个子目录`,
+            'success'
+          )
+        } catch (error) {
+          setStatus(browseStatus, error.message, 'error')
+        }
+      }
+
+      function populateEnvs(project) {
+        envSelect.innerHTML = ''
+        for (const envName of project.envs) {
+          const option = document.createElement('option')
+          option.value = envName
+          option.textContent = envName
+          if (envName === project.selected_env) {
+            option.selected = true
+          }
+          envSelect.appendChild(option)
+        }
+      }
+
+      function optionValuesForTarget(target) {
+        if (!currentProject) {
+          return []
+        }
+        if (target === 'api') {
+          return currentProject.apis.map((item) => ({
+            value: item.id,
+            label: `${item.id} (${item.name})`
+          }))
+        }
+        if (target === 'dir') {
+          return currentProject.dirs.map((item) => ({ value: item, label: item }))
+        }
+        if (target === 'workflow') {
+          return currentProject.workflows.map((item) => ({
+            value: item.id,
+            label: `${item.id} (${item.name})`
+          }))
+        }
+        return []
+      }
+
+      function updateTargetOptions() {
+        targetOptions.innerHTML = ''
+        for (const item of optionValuesForTarget(targetType.value)) {
+          const option = document.createElement('option')
+          option.value = item.value
+          option.label = item.label
+          targetOptions.appendChild(option)
+        }
+      }
+
+      function updateTargetInputs() {
+        const workflowMode = targetType.value === 'workflow'
+        const allMode = targetType.value === 'all'
+
+        workflowAllGroup.classList.toggle('hidden', !workflowMode)
+        targetValueGroup.classList.toggle(
+          'hidden',
+          allMode || (workflowMode && workflowAll.checked)
+        )
+
+        const workflowFiltersDisabled = workflowMode
+        tagInput.disabled = workflowFiltersDisabled
+        casePattern.disabled = workflowFiltersDisabled
+
+        if (workflowFiltersDisabled) {
+          tagInput.value = ''
+          casePattern.value = ''
+        }
+
+        updateTargetOptions()
+      }
+
+      async function loadProjectMetadata() {
+        const root = rootPathInput.value.trim()
+        if (!root) {
+          resetProjectState('请先填写项目根目录。')
+          return
+        }
+
+        setStatus(projectStatus, '正在读取项目信息...', 'meta')
+        try {
+          const query = new URLSearchParams({ root })
+          const currentEnv = envSelect.value.trim()
+          if (currentEnv) {
+            query.set('env', currentEnv)
+          }
+
+          const project = await requestJson(`/api/project?${query.toString()}`)
+          currentProject = project
+          rootPathInput.value = project.root
+          populateEnvs(project)
+          mockMode.value = 'default'
+          jobs.placeholder = project.parallel_slots
+            ? `当前 env 默认 slots: ${project.parallel_slots}`
+            : '可留空'
+          projectSummary.textContent =
+            `项目：${project.project_name} · env 默认值：${project.default_env} · ` +
+            `case ${project.case_count} 个 · workflow ${project.workflow_count} 个`
+          setStatus(
+            projectStatus,
+            `已加载 ${project.root} 下的 .testrunner 配置`,
+            'success'
+          )
+          updateTargetInputs()
+        } catch (error) {
+          resetProjectState(error.message)
+        }
+      }
+
+      function appendLog(event) {
+        const line = document.createElement('div')
+        line.className = `log-line ${event.kind}`
+        const time = event.timestamp ? new Date(event.timestamp).toLocaleTimeString() : '--:--:--'
+        line.textContent = `[${time}] ${event.message}`
+        logs.appendChild(line)
+        logs.scrollTop = logs.scrollHeight
+      }
+
+      function closeEventStream() {
+        if (currentEventSource) {
+          currentEventSource.close()
+          currentEventSource = null
+        }
+      }
+
+      function wireEventStream(streamPath) {
+        closeEventStream()
+        currentEventSource = new EventSource(streamPath)
+
+        const handleEvent = (rawEvent) => {
+          const payload = JSON.parse(rawEvent.data)
+          appendLog(payload)
+
+          if (payload.kind === 'finished') {
+            runButton.disabled = false
+            setStatus(runStatus, payload.message, 'success')
+            closeEventStream()
+          } else if (payload.kind === 'error') {
+            setStatus(runStatus, payload.message, 'error')
+          } else if (payload.kind === 'status') {
+            setStatus(runStatus, payload.message, 'meta')
+          }
+        }
+
+        for (const eventName of ['stdout', 'stderr', 'status', 'command', 'error', 'finished']) {
+          currentEventSource.addEventListener(eventName, handleEvent)
+        }
+
+        currentEventSource.onerror = () => {
+          if (currentEventSource) {
+            appendLog({
+              kind: 'error',
+              timestamp: new Date().toISOString(),
+              message: '日志流连接已关闭或发生错误。'
+            })
+          }
+        }
+      }
+
+      function collectTags() {
+        return tagInput.value
+          .split(',')
+          .map((value) => value.trim())
+          .filter(Boolean)
+      }
+
+      async function startRun(event) {
+        event.preventDefault()
+        const root = rootPathInput.value.trim()
+        if (!root) {
+          setStatus(runStatus, '请先选择项目根目录。', 'error')
+          return
+        }
+
+        const payload = {
+          root,
+          env: envSelect.value || null,
+          target: targetType.value,
+          target_value:
+            targetType.value === 'all' || (targetType.value === 'workflow' && workflowAll.checked)
+              ? null
+              : targetValue.value.trim() || null,
+          workflow_all: workflowAll.checked,
+          tags: collectTags(),
+          case_pattern: casePattern.value.trim() || null,
+          fail_fast: failFast.checked,
+          parallel: parallel.checked,
+          jobs: jobs.value ? Number(jobs.value) : null,
+          dry_run: dryRun.checked,
+          mock_mode: mockMode.value,
+          follow_env_logs: followEnvLogs.checked
+        }
+
+        logs.innerHTML = ''
+        runButton.disabled = true
+        setStatus(runStatus, '正在启动执行...', 'meta')
+
+        try {
+          const response = await requestJson('/api/runs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          })
+          commandText.textContent = response.command
+          wireEventStream(response.stream_path)
+        } catch (error) {
+          runButton.disabled = false
+          setStatus(runStatus, error.message, 'error')
+        }
+      }
+
+      browseButton.addEventListener('click', () => browse())
+      parentButton.addEventListener('click', () => {
+        if (!currentBrowsePath) {
+          return
+        }
+        const lastSlash = currentBrowsePath.lastIndexOf('/')
+        if (lastSlash <= 0) {
+          browse('/')
+          return
+        }
+        browse(currentBrowsePath.slice(0, lastSlash))
+      })
+      loadProjectButton.addEventListener('click', loadProjectMetadata)
+      envSelect.addEventListener('change', loadProjectMetadata)
+      targetType.addEventListener('change', updateTargetInputs)
+      workflowAll.addEventListener('change', updateTargetInputs)
+      runForm.addEventListener('submit', startRun)
+      clearLogsButton.addEventListener('click', () => {
+        logs.innerHTML = ''
+      })
+
+      updateTargetInputs()
+      browse()
+    </script>
+  </body>
+</html>

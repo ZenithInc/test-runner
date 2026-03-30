@@ -25,6 +25,28 @@ cargo run -p test-runner -- <subcommand>
 cargo build -p test-runner
 ```
 
+## 启动本地 Web UI
+
+如果你希望通过页面来选择路径和参数，而不是每次手写命令，可以直接启动内置 Web UI：
+
+```bash
+test-runner web
+```
+
+默认监听 `127.0.0.1:7919`。启动后，终端会打印访问地址。
+
+页面会提供下面这些能力：
+
+- 输入一个目录路径，请后端返回该目录下的子目录，逐级选择 `--root`
+- 读取 `.testrunner` 项目元数据，自动填充 env / api / workflow / dir 选项
+- 点击执行后，实时显示 CLI 子进程的 stdout / stderr 日志
+
+如果你需要换端口或绑定地址：
+
+```bash
+test-runner web --host 127.0.0.1 --port 7920
+```
+
 ## 初始化 `.testrunner/`
 
 在被测项目根目录下生成默认脚手架：

@@ -21,6 +21,8 @@ pub enum Commands {
         #[command(subcommand)]
         target: TestCommand,
     },
+    /// Start a lightweight local Web UI for browsing projects and launching runs
+    Web(WebArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -37,6 +39,16 @@ pub struct InitArgs {
     /// Generate mock server templates
     #[arg(long, default_value_t = true, action = ArgAction::Set)]
     pub with_mock: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct WebArgs {
+    /// Host/interface to bind the local Web server to
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+    /// TCP port for the local Web server
+    #[arg(long, default_value_t = 7919)]
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -148,7 +160,6 @@ impl CommonTestArgs {
 pub enum ReportFormat {
     Summary,
     Json,
-    Junit,
 }
 
 #[cfg(test)]
@@ -163,6 +174,18 @@ mod tests {
             Commands::Test {
                 target: TestCommand::All(args),
             } => assert!(args.common.follow_env_logs),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn web_args_parse_defaults() {
+        let cli = Cli::parse_from(["test-runner", "web"]);
+        match cli.command {
+            Commands::Web(args) => {
+                assert_eq!(args.host, "127.0.0.1");
+                assert_eq!(args.port, 7919);
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }

@@ -82,10 +82,6 @@ pub async fn run(command: TestCommand) -> Result<()> {
         return Ok(());
     }
 
-    if options.report_format == ReportFormat::Junit {
-        bail!("junit output is planned but not implemented yet");
-    }
-
     let parallel_jobs = resolve_parallel_jobs(&project, &options, selected_cases.len())?;
     let console = SummaryConsole::new(options.report_format);
     console.run_started(
@@ -233,10 +229,6 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
             "--case is not supported for `test workflow`; workflow steps are selected by the workflow definition"
         );
     }
-    if options.report_format == ReportFormat::Junit {
-        bail!("junit output is planned but not implemented yet");
-    }
-
     let project = load_project(&options.root, options.env.as_deref())?;
     let workflows = select_workflows(&project, &args)?;
 
@@ -2936,7 +2928,6 @@ fn print_report(report: &RunReport, report_path: &Path, format: ReportFormat) ->
             println!("{}", serde_json::to_string_pretty(report)?);
             println!("Report written to {}", report_path.display());
         }
-        ReportFormat::Junit => {}
     }
     Ok(())
 }
@@ -2973,7 +2964,6 @@ fn print_workflow_report(
             println!("{}", serde_json::to_string_pretty(report)?);
             println!("Report written to {}", report_path.display());
         }
-        ReportFormat::Junit => {}
     }
     Ok(())
 }
@@ -3017,7 +3007,6 @@ fn print_workflow_batch_report(
             println!("{}", serde_json::to_string_pretty(report)?);
             println!("Report written to {}", report_path.display());
         }
-        ReportFormat::Junit => {}
     }
     Ok(())
 }

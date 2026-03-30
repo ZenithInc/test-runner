@@ -1,55 +1,56 @@
 {
   "project": "health-service",
-  "environment": "containers",
-  "workflow_id": "payment-callback-flow",
-  "workflow_name": "payment callback flow",
-  "started_at": "2026-03-25T09:02:30.525452+00:00",
-  "finished_at": "2026-03-25T09:02:30.716657+00:00",
+  "environment": "docker",
+  "workflow_id": "register-login-create-order",
+  "workflow_name": "register login create order",
+  "started_at": "2026-03-30T09:49:22.068829+00:00",
+  "finished_at": "2026-03-30T09:49:22.134140+00:00",
   "status": "passed",
   "summary": {
-    "executed_steps": 2,
-    "passed_steps": 2,
+    "executed_steps": 4,
+    "passed_steps": 4,
     "failed_steps": 0,
-    "duration_ms": 191
+    "duration_ms": 65
   },
   "callback_summary": {
-    "total": 1,
-    "passed": 1,
+    "total": 0,
+    "passed": 0,
     "failed": 0
   },
-  "callbacks": [
-    {
-      "id": 1,
-      "source": "case:workflow/payment/schedule-callback",
-      "api": "callback/payment/status",
-      "method": "POST",
-      "url": "http://127.0.0.1:18080/callbacks/payments/status",
-      "after_ms": 100,
-      "scheduled_at": "2026-03-25T09:02:30.528208+00:00",
-      "status": "passed",
-      "duration_ms": 104,
-      "response_status": 204
-    }
-  ],
   "environment_artifacts": {
     "runtime": {
-      "kind": "containers",
-      "project_name": "test-runner-health-service-health-service-38420-1774429287131",
-      "project_directory": "",
+      "kind": "docker_compose",
+      "project_name": "test-runner-sample",
+      "project_directory": "/Volumes/Dev/codes/youse/test-runner/sample-projects",
       "files": [
-        "mysql:mysql:8.4",
-        "redis:redis:7.2-alpine",
-        "app:"
+        "docker-compose.yml"
       ],
       "startup_status": "passed",
-      "startup_duration_ms": 63390,
+      "startup_duration_ms": 6616,
       "startup_command": [
-        "bollard::containers"
+        "docker",
+        "compose",
+        "-p",
+        "test-runner-sample",
+        "-f",
+        "/Volumes/Dev/codes/youse/test-runner/sample-projects/docker-compose.yml",
+        "up",
+        "--build",
+        "-d",
+        "--wait"
       ],
       "shutdown_status": "passed",
-      "shutdown_duration_ms": 663,
+      "shutdown_duration_ms": 11202,
       "shutdown_command": [
-        "bollard::containers::stop+remove"
+        "docker",
+        "compose",
+        "-p",
+        "test-runner-sample",
+        "-f",
+        "/Volumes/Dev/codes/youse/test-runner/sample-projects/docker-compose.yml",
+        "down",
+        "-v",
+        "--remove-orphans"
       ]
     },
     "readiness": [
@@ -70,47 +71,101 @@
     ],
     "logs": [
       {
-        "kind": "containers",
+        "kind": "compose_service",
         "service": "app",
         "stream": "combined",
         "output": "env/app.log",
         "status": "passed",
-        "size_bytes": 79
+        "size_bytes": 88
       },
       {
-        "kind": "containers",
+        "kind": "container_file",
         "service": "mysql",
-        "stream": "combined",
-        "output": "env/mysql.log",
+        "source_path": "/var/lib/mysql/general.log",
+        "output": "env/mysql-query.log",
         "status": "passed",
-        "size_bytes": 6621
+        "size_bytes": 13266807
       },
       {
-        "kind": "containers",
+        "kind": "redis_monitor",
         "service": "redis",
-        "stream": "combined",
-        "output": "env/redis.log",
+        "output": "env/redis-monitor.log",
         "status": "passed",
-        "size_bytes": 705
+        "size_bytes": 1635
       }
     ]
   },
   "steps": [
     {
-      "id": "schedule-callback",
-      "case_id": "workflow/payment/schedule-callback",
+      "id": "register",
+      "case_id": "user/register/happy-path",
       "status": "passed",
       "passed": true,
-      "duration_ms": 183,
+      "duration_ms": 28,
+      "exports": {},
+      "case_steps": [
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 8,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 0
+            }
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 17,
+          "details": {
+            "api": "user/register",
+            "status": 201
+          },
+          "error": null
+        },
+        {
+          "kind": "query_db",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "datasource": "mysql.main",
+            "sql": "select name, email, password_hash from users where email = 'smoke.register@example.com'"
+          },
+          "error": null
+        }
+      ],
+      "deferred_teardown_steps": [
+        {
+          "kind": "sql",
+          "status": "passed",
+          "duration_ms": 2,
+          "details": {
+            "datasource": "mysql.main",
+            "result": {
+              "affected_rows": 1
+            }
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "send-sms",
+      "case_id": "user/send-sms-code/happy-path",
+      "status": "passed",
+      "passed": true,
+      "duration_ms": 6,
       "exports": {
-        "expected_status": "SUCCESS",
-        "order_no": "workflow-callback-001"
+        "sms_code": "162100"
       },
       "case_steps": [
         {
           "kind": "redis",
           "status": "passed",
-          "duration_ms": 1,
+          "duration_ms": 0,
           "details": {
             "command": "DEL",
             "datasource": "redis.main",
@@ -119,32 +174,25 @@
           "error": null
         },
         {
-          "kind": "callback",
+          "kind": "request",
           "status": "passed",
-          "duration_ms": 0,
+          "duration_ms": 4,
           "details": {
-            "after_ms": 100,
-            "id": 1,
-            "request": {
-              "api": "callback/payment/status",
-              "body_kind": "json",
-              "headers": {
-                "accept": "application/json",
-                "content-type": "application/json",
-                "x-test-env": "containers"
-              },
-              "method": "POST",
-              "url": "http://127.0.0.1:18080/callbacks/payments/status"
-            }
+            "api": "user/send-sms-code",
+            "status": 200
           },
           "error": null
         },
         {
-          "kind": "sleep",
+          "kind": "query_redis",
           "status": "passed",
-          "duration_ms": 180,
+          "duration_ms": 0,
           "details": {
-            "ms": 180
+            "args": [
+              "sms:code:13800000000"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
           },
           "error": null
         }
@@ -153,34 +201,34 @@
         {
           "kind": "redis",
           "status": "passed",
-          "duration_ms": 1,
+          "duration_ms": 0,
           "details": {
             "command": "DEL",
             "datasource": "redis.main",
-            "result": 1
+            "result": 0
           },
           "error": null
         }
       ]
     },
     {
-      "id": "verify-callback",
-      "case_id": "workflow/payment/assert-callback",
+      "id": "login",
+      "case_id": "workflow/user/login-after-register",
       "status": "passed",
       "passed": true,
-      "duration_ms": 4,
-      "exports": {},
+      "duration_ms": 19,
+      "exports": {
+        "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3NDg2Nzc2MiwiaWF0IjoxNzc0ODY0MTYyfQ.HgRv5OJa5lEQV4bI9BQ5JVJddb92oLBRRgN6rHHXAxU",
+        "buyer_email": "smoke.register@example.com"
+      },
       "case_steps": [
         {
-          "kind": "query_redis",
+          "kind": "if",
           "status": "passed",
-          "duration_ms": 2,
+          "duration_ms": 0,
           "details": {
-            "args": [
-              "payment:status:workflow-callback-001"
-            ],
-            "command": "GET",
-            "datasource": "redis.main"
+            "condition": "${seed_user == true}",
+            "value": false
           },
           "error": null
         },
@@ -189,8 +237,18 @@
           "status": "passed",
           "duration_ms": 0,
           "details": {
-            "condition": "${result.value == null}",
+            "condition": "${seed_sms == true}",
             "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 16,
+          "details": {
+            "api": "workflow/user/login-after-register",
+            "status": 200
           },
           "error": null
         },
@@ -200,10 +258,109 @@
           "duration_ms": 1,
           "details": {
             "args": [
-              "payment:status:workflow-callback-001"
+              "auth:token:eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3NDg2Nzc2MiwiaWF0IjoxNzc0ODY0MTYyfQ.HgRv5OJa5lEQV4bI9BQ5JVJddb92oLBRRgN6rHHXAxU"
             ],
             "command": "GET",
             "datasource": "redis.main"
+          },
+          "error": null
+        },
+        {
+          "kind": "query_redis",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "args": [
+              "sms:code:13800000000"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
+          },
+          "error": null
+        }
+      ],
+      "deferred_teardown_steps": [
+        {
+          "kind": "redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "command": "DEL",
+            "datasource": "redis.main",
+            "result": 1
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_sms == true}",
+            "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_user == true}",
+            "value": false
+          },
+          "error": null
+        }
+      ]
+    },
+    {
+      "id": "create-order",
+      "case_id": "workflow/order/create-after-login",
+      "status": "passed",
+      "passed": true,
+      "duration_ms": 2,
+      "exports": {},
+      "case_steps": [
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_token == true}",
+            "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "query_redis",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "args": [
+              "auth:token:eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3NDg2Nzc2MiwiaWF0IjoxNzc0ODY0MTYyfQ.HgRv5OJa5lEQV4bI9BQ5JVJddb92oLBRRgN6rHHXAxU"
+            ],
+            "command": "GET",
+            "datasource": "redis.main"
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "api": "workflow/order/create-after-login",
+            "status": 201
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_token == true}",
+            "value": false
           },
           "error": null
         }

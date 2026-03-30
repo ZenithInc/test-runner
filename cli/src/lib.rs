@@ -8,6 +8,7 @@ pub mod mock;
 pub mod runner;
 pub mod runtime;
 pub mod url_rewrite;
+pub mod web;
 pub mod workflow;
 
 use anyhow::Result;
@@ -21,5 +22,6 @@ pub async fn run() -> Result<()> {
     match cli.command {
         Commands::Init(args) => init::run(args).await,
         Commands::Test { target } => runner::run(target).await,
+        Commands::Web(args) => web::run(args).await,
     }
 }

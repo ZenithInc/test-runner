@@ -105,7 +105,28 @@ cargo run -p test-runner -- test workflow register-login-create-order --root sam
 如果环境文件里声明了 `runtime` / `readiness` / `logs`，`test-runner` 会在执行前后自动托管环境，而不需要你手工先跑 `docker compose up/down`。
 如果你想像 `tail -f` 一样边跑边看环境输出，可以额外加 `--follow-env-logs`；现在它更适合盯 MySQL query log、Redis MONITOR 和应用运行期日志。
 
-### 1.5 预览文档站点
+### 1.5 启动本地 Web UI
+
+如果你更希望通过页面来选择路径、参数并实时看日志，可以直接启动内置 Web UI：
+
+```bash
+cargo run -p test-runner -- web
+```
+
+默认会监听 `127.0.0.1:7919`，终端会打印访问地址。页面里可以：
+
+- 输入一个目录路径并请求后端返回子目录列表，逐级选择 `--root`
+- 读取 `.testrunner` 项目元数据，自动填充 env / api / workflow / dir 选项
+- 选择执行参数并点击运行
+- 在页面中实时查看 CLI 子进程的 stdout / stderr 日志
+
+如果你需要修改监听地址：
+
+```bash
+cargo run -p test-runner -- web --host 127.0.0.1 --port 7920
+```
+
+### 1.6 预览文档站点
 
 ```bash
 npm install
@@ -127,7 +148,7 @@ npm run docs:preview
 - `docs/workflow/index.md`：工作流 DSL 和 cleanup 策略
 
 
-### 1.6 GitHub 自动化
+### 1.7 GitHub 自动化
 
 仓库现在包含 3 条 GitHub Actions 工作流：
 
@@ -158,6 +179,7 @@ CLI 当前的顶层命令如下：
 
 ```text
 test-runner init
+test-runner web
 test-runner test api <API_ID>
 test-runner test dir <DIR>
 test-runner test all
@@ -179,7 +201,25 @@ test-runner init [OPTIONS]
 - `--with-mock <true|false>`：是否生成 Mock 服务模板，默认 `true`。
 
 
-### 2.2 `test api`
+### 2.2 `web`
+
+```bash
+test-runner web [OPTIONS]
+```
+
+参数：
+
+- `--host <HOST>`：Web UI 绑定的地址，默认 `127.0.0.1`。
+- `--port <PORT>`：Web UI 绑定的端口，默认 `7919`。
+
+行为：
+
+- 启动一个本地 HTTP 服务并返回一个单页 Web 界面。
+- 页面会通过后端接口浏览目录、读取 `.testrunner` 项目元数据，并在执行时启动当前 CLI 的子进程。
+- 执行日志会以流的方式实时显示在页面上。
+
+
+### 2.3 `test api`
 
 ```bash
 test-runner test api [OPTIONS] <API_ID>
@@ -190,7 +230,7 @@ test-runner test api [OPTIONS] <API_ID>
 - 运行所有 `case.api == <API_ID>` 的测试用例。
 
 
-### 2.3 `test dir`
+### 2.4 `test dir`
 
 ```bash
 test-runner test dir [OPTIONS] <DIR>
@@ -203,7 +243,7 @@ test-runner test dir [OPTIONS] <DIR>
   - 用例文件相对路径以 `<DIR>` 开头
 
 
-### 2.4 `test all`
+### 2.5 `test all`
 
 ```bash
 test-runner test all [OPTIONS]
@@ -215,7 +255,7 @@ test-runner test all [OPTIONS]
 - **V1 中不包含工作流（workflow）**；工作流需要通过 `test workflow` 单独触发。
 
 
-### 2.5 `test workflow`
+### 2.6 `test workflow`
 
 ```bash
 test-runner test workflow [OPTIONS] <WORKFLOW_ID>
@@ -240,7 +280,7 @@ test-runner test workflow auth-flow --dry-run --root /path/to/your-project
 ```
 
 
-### 2.6 `test` 共有参数
+### 2.7 `test` 共有参数
 
 下面这些参数适用于 `test api` / `test dir` / `test all` / `test workflow`：
 
@@ -253,13 +293,13 @@ test-runner test workflow auth-flow --dry-run --root /path/to/your-project
 - `--mock`：强制启用内嵌 Mock 服务。
 - `--no-mock`：强制禁用内嵌 Mock 服务。
 - `--follow-env-logs`：执行期间把环境服务日志实时输出到 `stderr`。
-- `--report-format <summary|json|junit>`：输出格式。
+- `--report-format <summary|json>`：输出格式。
 
 说明：
 
 - `summary`：终端输出阶段、进度和汇总；在 TTY 下会自动做 ANSI 强调（可通过 `NO_COLOR` 关闭）。
 - `json`：终端输出 JSON，同时仍然会把报告写入 `.testrunner/reports/last-run.json` 或 `.testrunner/reports/last-workflow-run.json`。
-- `junit`：**当前已预留参数，但尚未实现**，执行时会报错。
+
 - `--dry-run` 只展示执行计划，不会真正发请求、不会启动环境 runtime，也不会写报告文件。
 - `--follow-env-logs` 会根据 `env/*.yaml` 里的 `logs:` 声明实时跟随相关日志源；为了减少启动噪音，查询级日志会在 readiness 通过后开始输出。为了不破坏 `--report-format json` 的机器可读性，这些 live logs 会写到 `stderr`。当 `stderr` 是 TTY 且未设置 `NO_COLOR` 时，MySQL / Redis / 应用日志会按来源着色。
 
@@ -1328,7 +1368,7 @@ steps:
 为了避免误解，下面这些点需要特别注意：
 
 - 目前是 **串行执行**，还没有做并行调度。
-- `report-format=junit` 尚未实现。
+
 - `api.timeout_ms` 只是 schema 字段，当前不会覆盖全局 HTTP 超时。
 - Redis `key_prefix` 目前不会自动加到命令参数里。
 - Mock 已支持基于请求上下文的动态响应，但不支持在 Mock 内发请求或访问数据库 / Redis。
