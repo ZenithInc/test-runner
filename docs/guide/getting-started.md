@@ -35,6 +35,8 @@ test-runner web
 
 默认监听 `127.0.0.1:7919`。启动后，终端会打印访问地址。
 
+默认只绑定本机回环地址，不会直接暴露到局域网；同时它也没有内建认证，更适合本机单用户调试。
+
 页面会提供下面这些能力：
 
 - 输入一个目录路径，请后端返回该目录下的子目录，逐级选择 `--root`
@@ -62,6 +64,23 @@ test-runner init --root /path/to/your-project --force
 ```
 
 初始化后会生成 `project.yaml`、环境文件、数据源配置、API 定义、样例用例、数据文件和可选的 Mock 模板。
+
+如果你希望控制初始化内容，还可以补充：
+
+```bash
+# 生成 CI 风格环境模板（默认环境切到 ci，示例地址改成容器网络里的 app:3000）
+test-runner init --root /path/to/your-project --env-template ci
+
+# 跳过 mock 脚手架
+test-runner init --root /path/to/your-project --with-mock false
+```
+
+当前实现里：
+
+- `local`：默认本地模板
+- `ci`：把默认环境切到 `ci`，并把 `env/ci.yaml` 示例地址设成 `http://app:3000`
+- `minimal`：目前和 `local` 基本一致，还没有额外裁剪规则
+- `--with-mock false`：不会生成 `mocks/` 目录、路由和 fixture 模板
 
 ## 先看执行计划
 
@@ -101,6 +120,9 @@ test-runner test dir user --root sample-projects --env containers --parallel --j
 
 # workflow 级并行（一次运行多个 workflow）
 test-runner test workflow --all --root sample-projects --env containers --parallel --jobs 2
+
+# 跟随环境日志（stdout 仍保留给运行摘要 / JSON，live logs 输出到 stderr）
+test-runner test workflow register-login-create-order --root sample-projects --env containers --follow-env-logs
 ```
 
 其中：
@@ -108,6 +130,7 @@ test-runner test workflow --all --root sample-projects --env containers --parall
 - `test api` / `test dir` / `test all`：按 **case** 分配 slot
 - `test workflow --all`：按 **workflow** 分配 slot
 - 单个 workflow 内部的 steps 仍保持串行
+- `--jobs N` 可以单独使用；它本身就会请求并行调度，不一定非要再显式写一个 `--parallel`
 - 如果应用通过容器环境变量读取 mock / provider URL，把占位地址显式写到 `runtime.services[*].env`；并行 + 内嵌 mock 时，运行器会自动改写到当前 slot 的实际端口
 
 ## 一个推荐的接入顺序

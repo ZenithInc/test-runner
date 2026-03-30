@@ -94,6 +94,12 @@ test-runner test workflow register-login-create-order
 
 文件里包含项目名、环境名、目标、汇总信息以及每个 case 的步骤结果。
 
+如果这次运行涉及 callback 或环境托管，`last-run.json` 里还会额外带上：
+
+- `callback_summary` 和 `callbacks`
+- `environment_artifacts`
+- 并行运行时的 `parallel` 元数据
+
 ## `reports/last-workflow-run.json`
 
 执行 workflow 后，最新 workflow 报告会固定写到：
@@ -103,6 +109,12 @@ test-runner test workflow register-login-create-order
 ```
 
 文件里会包含 workflow 级汇总信息、每个 `run_case` step 的状态、导出值，以及 deferred teardown 的执行结果。
+
+如果 workflow 里安排了 callback，或者执行前后托管了环境，这个文件同样会包含：
+
+- `callback_summary` 和 `callbacks`
+- `environment_artifacts`
+- 并行时的 `slot_id`
 
 ## `reports/last-workflows-run.json`
 
@@ -125,6 +137,14 @@ test-runner test workflow --all --parallel --jobs 2
 - 并行元数据（jobs、slots、unit）
 - callback 汇总和环境产物索引
 
+其中 `workflows[]` 里的每个元素都会保留单条 workflow 的：
+
+- `workflow_id` / `workflow_name`
+- `status` / `error`
+- `summary`
+- `steps`
+- 可选的 `slot_id`
+
 ## `reports/slot-<id>/`
 
 在 Testcontainers slot 并行模式下，环境日志产物会按 slot 自动分目录：
@@ -135,5 +155,13 @@ test-runner test workflow --all --parallel --jobs 2
 ```
 
 这样可以避免不同 slot 的 app / mysql / redis 日志互相覆盖。
+
+如果环境文件把日志输出写成 `env/app.log`、`env/mysql-query.log` 这类相对路径，那么并行时通常会落成：
+
+```text
+.testrunner/reports/slot-0/env/app.log
+.testrunner/reports/slot-0/env/mysql-query.log
+.testrunner/reports/slot-0/env/redis-monitor.log
+```
 
 如果你想看 `env/*.yaml` 如何进一步声明环境生命周期、就绪检查和日志产物，请继续阅读 [环境 DSL](/guide/environment-dsl)。
