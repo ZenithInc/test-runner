@@ -1,0 +1,41 @@
+name: update order version conflict
+api: order/update
+tags:
+  - order
+  - negative
+  - patch
+setup:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from orders where customer_email = 'conflict.order@example.com'"
+steps:
+  - request:
+      api: order/create
+      base_url: "${env.variables.service_base_url}"
+      body:
+        customer:
+          name: Conflict Runner
+          email: conflict.order@example.com
+        items:
+          - sku: SKU-CHAIR
+            quantity: 1
+            unit_price: 3000
+    extract:
+      order_id: response.json.order_id
+    assert:
+      - eq: ["response.status", 201]
+  - request:
+      api: order/update
+      base_url: "${env.variables.service_base_url}"
+      path_params:
+        order_id: "{{ order_id }}"
+      body:
+        version: 99
+        note: should-conflict
+    assert:
+      - eq: ["response.status", 409]
+      - contains: ["response.json.error", "version mismatch"]
+teardown:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from orders where customer_email = 'conflict.order@example.com'"

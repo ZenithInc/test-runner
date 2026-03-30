@@ -1,0 +1,60 @@
+name: update order happy path
+api: order/update
+tags:
+  - order
+  - db
+  - patch
+setup:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from orders where customer_email = 'update.order@example.com'"
+steps:
+  - request:
+      api: order/create
+      base_url: "${env.variables.service_base_url}"
+      body:
+        customer:
+          name: Update Runner
+          email: update.order@example.com
+        items:
+          - sku: SKU-DESK
+            quantity: 1
+            unit_price: 6000
+    extract:
+      order_id: response.json.order_id
+      order_version: response.json.version
+    assert:
+      - eq: ["response.status", 201]
+      - eq: ["order_version", 1]
+  - request:
+      api: order/update
+      base_url: "${env.variables.service_base_url}"
+      path_params:
+        order_id: "{{ order_id }}"
+      body:
+        version: order_version
+        customer_tier: vip
+        coupon_code: VIP50
+        note: " priority update "
+    extract:
+      updated_version: response.json.version
+    assert:
+      - eq: ["response.status", 200]
+      - eq: ["updated_version", 2]
+      - eq: ["response.json.customer.tier", "vip"]
+      - eq: ["response.json.metadata.coupon_code", "VIP50"]
+      - eq: ["response.json.metadata.note", "priority update"]
+      - eq: ["response.json.pricing.discount", 5000]
+      - eq: ["response.json.flags.has_discount", true]
+  - query_db:
+      datasource: mysql.main
+      sql: "select version, customer_tier, coupon_code, note from orders where id = '{{ order_id }}'"
+    assert:
+      - eq: ["result.row_count", 1]
+      - eq: ["result.rows[0].customer_tier", "vip"]
+      - eq: ["result.rows[0].coupon_code", "VIP50"]
+      - eq: ["result.rows[0].note", "priority update"]
+teardown:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from orders where customer_email = 'update.order@example.com'"

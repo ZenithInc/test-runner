@@ -1,0 +1,46 @@
+name: workflow get created order
+api: order/get
+tags:
+  - workflow
+  - order
+  - query
+vars:
+  order_id: ORD-WORKFLOW-DETAIL
+  expected_email: smoke.register@example.com
+  expected_note: workflow order note
+  expected_version: 1
+  expected_item_count: 1
+  seed_order: true
+setup:
+  - if: "${seed_order == true}"
+    then:
+      - sql:
+          datasource: mysql.main
+          sql: "delete from orders where id = '{{ order_id }}'"
+      - sql:
+          datasource: mysql.main
+          sql: "insert into orders (id, status, version, customer_name, customer_email, customer_tier, coupon_code, note, sku_count, item_count, subtotal, discount, shipping_fee, payable_total) values ('{{ order_id }}', 'created', {{ expected_version }}, 'Workflow Order Runner', '{{ expected_email }}', 'vip', 'SAVE10', '{{ expected_note }}', 1, 1, 4500, 450, 1200, 5250)"
+      - sql:
+          datasource: mysql.main
+          sql: "insert into order_items (order_id, line_no, sku, quantity, unit_price, line_total) values ('{{ order_id }}', 1, 'SKU-BOOK', 1, 4500, 4500)"
+steps:
+  - request:
+      api: order/get
+      base_url: "${env.variables.service_base_url}"
+      path_params:
+        order_id: "{{ order_id }}"
+      query:
+        include: all
+    assert:
+      - eq: ["response.status", 200]
+      - eq: ["response.json.order_id", "order_id"]
+      - eq: ["response.json.version", "expected_version"]
+      - eq: ["response.json.customer.email", "expected_email"]
+      - eq: ["response.json.metadata.note", "expected_note"]
+      - eq: ["len(response.json.items)", "expected_item_count"]
+teardown:
+  - if: "${seed_order == true}"
+    then:
+      - sql:
+          datasource: mysql.main
+          sql: "delete from orders where id = '{{ order_id }}'"

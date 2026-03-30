@@ -41,11 +41,13 @@ steps:
         note: "{{ access_token }}"
     extract:
       order_id: response.json.order_id
+      order_version: response.json.version
       normalized_email: response.json.customer.email
       note_value: response.json.metadata.note
     assert:
       - eq: ["response.status", 201]
       - not_empty: ["order_id"]
+      - eq: ["order_version", 1]
       - eq: ["normalized_email", "buyer_email"]
       - eq: ["note_value", "access_token"]
 teardown:

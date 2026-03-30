@@ -1,0 +1,54 @@
+name: workflow get current user after login
+api: user/me
+tags:
+  - workflow
+  - auth
+  - headers
+  - redis
+vars:
+  email: smoke.register@example.com
+  expected_name: Workflow Profile Runner
+  access_token: workflow-profile-token
+  seed_user: true
+  seed_token: true
+setup:
+  - if: "${seed_user == true}"
+    then:
+      - sql:
+          datasource: mysql.main
+          sql: "delete from users where email = '{{ email }}'"
+      - sql:
+          datasource: mysql.main
+          sql: "insert into users (name, email, password_hash) values ('{{ expected_name }}', '{{ email }}', '$argon2id$v=19$m=19456,t=2,p=1$c2FtcGxlLWxvZ2luLXNhbHQ$KfzEIjldXSW/qzqrm9OxGSXE7BwEewabPZJ+/jSgdZ0')"
+  - if: "${seed_token == true}"
+    then:
+      - redis:
+          datasource: redis.main
+          command: SETEX
+          args:
+            - "auth:token:{{ access_token }}"
+            - 3600
+            - "{{ email }}"
+steps:
+  - request:
+      api: user/me
+      base_url: "${env.variables.service_base_url}"
+      headers:
+        authorization: "Bearer {{ access_token }}"
+    assert:
+      - eq: ["response.status", 200]
+      - eq: ["response.json.name", "expected_name"]
+      - eq: ["response.json.email", "email"]
+teardown:
+  - if: "${seed_token == true}"
+    then:
+      - redis:
+          datasource: redis.main
+          command: DEL
+          args:
+            - "auth:token:{{ access_token }}"
+  - if: "${seed_user == true}"
+    then:
+      - sql:
+          datasource: mysql.main
+          sql: "delete from users where email = '{{ email }}'"

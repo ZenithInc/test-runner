@@ -1,0 +1,39 @@
+name: list orders filter pagination
+api: order/list
+tags:
+  - order
+  - db
+  - query
+setup:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from orders where customer_email = 'list.order@example.com'"
+  - sql:
+      datasource: mysql.main
+      sql: "insert into orders (id, status, version, customer_name, customer_email, customer_tier, coupon_code, note, sku_count, item_count, subtotal, discount, shipping_fee, payable_total) values ('ORD-LIST-001', 'created', 1, 'List Runner', 'list.order@example.com', null, null, 'first seeded order', 1, 1, 4800, 0, 1200, 6000)"
+  - sql:
+      datasource: mysql.main
+      sql: "insert into orders (id, status, version, customer_name, customer_email, customer_tier, coupon_code, note, sku_count, item_count, subtotal, discount, shipping_fee, payable_total) values ('ORD-LIST-002', 'created', 1, 'List Runner', 'list.order@example.com', 'vip', 'SAVE10', 'second seeded order', 2, 3, 9300, 930, 0, 8370)"
+steps:
+  - request:
+      api: order/list
+      base_url: "${env.variables.service_base_url}"
+      query:
+        customer_email: list.order@example.com
+        status: created
+        limit: 1
+        offset: 1
+    assert:
+      - eq: ["response.status", 200]
+      - contains: ["response.headers.content-type", "application/json"]
+      - eq: ["response.json.total", 2]
+      - eq: ["response.json.limit", 1]
+      - eq: ["response.json.offset", 1]
+      - eq: ["len(response.json.items)", 1]
+      - eq: ["response.json.has_more", false]
+      - eq: ["response.json.items[0].order_id", "ORD-LIST-001"]
+      - eq: ["response.json.items[0].metadata.note", "first seeded order"]
+teardown:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from orders where customer_email = 'list.order@example.com'"

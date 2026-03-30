@@ -1,7 +1,8 @@
 name: register login create order
 description: >
   Registers a user, reuses the created user and SMS side effects to log in,
-  then creates an order while asserting the login token is still available.
+  reads the current profile via Authorization header, creates an order, and
+  then fetches and updates that order through path-parameter based routes.
 steps:
   - run_case:
       id: register
@@ -27,6 +28,16 @@ steps:
   - if: "${workflow.steps.login.passed}"
     then:
       - run_case:
+          id: current-profile
+          case: workflow/user/me-after-login
+          cleanup: immediate
+          inputs:
+            seed_user: false
+            seed_token: false
+            email: "${workflow.steps.login.exports.buyer_email}"
+            expected_name: Smoke Runner
+            access_token: "${workflow.steps.login.exports.access_token}"
+      - run_case:
           id: create-order
           case: workflow/order/create-after-login
           cleanup: immediate
@@ -34,6 +45,30 @@ steps:
             seed_token: false
             buyer_email: "${workflow.steps.login.exports.buyer_email}"
             access_token: "${workflow.steps.login.exports.access_token}"
+          exports:
+            order_id: vars.order_id
+            order_version: vars.order_version
+      - run_case:
+          id: get-order
+          case: workflow/order/get-created-order
+          cleanup: immediate
+          inputs:
+            seed_order: false
+            order_id: "${workflow.steps.create-order.exports.order_id}"
+            expected_email: "${workflow.steps.login.exports.buyer_email}"
+            expected_note: "${workflow.steps.login.exports.access_token}"
+            expected_version: "${workflow.steps.create-order.exports.order_version}"
+            expected_item_count: 1
+      - run_case:
+          id: update-order
+          case: workflow/order/update-created-order
+          cleanup: immediate
+          inputs:
+            seed_order: false
+            order_id: "${workflow.steps.create-order.exports.order_id}"
+            current_version: "${workflow.steps.create-order.exports.order_version}"
+            expected_discount: 4500
+            updated_note: reviewed-by-workflow
     else:
       - run_case:
           id: health-fallback

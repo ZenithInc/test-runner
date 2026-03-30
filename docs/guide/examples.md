@@ -163,13 +163,17 @@ steps:
 1. `user/register/happy-path`
 2. `user/send-sms-code/happy-path`
 3. `workflow/user/login-after-register`
-4. `workflow/order/create-after-login`
+4. `workflow/user/me-after-login`
+5. `workflow/order/create-after-login`
+6. `workflow/order/get-created-order`
+7. `workflow/order/update-created-order`
 
 它验证了：
 
 - register 产生的数据库副作用可以被后续 login 复用
 - send-sms 导出的验证码可以通过 `exports + inputs` 传给后续 case
-- login 产生的 token 副作用在 create-order 前仍然可见
+- login 产生的 token 既能通过 Authorization header 访问 `/me`，也能在 create-order 前继续复用
+- create-order 导出的 `order_id` / `order_version` 可以继续驱动后续 `GET /orders/{order_id}` 和 `PATCH /orders/{order_id}`
 - workflow 结束后，deferred teardown 会统一清理这些副作用
 
 执行命令：
@@ -189,8 +193,12 @@ test-runner test workflow payment-callback-flow --root sample-projects --env doc
 # Docker Compose 模式
 test-runner test api system/health --root sample-projects --env docker
 test-runner test api order/create --root sample-projects --env docker
+test-runner test api order/get --root sample-projects --env docker
+test-runner test api order/list --root sample-projects --env docker
+test-runner test api order/update --root sample-projects --env docker
 test-runner test api user/register --root sample-projects --env docker
 test-runner test api user/login --root sample-projects --env docker
+test-runner test api user/me --root sample-projects --env docker
 test-runner test api user/send-sms-code --root sample-projects --env docker
 test-runner test workflow register-login-create-order --root sample-projects --env docker
 

@@ -1,0 +1,13 @@
+name: get current user unauthorized
+api: user/me
+tags:
+  - auth
+  - negative
+  - headers
+steps:
+  - request:
+      api: user/me
+      base_url: "${env.variables.service_base_url}"
+    assert:
+      - eq: ["response.status", 401]
+      - eq: ["response.json.error", "missing Authorization header"]

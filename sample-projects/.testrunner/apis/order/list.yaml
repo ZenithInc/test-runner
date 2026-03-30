@@ -1,0 +1,6 @@
+name: List orders
+method: GET
+path: /orders
+headers:
+  accept: application/json
+query: {}

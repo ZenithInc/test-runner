@@ -1,0 +1,16 @@
+name: get order not found
+api: order/get
+tags:
+  - order
+  - negative
+steps:
+  - request:
+      api: order/get
+      base_url: "${env.variables.service_base_url}"
+      path_params:
+        order_id: ORD-MISSING
+      query:
+        include: all
+    assert:
+      - eq: ["response.status", 404]
+      - eq: ["response.json.error", "order `ORD-MISSING` was not found"]

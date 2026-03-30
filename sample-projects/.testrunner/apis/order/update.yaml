@@ -1,0 +1,7 @@
+name: Update order
+method: PATCH
+path: /orders/{order_id}
+headers:
+  content-type: application/json
+  accept: application/json
+query: {}

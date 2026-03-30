@@ -1,0 +1,65 @@
+name: get current user happy path
+api: user/me
+tags:
+  - auth
+  - headers
+  - redis
+setup:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from users where email = 'me.runner@example.com'"
+  - sql:
+      datasource: mysql.main
+      sql: "insert into users (name, email, password_hash) values ('Me Runner', 'me.runner@example.com', '$argon2id$v=19$m=19456,t=2,p=1$c2FtcGxlLWxvZ2luLXNhbHQ$KfzEIjldXSW/qzqrm9OxGSXE7BwEewabPZJ+/jSgdZ0')"
+  - redis:
+      datasource: redis.main
+      command: SETEX
+      args:
+        - sms:code:13800000002
+        - 300
+        - "654321"
+steps:
+  - request:
+      api: user/login
+      base_url: "${env.variables.service_base_url}"
+      body:
+        email: me.runner@example.com
+        password: P@ssw0rd123
+        phone: "13800000002"
+        sms_code: "654321"
+    extract:
+      access_token: response.json.access_token
+    assert:
+      - eq: ["response.status", 200]
+      - not_empty: ["access_token"]
+  - request:
+      api: user/me
+      base_url: "${env.variables.service_base_url}"
+      headers:
+        authorization: "Bearer {{ access_token }}"
+    assert:
+      - eq: ["response.status", 200]
+      - contains: ["response.headers.content-type", "application/json"]
+      - eq: ["response.json.name", "Me Runner"]
+      - eq: ["response.json.email", "me.runner@example.com"]
+  - query_redis:
+      datasource: redis.main
+      command: GET
+      args:
+        - "auth:token:{{ access_token }}"
+    assert:
+      - eq: ["result.value", "me.runner@example.com"]
+teardown:
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - "auth:token:{{ access_token }}"
+  - redis:
+      datasource: redis.main
+      command: DEL
+      args:
+        - sms:code:13800000002
+  - sql:
+      datasource: mysql.main
+      sql: "delete from users where email = 'me.runner@example.com'"

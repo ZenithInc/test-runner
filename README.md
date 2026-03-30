@@ -1397,13 +1397,17 @@ steps:
 
 仓库里现在提供了一个可运行的 Rust 示例项目：`sample-projects/`。
 
-它包含七个接口：
+它现在包含 11 个接口：
 
 ```text
 GET  /health
+GET  /orders
+GET  /orders/{order_id}
 POST /orders
+PATCH /orders/{order_id}
 POST /payments/provider/create
 POST /callbacks/payments/status
+GET  /me
 POST /register
 POST /login
 POST /send-sms-code
@@ -1413,8 +1417,12 @@ POST /send-sms-code
 
 - `/health`：最小健康检查
 - `/orders`：一个无外部依赖的下单接口，返回嵌套数组/对象/布尔/null/数值结构，适合验证 DSL 表达式
+- `GET /orders`：支持 query filter + pagination，适合验证 query 参数、列表断言和分页元数据
+- `GET /orders/{order_id}`：支持 path 参数和可选 `include` 查询，适合验证 path/query 组合
+- `PATCH /orders/{order_id}`：支持版本检查、折扣重算和 `409 conflict`，适合验证更新语义
 - `/payments/provider/create`：模拟被测系统向第三方支付服务发起请求
 - `/callbacks/payments/status`：模拟第三方稍后回调被测系统后的落点
+- `/me`：要求 `Authorization: Bearer <token>`，适合验证 header 鉴权和 Redis token 复用
 - `/register`：把用户写入 MySQL，并返回新建用户信息
 - `/login`：校验 MySQL 中的密码哈希和短信验证码，签发 JWT，并把 token 写入 Redis
 - `/send-sms-code`：调用一个被 Mock 的短信 HTTP 服务，并把短信验证码写入 Redis
@@ -1432,7 +1440,11 @@ POST /send-sms-code
 ```bash
 cargo run -p test-runner -- test api system/health --root sample-projects --env docker
 cargo run -p test-runner -- test api order/create --root sample-projects --env docker
+cargo run -p test-runner -- test api order/get --root sample-projects --env docker
+cargo run -p test-runner -- test api order/list --root sample-projects --env docker
+cargo run -p test-runner -- test api order/update --root sample-projects --env docker
 cargo run -p test-runner -- test api payment/provider/create --root sample-projects --env docker
+cargo run -p test-runner -- test api user/me --root sample-projects --env docker
 cargo run -p test-runner -- test workflow register-login-create-order --root sample-projects --env docker
 cargo run -p test-runner -- test workflow payment-callback-flow --root sample-projects --env docker --no-mock
 ```
@@ -1452,13 +1464,17 @@ cargo run -p test-runner -- test workflow payment-callback-flow --root sample-pr
 - `user/register/happy-path`
 - `user/send-sms-code/happy-path`
 - `workflow/user/login-after-register`
+- `workflow/user/me-after-login`
 - `workflow/order/create-after-login`
+- `workflow/order/get-created-order`
+- `workflow/order/update-created-order`
 
 这条流程会同时验证：
 
 - register 产生的用户副作用被后续 login 复用
 - send-sms 产生的验证码副作用被后续 login 复用
-- login 产生的 token 副作用在 create-order 前仍可见
+- login 产生的 token 既能被 `/me` 的 Authorization header 复用，也能在 create-order 前仍可见
+- create-order 产生的 order_id / version 可以通过 workflow `exports + inputs` 传给后续读取 / 更新 case
 - workflow 结束后，deferred teardown 会把这些副作用清理掉
 
 `payment-callback-flow` 则展示了另一条链路：
@@ -1483,7 +1499,7 @@ sample-projects/.testrunner/reports/env/
 cargo run -p health-service
 ```
 
-这时如果没有设置 `DATABASE_URL`，服务仍然会启动，但 `/register` 和 `/login` 会返回 `503`；如果没有设置 `REDIS_URL`，`/login` 和 `/send-sms-code` 也会返回 `503`；如果没有可访问的短信服务地址，`/send-sms-code` 会返回 `503` 或 `502`。不过 `/health` 和 `/orders` 这两个接口不依赖外部服务，适合直接本地验证。要完整跑注册/登录/短信链路，请优先使用上面的 `test-runner` 托管方式，或自行准备 MySQL 与 Redis，并在需要时设置短信服务地址：
+这时如果没有设置 `DATABASE_URL`，服务仍然会启动，但 `/register`、`/login`、`GET /orders`、`GET /orders/{order_id}`、`PATCH /orders/{order_id}` 会返回 `503`；如果没有设置 `REDIS_URL`，`/login`、`/send-sms-code` 和 `/me` 也会返回 `503`；如果没有可访问的短信服务地址，`/send-sms-code` 会返回 `503` 或 `502`。不过 `/health` 和 `POST /orders` 不依赖外部服务，适合直接本地验证。要完整跑注册/登录/短信链路，请优先使用上面的 `test-runner` 托管方式，或自行准备 MySQL 与 Redis，并在需要时设置短信服务地址：
 
 ```bash
 DATABASE_URL=mysql://app:app@127.0.0.1:13306/app \

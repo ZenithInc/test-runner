@@ -1,0 +1,6 @@
+name: Get current user
+method: GET
+path: /me
+headers:
+  accept: application/json
+query: {}

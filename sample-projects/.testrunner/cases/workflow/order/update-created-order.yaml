@@ -1,0 +1,50 @@
+name: workflow update created order
+api: order/update
+tags:
+  - workflow
+  - order
+  - patch
+vars:
+  order_id: ORD-WORKFLOW-UPDATE
+  current_version: 1
+  expected_discount: 5000
+  updated_note: workflow-updated-note
+  seed_order: true
+setup:
+  - if: "${seed_order == true}"
+    then:
+      - sql:
+          datasource: mysql.main
+          sql: "delete from orders where id = '{{ order_id }}'"
+      - sql:
+          datasource: mysql.main
+          sql: "insert into orders (id, status, version, customer_name, customer_email, customer_tier, coupon_code, note, sku_count, item_count, subtotal, discount, shipping_fee, payable_total) values ('{{ order_id }}', 'created', {{ current_version }}, 'Workflow Order Runner', 'smoke.register@example.com', null, null, 'workflow order note', 1, 1, 6000, 0, 1200, 7200)"
+      - sql:
+          datasource: mysql.main
+          sql: "insert into order_items (order_id, line_no, sku, quantity, unit_price, line_total) values ('{{ order_id }}', 1, 'SKU-DESK', 1, 6000, 6000)"
+steps:
+  - request:
+      api: order/update
+      base_url: "${env.variables.service_base_url}"
+      path_params:
+        order_id: "{{ order_id }}"
+      body:
+        version: current_version
+        customer_tier: vip
+        coupon_code: VIP50
+        note: "{{ updated_note }}"
+    extract:
+      next_version: response.json.version
+    assert:
+      - eq: ["response.status", 200]
+      - eq: ["next_version", 2]
+      - eq: ["response.json.customer.tier", "vip"]
+      - eq: ["response.json.metadata.coupon_code", "VIP50"]
+      - eq: ["response.json.metadata.note", "updated_note"]
+      - eq: ["response.json.pricing.discount", "expected_discount"]
+teardown:
+  - if: "${seed_order == true}"
+    then:
+      - sql:
+          datasource: mysql.main
+          sql: "delete from orders where id = '{{ order_id }}'"

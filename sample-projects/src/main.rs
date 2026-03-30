@@ -5,8 +5,8 @@ use argon2::{
 };
 use axum::{
     Json, Router,
-    extract::State,
-    http::StatusCode,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -146,7 +146,8 @@ struct OrderItemRequest {
 #[derive(Debug, Serialize)]
 struct CreateOrderResponse {
     order_id: String,
-    status: &'static str,
+    status: String,
+    version: u64,
     customer: OrderCustomerResponse,
     items: Vec<OrderItemResponse>,
     pricing: OrderPricingResponse,
@@ -154,14 +155,14 @@ struct CreateOrderResponse {
     metadata: OrderMetadataResponse,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct OrderCustomerResponse {
     name: String,
     email: String,
     tier: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct OrderItemResponse {
     sku: String,
     quantity: u32,
@@ -169,7 +170,7 @@ struct OrderItemResponse {
     line_total: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct OrderPricingResponse {
     sku_count: u64,
     item_count: u64,
@@ -179,16 +180,86 @@ struct OrderPricingResponse {
     payable_total: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct OrderFlagsResponse {
     has_discount: bool,
     has_free_shipping: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct OrderMetadataResponse {
     coupon_code: Option<String>,
     note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GetOrderQuery {
+    #[serde(default)]
+    include: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListOrdersQuery {
+    #[serde(default)]
+    customer_email: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateOrderRequest {
+    version: u64,
+    #[serde(default)]
+    customer_tier: Option<String>,
+    #[serde(default)]
+    coupon_code: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OrderLookupResponse {
+    order_id: String,
+    status: String,
+    version: u64,
+    customer: OrderCustomerResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    items: Option<Vec<OrderItemResponse>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pricing: Option<OrderPricingResponse>,
+    flags: OrderFlagsResponse,
+    metadata: OrderMetadataResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct OrderSummaryResponse {
+    order_id: String,
+    status: String,
+    version: u64,
+    customer: OrderCustomerResponse,
+    pricing: OrderPricingResponse,
+    flags: OrderFlagsResponse,
+    metadata: OrderMetadataResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct ListOrdersResponse {
+    items: Vec<OrderSummaryResponse>,
+    total: u64,
+    limit: u64,
+    offset: u64,
+    has_more: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct MeResponse {
+    id: u64,
+    name: String,
+    email: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,8 +299,26 @@ struct JwtClaims {
 #[derive(Debug)]
 struct StoredUser {
     id: u64,
+    name: String,
     email: String,
     password_hash: String,
+}
+
+#[derive(Debug)]
+struct StoredOrder {
+    order_id: String,
+    status: String,
+    version: u64,
+    customer: OrderCustomerResponse,
+    items: Vec<OrderItemResponse>,
+    pricing: OrderPricingResponse,
+    metadata: OrderMetadataResponse,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OrderDetailProjection {
+    include_items: bool,
+    include_pricing: bool,
 }
 
 #[derive(Debug)]
@@ -268,12 +357,14 @@ async fn main() -> Result<()> {
     };
     let app = Router::new()
         .route("/health", get(health))
-        .route("/orders", post(create_order))
+        .route("/orders", get(list_orders).post(create_order))
+        .route("/orders/:order_id", get(get_order).patch(update_order))
         .route("/payments/provider/create", post(create_payment_via_provider))
         .route("/callbacks/payments/status", post(receive_payment_status_callback))
         .route("/register", post(register))
         .route("/login", post(login))
         .route("/send-sms-code", post(send_sms_code))
+        .route("/me", get(get_me))
         .with_state(state);
 
     println!("health-service listening on http://{host}:{port}");
@@ -291,6 +382,7 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn create_order(
+    State(state): State<AppState>,
     Json(payload): Json<CreateOrderRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let customer = normalize_order_customer(payload.customer)?;
@@ -298,20 +390,141 @@ async fn create_order(
     let coupon_code = normalize_coupon_code(payload.coupon_code);
     let note = normalize_optional_text(payload.note);
     let pricing = build_order_pricing(&items, coupon_code.as_deref(), customer.tier.as_deref())?;
+    let metadata = OrderMetadataResponse {
+        coupon_code: coupon_code.clone(),
+        note: note.clone(),
+    };
+    let order = StoredOrder {
+        order_id: issue_order_id()?,
+        status: "created".to_string(),
+        version: 1,
+        customer: customer.clone(),
+        items: items.clone(),
+        pricing: pricing.clone(),
+        metadata: metadata.clone(),
+    };
+
+    if let Some(pool) = state.database.as_ref() {
+        persist_order(pool, &order).await?;
+    }
 
     Ok((
         StatusCode::CREATED,
         Json(CreateOrderResponse {
-            order_id: issue_order_id()?,
-            status: "created",
+            order_id: order.order_id,
+            status: order.status,
+            version: order.version,
             customer,
             items,
-            flags: OrderFlagsResponse {
-                has_discount: pricing.discount > 0,
-                has_free_shipping: pricing.shipping_fee == 0,
-            },
-            metadata: OrderMetadataResponse { coupon_code, note },
+            flags: build_order_flags(&pricing),
+            metadata,
             pricing,
+        }),
+    ))
+}
+
+async fn list_orders(
+    State(state): State<AppState>,
+    Query(query): Query<ListOrdersQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(pool) = state.database.as_ref() else {
+        return Err(ApiError::service_unavailable(
+            "database is not configured; start the sample with docker compose or set DATABASE_URL",
+        ));
+    };
+
+    let customer_email = query
+        .customer_email
+        .map(normalize_email)
+        .transpose()?;
+    let status = query.status.map(normalize_order_status).transpose()?;
+    let limit = normalize_list_limit(query.limit)?;
+    let offset = u64::from(query.offset.unwrap_or(0));
+    let (orders, total) =
+        find_orders(pool, customer_email.as_deref(), status.as_deref(), limit, offset).await?;
+    let has_more = offset + (orders.len() as u64) < total;
+
+    Ok((
+        StatusCode::OK,
+        Json(ListOrdersResponse {
+            items: orders
+                .into_iter()
+                .map(|order| OrderSummaryResponse {
+                    order_id: order.order_id,
+                    status: order.status,
+                    version: order.version,
+                    customer: order.customer,
+                    pricing: order.pricing.clone(),
+                    flags: build_order_flags(&order.pricing),
+                    metadata: order.metadata,
+                })
+                .collect(),
+            total,
+            limit,
+            offset,
+            has_more,
+        }),
+    ))
+}
+
+async fn get_order(
+    State(state): State<AppState>,
+    Path(order_id): Path<String>,
+    Query(query): Query<GetOrderQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(pool) = state.database.as_ref() else {
+        return Err(ApiError::service_unavailable(
+            "database is not configured; start the sample with docker compose or set DATABASE_URL",
+        ));
+    };
+
+    let order_id = normalize_order_no(order_id)?;
+    let projection = parse_order_detail_projection(query.include.as_deref())?;
+    let Some(order) = find_order_by_id(pool, &order_id).await? else {
+        return Err(ApiError::not_found(format!("order `{order_id}` was not found")));
+    };
+
+    Ok((StatusCode::OK, Json(build_order_lookup_response(order, projection))))
+}
+
+async fn update_order(
+    State(state): State<AppState>,
+    Path(order_id): Path<String>,
+    Json(payload): Json<UpdateOrderRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Some(pool) = state.database.as_ref() else {
+        return Err(ApiError::service_unavailable(
+            "database is not configured; start the sample with docker compose or set DATABASE_URL",
+        ));
+    };
+
+    let order_id = normalize_order_no(order_id)?;
+    let order = update_order_record(pool, &order_id, payload).await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(build_order_lookup_response(
+            order,
+            OrderDetailProjection {
+                include_items: true,
+                include_pricing: true,
+            },
+        )),
+    ))
+}
+
+async fn get_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let user = authenticate_user(&state, &headers).await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(MeResponse {
+            id: user.id,
+            name: user.name,
+            email: user.email,
         }),
     ))
 }
@@ -591,11 +804,58 @@ async fn ensure_schema(pool: &MySqlPool) -> Result<()> {
     .await
     .context("failed to ensure users table exists")?;
 
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS orders (
+            id VARCHAR(64) NOT NULL PRIMARY KEY,
+            status VARCHAR(32) NOT NULL,
+            version BIGINT UNSIGNED NOT NULL,
+            customer_name VARCHAR(100) NOT NULL,
+            customer_email VARCHAR(255) NOT NULL,
+            customer_tier VARCHAR(32) NULL,
+            coupon_code VARCHAR(32) NULL,
+            note TEXT NULL,
+            sku_count BIGINT UNSIGNED NOT NULL,
+            item_count BIGINT UNSIGNED NOT NULL,
+            subtotal BIGINT UNSIGNED NOT NULL,
+            discount BIGINT UNSIGNED NOT NULL,
+            shipping_fee BIGINT UNSIGNED NOT NULL,
+            payable_total BIGINT UNSIGNED NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            KEY idx_orders_customer_email_created_at (customer_email, created_at),
+            KEY idx_orders_status_created_at (status, created_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to ensure orders table exists")?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS order_items (
+            order_id VARCHAR(64) NOT NULL,
+            line_no INT UNSIGNED NOT NULL,
+            sku VARCHAR(64) NOT NULL,
+            quantity INT UNSIGNED NOT NULL,
+            unit_price BIGINT UNSIGNED NOT NULL,
+            line_total BIGINT UNSIGNED NOT NULL,
+            PRIMARY KEY (order_id, line_no),
+            CONSTRAINT fk_order_items_order
+                FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to ensure order_items table exists")?;
+
     Ok(())
 }
 
 async fn find_user_by_email(pool: &MySqlPool, email: &str) -> Result<Option<StoredUser>, ApiError> {
-    let row = sqlx::query("SELECT id, email, password_hash FROM users WHERE email = ?")
+    let row = sqlx::query("SELECT id, name, email, password_hash FROM users WHERE email = ?")
         .bind(email)
         .fetch_optional(pool)
         .await
@@ -609,6 +869,9 @@ async fn find_user_by_email(pool: &MySqlPool, email: &str) -> Result<Option<Stor
         id: row
             .try_get("id")
             .map_err(|error| ApiError::internal(format!("failed to read user id: {error}")))?,
+        name: row
+            .try_get("name")
+            .map_err(|error| ApiError::internal(format!("failed to read user name: {error}")))?,
         email: row
             .try_get("email")
             .map_err(|error| ApiError::internal(format!("failed to read user email: {error}")))?,
@@ -616,6 +879,515 @@ async fn find_user_by_email(pool: &MySqlPool, email: &str) -> Result<Option<Stor
             ApiError::internal(format!("failed to read user password hash: {error}"))
         })?,
     }))
+}
+
+async fn persist_order(pool: &MySqlPool, order: &StoredOrder) -> Result<(), ApiError> {
+    let mut transaction = pool.begin().await.map_err(map_database_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO orders (
+            id,
+            status,
+            version,
+            customer_name,
+            customer_email,
+            customer_tier,
+            coupon_code,
+            note,
+            sku_count,
+            item_count,
+            subtotal,
+            discount,
+            shipping_fee,
+            payable_total
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&order.order_id)
+    .bind(&order.status)
+    .bind(order.version)
+    .bind(&order.customer.name)
+    .bind(&order.customer.email)
+    .bind(&order.customer.tier)
+    .bind(&order.metadata.coupon_code)
+    .bind(&order.metadata.note)
+    .bind(order.pricing.sku_count)
+    .bind(order.pricing.item_count)
+    .bind(order.pricing.subtotal)
+    .bind(order.pricing.discount)
+    .bind(order.pricing.shipping_fee)
+    .bind(order.pricing.payable_total)
+    .execute(&mut *transaction)
+    .await
+    .map_err(map_database_error)?;
+
+    for (index, item) in order.items.iter().enumerate() {
+        sqlx::query(
+            r#"
+            INSERT INTO order_items (
+                order_id,
+                line_no,
+                sku,
+                quantity,
+                unit_price,
+                line_total
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&order.order_id)
+        .bind(index as u32 + 1)
+        .bind(&item.sku)
+        .bind(item.quantity)
+        .bind(item.unit_price)
+        .bind(item.line_total)
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_database_error)?;
+    }
+
+    transaction.commit().await.map_err(map_database_error)?;
+    Ok(())
+}
+
+async fn find_order_by_id(pool: &MySqlPool, order_id: &str) -> Result<Option<StoredOrder>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            id,
+            status,
+            version,
+            customer_name,
+            customer_email,
+            customer_tier,
+            coupon_code,
+            note,
+            sku_count,
+            item_count,
+            subtotal,
+            discount,
+            shipping_fee,
+            payable_total
+        FROM orders
+        WHERE id = ?
+        "#,
+    )
+    .bind(order_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(map_database_error)?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let item_rows = sqlx::query(
+        r#"
+        SELECT sku, quantity, unit_price, line_total
+        FROM order_items
+        WHERE order_id = ?
+        ORDER BY line_no
+        "#,
+    )
+    .bind(order_id)
+    .fetch_all(pool)
+    .await
+    .map_err(map_database_error)?;
+
+    let items = item_rows
+        .into_iter()
+        .map(|item| {
+            Ok(OrderItemResponse {
+                sku: item
+                    .try_get("sku")
+                    .map_err(|error| ApiError::internal(format!("failed to read order sku: {error}")))?,
+                quantity: item.try_get("quantity").map_err(|error| {
+                    ApiError::internal(format!("failed to read order quantity: {error}"))
+                })?,
+                unit_price: item.try_get("unit_price").map_err(|error| {
+                    ApiError::internal(format!("failed to read order unit_price: {error}"))
+                })?,
+                line_total: item.try_get("line_total").map_err(|error| {
+                    ApiError::internal(format!("failed to read order line_total: {error}"))
+                })?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    Ok(Some(StoredOrder {
+        order_id: row
+            .try_get("id")
+            .map_err(|error| ApiError::internal(format!("failed to read order id: {error}")))?,
+        status: row
+            .try_get("status")
+            .map_err(|error| ApiError::internal(format!("failed to read order status: {error}")))?,
+        version: row
+            .try_get("version")
+            .map_err(|error| ApiError::internal(format!("failed to read order version: {error}")))?,
+        customer: OrderCustomerResponse {
+            name: row.try_get("customer_name").map_err(|error| {
+                ApiError::internal(format!("failed to read order customer_name: {error}"))
+            })?,
+            email: row.try_get("customer_email").map_err(|error| {
+                ApiError::internal(format!("failed to read order customer_email: {error}"))
+            })?,
+            tier: row.try_get("customer_tier").map_err(|error| {
+                ApiError::internal(format!("failed to read order customer_tier: {error}"))
+            })?,
+        },
+        items,
+        pricing: OrderPricingResponse {
+            sku_count: row
+                .try_get("sku_count")
+                .map_err(|error| ApiError::internal(format!("failed to read order sku_count: {error}")))?,
+            item_count: row.try_get("item_count").map_err(|error| {
+                ApiError::internal(format!("failed to read order item_count: {error}"))
+            })?,
+            subtotal: row
+                .try_get("subtotal")
+                .map_err(|error| ApiError::internal(format!("failed to read order subtotal: {error}")))?,
+            discount: row
+                .try_get("discount")
+                .map_err(|error| ApiError::internal(format!("failed to read order discount: {error}")))?,
+            shipping_fee: row.try_get("shipping_fee").map_err(|error| {
+                ApiError::internal(format!("failed to read order shipping_fee: {error}"))
+            })?,
+            payable_total: row.try_get("payable_total").map_err(|error| {
+                ApiError::internal(format!("failed to read order payable_total: {error}"))
+            })?,
+        },
+        metadata: OrderMetadataResponse {
+            coupon_code: row.try_get("coupon_code").map_err(|error| {
+                ApiError::internal(format!("failed to read order coupon_code: {error}"))
+            })?,
+            note: row
+                .try_get("note")
+                .map_err(|error| ApiError::internal(format!("failed to read order note: {error}")))?,
+        },
+    }))
+}
+
+async fn find_orders(
+    pool: &MySqlPool,
+    customer_email: Option<&str>,
+    status: Option<&str>,
+    limit: u64,
+    offset: u64,
+) -> Result<(Vec<StoredOrder>, u64), ApiError> {
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM orders
+        WHERE (? IS NULL OR customer_email = ?)
+          AND (? IS NULL OR status = ?)
+        "#,
+    )
+    .bind(customer_email)
+    .bind(customer_email)
+    .bind(status)
+    .bind(status)
+    .fetch_one(pool)
+    .await
+    .map_err(map_database_error)?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            id,
+            status,
+            version,
+            customer_name,
+            customer_email,
+            customer_tier,
+            coupon_code,
+            note,
+            sku_count,
+            item_count,
+            subtotal,
+            discount,
+            shipping_fee,
+            payable_total
+        FROM orders
+        WHERE (? IS NULL OR customer_email = ?)
+          AND (? IS NULL OR status = ?)
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        OFFSET ?
+        "#,
+    )
+    .bind(customer_email)
+    .bind(customer_email)
+    .bind(status)
+    .bind(status)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await
+    .map_err(map_database_error)?;
+
+    let orders = rows
+        .into_iter()
+        .map(|row| {
+            Ok(StoredOrder {
+                order_id: row
+                    .try_get("id")
+                    .map_err(|error| ApiError::internal(format!("failed to read order id: {error}")))?,
+                status: row.try_get("status").map_err(|error| {
+                    ApiError::internal(format!("failed to read order status: {error}"))
+                })?,
+                version: row.try_get("version").map_err(|error| {
+                    ApiError::internal(format!("failed to read order version: {error}"))
+                })?,
+                customer: OrderCustomerResponse {
+                    name: row.try_get("customer_name").map_err(|error| {
+                        ApiError::internal(format!("failed to read order customer_name: {error}"))
+                    })?,
+                    email: row.try_get("customer_email").map_err(|error| {
+                        ApiError::internal(format!("failed to read order customer_email: {error}"))
+                    })?,
+                    tier: row.try_get("customer_tier").map_err(|error| {
+                        ApiError::internal(format!("failed to read order customer_tier: {error}"))
+                    })?,
+                },
+                items: Vec::new(),
+                pricing: OrderPricingResponse {
+                    sku_count: row.try_get("sku_count").map_err(|error| {
+                        ApiError::internal(format!("failed to read order sku_count: {error}"))
+                    })?,
+                    item_count: row.try_get("item_count").map_err(|error| {
+                        ApiError::internal(format!("failed to read order item_count: {error}"))
+                    })?,
+                    subtotal: row.try_get("subtotal").map_err(|error| {
+                        ApiError::internal(format!("failed to read order subtotal: {error}"))
+                    })?,
+                    discount: row.try_get("discount").map_err(|error| {
+                        ApiError::internal(format!("failed to read order discount: {error}"))
+                    })?,
+                    shipping_fee: row.try_get("shipping_fee").map_err(|error| {
+                        ApiError::internal(format!("failed to read order shipping_fee: {error}"))
+                    })?,
+                    payable_total: row.try_get("payable_total").map_err(|error| {
+                        ApiError::internal(format!("failed to read order payable_total: {error}"))
+                    })?,
+                },
+                metadata: OrderMetadataResponse {
+                    coupon_code: row.try_get("coupon_code").map_err(|error| {
+                        ApiError::internal(format!("failed to read order coupon_code: {error}"))
+                    })?,
+                    note: row.try_get("note").map_err(|error| {
+                        ApiError::internal(format!("failed to read order note: {error}"))
+                    })?,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+
+    Ok((orders, total.max(0) as u64))
+}
+
+async fn update_order_record(
+    pool: &MySqlPool,
+    order_id: &str,
+    payload: UpdateOrderRequest,
+) -> Result<StoredOrder, ApiError> {
+    if payload.customer_tier.is_none() && payload.coupon_code.is_none() && payload.note.is_none() {
+        return Err(ApiError::bad_request(
+            "at least one of customer_tier, coupon_code, or note must be provided",
+        ));
+    }
+
+    let Some(current_order) = find_order_by_id(pool, order_id).await? else {
+        return Err(ApiError::not_found(format!("order `{order_id}` was not found")));
+    };
+
+    if payload.version != current_order.version {
+        return Err(ApiError::conflict(format!(
+            "order `{order_id}` version mismatch: expected {}, got {}",
+            current_order.version, payload.version
+        )));
+    }
+
+    let customer_tier = if let Some(value) = payload.customer_tier {
+        normalize_customer_tier(Some(value))
+    } else {
+        current_order.customer.tier.clone()
+    };
+    let coupon_code = if let Some(value) = payload.coupon_code {
+        normalize_coupon_code(Some(value))
+    } else {
+        current_order.metadata.coupon_code.clone()
+    };
+    let note = if let Some(value) = payload.note {
+        normalize_optional_text(Some(value))
+    } else {
+        current_order.metadata.note.clone()
+    };
+    let pricing = build_order_pricing(
+        &current_order.items,
+        coupon_code.as_deref(),
+        customer_tier.as_deref(),
+    )?;
+    let version = current_order.version + 1;
+
+    let updated = sqlx::query(
+        r#"
+        UPDATE orders
+        SET
+            version = ?,
+            customer_tier = ?,
+            coupon_code = ?,
+            note = ?,
+            sku_count = ?,
+            item_count = ?,
+            subtotal = ?,
+            discount = ?,
+            shipping_fee = ?,
+            payable_total = ?
+        WHERE id = ? AND version = ?
+        "#,
+    )
+    .bind(version)
+    .bind(&customer_tier)
+    .bind(&coupon_code)
+    .bind(&note)
+    .bind(pricing.sku_count)
+    .bind(pricing.item_count)
+    .bind(pricing.subtotal)
+    .bind(pricing.discount)
+    .bind(pricing.shipping_fee)
+    .bind(pricing.payable_total)
+    .bind(order_id)
+    .bind(current_order.version)
+    .execute(pool)
+    .await
+    .map_err(map_database_error)?;
+
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::conflict(format!(
+            "order `{order_id}` version changed while applying the update"
+        )));
+    }
+
+    Ok(StoredOrder {
+        order_id: current_order.order_id,
+        status: current_order.status,
+        version,
+        customer: OrderCustomerResponse {
+            tier: customer_tier,
+            ..current_order.customer
+        },
+        items: current_order.items,
+        pricing,
+        metadata: OrderMetadataResponse { coupon_code, note },
+    })
+}
+
+fn build_order_lookup_response(
+    order: StoredOrder,
+    projection: OrderDetailProjection,
+) -> OrderLookupResponse {
+    let pricing = order.pricing.clone();
+    OrderLookupResponse {
+        order_id: order.order_id,
+        status: order.status,
+        version: order.version,
+        customer: order.customer,
+        items: projection.include_items.then_some(order.items),
+        pricing: projection.include_pricing.then_some(pricing.clone()),
+        flags: build_order_flags(&pricing),
+        metadata: order.metadata,
+    }
+}
+
+fn build_order_flags(pricing: &OrderPricingResponse) -> OrderFlagsResponse {
+    OrderFlagsResponse {
+        has_discount: pricing.discount > 0,
+        has_free_shipping: pricing.shipping_fee == 0,
+    }
+}
+
+fn parse_order_detail_projection(include: Option<&str>) -> Result<OrderDetailProjection, ApiError> {
+    let Some(include) = include.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(OrderDetailProjection {
+            include_items: false,
+            include_pricing: false,
+        });
+    };
+
+    let mut projection = OrderDetailProjection {
+        include_items: false,
+        include_pricing: false,
+    };
+
+    for field in include.split(',').map(str::trim).filter(|field| !field.is_empty()) {
+        match field {
+            "all" => {
+                projection.include_items = true;
+                projection.include_pricing = true;
+            }
+            "items" => projection.include_items = true,
+            "pricing" => projection.include_pricing = true,
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "unsupported include field `{other}`; expected items, pricing, or all"
+                )))
+            }
+        }
+    }
+
+    Ok(projection)
+}
+
+fn normalize_list_limit(limit: Option<u32>) -> Result<u64, ApiError> {
+    let limit = limit.unwrap_or(20);
+    if !(1..=50).contains(&limit) {
+        return Err(ApiError::bad_request(
+            "limit must be between 1 and 50 inclusive",
+        ));
+    }
+
+    Ok(u64::from(limit))
+}
+
+fn normalize_order_status(value: String) -> Result<String, ApiError> {
+    let status = value.trim().to_ascii_lowercase();
+    match status.as_str() {
+        "" => Err(ApiError::bad_request("status is required")),
+        "created" => Ok(status),
+        _ => Err(ApiError::bad_request(format!(
+            "status `{status}` is not supported"
+        ))),
+    }
+}
+
+async fn authenticate_user(state: &AppState, headers: &HeaderMap) -> Result<StoredUser, ApiError> {
+    let Some(pool) = state.database.as_ref() else {
+        return Err(ApiError::service_unavailable(
+            "database is not configured; start the sample with docker compose or set DATABASE_URL",
+        ));
+    };
+    let Some(redis) = state.redis.as_ref() else {
+        return Err(ApiError::service_unavailable(
+            "redis is not configured; start the sample with docker compose or set REDIS_URL",
+        ));
+    };
+
+    let authorization = headers
+        .get(AUTHORIZATION)
+        .ok_or_else(|| ApiError::unauthorized("missing Authorization header"))?
+        .to_str()
+        .map_err(|_| ApiError::unauthorized("Authorization header must be valid UTF-8"))?;
+    let access_token = authorization
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::unauthorized("Authorization header must use Bearer token"))?;
+    let email = find_email_for_token(redis, access_token)
+        .await?
+        .ok_or_else(|| ApiError::unauthorized("invalid or expired access token"))?;
+
+    find_user_by_email(pool, &email)
+        .await?
+        .ok_or_else(|| ApiError::unauthorized("invalid or expired access token"))
 }
 
 async fn store_token(
@@ -639,6 +1411,23 @@ async fn store_token(
         .map_err(|error| ApiError::internal(format!("failed to store token in redis: {error}")))?;
 
     Ok(())
+}
+
+async fn find_email_for_token(
+    client: &redis::Client,
+    access_token: &str,
+) -> Result<Option<String>, ApiError> {
+    let key = token_key(access_token);
+    let mut connection = client
+        .get_multiplexed_tokio_connection()
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to open redis connection: {error}")))?;
+
+    redis::cmd("GET")
+        .arg(&key)
+        .query_async(&mut connection)
+        .await
+        .map_err(|error| ApiError::internal(format!("failed to read token from redis: {error}")))
 }
 
 async fn store_verification_code(
@@ -878,7 +1667,13 @@ fn generate_verification_code() -> Result<String, ApiError> {
 }
 
 fn issue_order_id() -> Result<String, ApiError> {
-    Ok(format!("ORD-{}", current_timestamp_millis()?))
+    Ok(format!(
+        "ORD-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .map_err(|error| ApiError::internal(format!("failed to read system clock: {error}")))?
+    ))
 }
 
 fn token_key(access_token: &str) -> String {
@@ -1145,6 +1940,10 @@ fn map_database_error(error: sqlx::Error) -> ApiError {
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, message)
     }
 
     fn unauthorized(message: impl Into<String>) -> Self {

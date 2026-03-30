@@ -138,18 +138,25 @@ async fn sample_project_all_cases_pass() {
         ])
         .assert()
         .success()
-        .stdout(contains("==> Running 12 case(s) for all cases in env `it`"))
-        .stdout(contains("Cases: 12 passed, 0 failed, 12 total"))
+        .stdout(contains("==> Running 22 case(s) for all cases in env `it`"))
+        .stdout(contains("Cases: 22 passed, 0 failed, 22 total"))
         .stdout(contains("callback/direct-payment-success"))
         .stdout(contains("payment/provider-callback-via-mock"))
         .stdout(contains("system/health/smoke"))
         .stdout(contains("order/create/expression-happy-path"))
+        .stdout(contains("order/get/happy-path"))
+        .stdout(contains("order/list/filter-pagination"))
+        .stdout(contains("order/update/happy-path"))
         .stdout(contains("user/send-sms-code/happy-path"))
         .stdout(contains("user/register/happy-path"))
         .stdout(contains("user/login/happy-path"))
         .stdout(contains("user/login/invalid-sms-code"))
+        .stdout(contains("user/me/happy-path"))
+        .stdout(contains("workflow/user/me-after-login"))
         .stdout(contains("workflow/user/login-after-register"))
-        .stdout(contains("workflow/order/create-after-login"));
+        .stdout(contains("workflow/order/create-after-login"))
+        .stdout(contains("workflow/order/get-created-order"))
+        .stdout(contains("workflow/order/update-created-order"));
 }
 
 #[tokio::test]
@@ -250,7 +257,7 @@ fn sample_project_dry_run_lists_all_cases() {
         ])
         .assert()
         .success()
-        .stdout(contains("Selected 12 case(s)"));
+        .stdout(contains("Selected 22 case(s)"));
 }
 
 #[test]
@@ -288,7 +295,10 @@ fn workflow_dry_run_lists_register_login_create_order_steps() {
         .stdout(contains("register"))
         .stdout(contains("send-sms"))
         .stdout(contains("login"))
-        .stdout(contains("create-order"));
+        .stdout(contains("current-profile"))
+        .stdout(contains("create-order"))
+        .stdout(contains("get-order"))
+        .stdout(contains("update-order"));
 }
 
 #[test]
@@ -539,9 +549,18 @@ async fn sample_project_register_login_create_order_workflow_passes() {
             "PASS [3] login -> workflow/user/login-after-register",
         ))
         .stdout(contains(
-            "PASS [4] create-order -> workflow/order/create-after-login",
+            "PASS [4] current-profile -> workflow/user/me-after-login",
         ))
-        .stdout(contains("Steps: 4 passed, 0 failed, 4 total"));
+        .stdout(contains(
+            "PASS [5] create-order -> workflow/order/create-after-login",
+        ))
+        .stdout(contains(
+            "PASS [6] get-order -> workflow/order/get-created-order",
+        ))
+        .stdout(contains(
+            "PASS [7] update-order -> workflow/order/update-created-order",
+        ))
+        .stdout(contains("Steps: 7 passed, 0 failed, 7 total"));
 }
 
 #[tokio::test]
@@ -674,9 +693,18 @@ fn sample_project_docker_env_managed_workflow_collects_environment_logs() {
             "PASS [3] login -> workflow/user/login-after-register",
         ))
         .stdout(contains(
-            "PASS [4] create-order -> workflow/order/create-after-login",
+            "PASS [4] current-profile -> workflow/user/me-after-login",
         ))
-        .stdout(contains("Steps: 4 passed, 0 failed, 4 total"))
+        .stdout(contains(
+            "PASS [5] create-order -> workflow/order/create-after-login",
+        ))
+        .stdout(contains(
+            "PASS [6] get-order -> workflow/order/get-created-order",
+        ))
+        .stdout(contains(
+            "PASS [7] update-order -> workflow/order/update-created-order",
+        ))
+        .stdout(contains("Steps: 7 passed, 0 failed, 7 total"))
         .stdout(contains("Logs: 3 collected, 0 failed"));
 
     let report =

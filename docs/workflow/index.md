@@ -257,13 +257,17 @@ sample-projects/.testrunner/workflows/register-login-create-order.yaml
 1. `user/register/happy-path`
 2. `user/send-sms-code/happy-path`
 3. `workflow/user/login-after-register`
-4. `workflow/order/create-after-login`
+4. `workflow/user/me-after-login`
+5. `workflow/order/create-after-login`
+6. `workflow/order/get-created-order`
+7. `workflow/order/update-created-order`
 
-这条流程验证了四件事：
+这条流程现在会把“登录后的 header 鉴权”和“订单读写”也串进来：
 
 - register 产生的用户副作用可以被后续 login 复用
 - send-sms 产生的验证码副作用可以被后续 login 复用
-- login 产生的 token 副作用在 create-order 前仍然可见
+- login 产生的 token 既能给 `/me` 的 Authorization header 用，也能继续传给后续下单 case
+- create-order 导出的 `order_id` / `order_version` 可以继续传给后续 `GET /orders/{order_id}` 和 `PATCH /orders/{order_id}`
 - workflow 结束后，deferred teardown 会把这些副作用统一清理掉
 
 运行方式：

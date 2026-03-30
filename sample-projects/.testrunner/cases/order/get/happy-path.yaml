@@ -1,0 +1,56 @@
+name: get order happy path
+api: order/get
+tags:
+  - order
+  - db
+  - query
+setup:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from orders where customer_email = 'lookup.order@example.com'"
+steps:
+  - request:
+      api: order/create
+      base_url: "${env.variables.service_base_url}"
+      body:
+        customer:
+          name: " Lookup Runner "
+          email: lookup.order@example.com
+          tier: vip
+        items:
+          - sku: SKU-BOOK
+            quantity: 1
+            unit_price: 4500
+          - sku: SKU-PEN
+            quantity: 2
+            unit_price: 1200
+        coupon_code: SAVE10
+        note: " first lookup "
+    extract:
+      order_id: response.json.order_id
+    assert:
+      - eq: ["response.status", 201]
+      - eq: ["response.json.version", 1]
+  - request:
+      api: order/get
+      base_url: "${env.variables.service_base_url}"
+      path_params:
+        order_id: "{{ order_id }}"
+      query:
+        include: items,pricing
+    assert:
+      - eq: ["response.status", 200]
+      - contains: ["response.headers.content-type", "application/json"]
+      - eq: ["response.json.order_id", "order_id"]
+      - eq: ["response.json.version", 1]
+      - eq: ["response.json.customer.email", "lookup.order@example.com"]
+      - eq: ["response.json.metadata.note", "first lookup"]
+      - eq: ["response.json.metadata.coupon_code", "SAVE10"]
+      - eq: ["len(response.json.items)", 2]
+      - eq: ["response.json.pricing.subtotal", 6900]
+      - eq: ["response.json.pricing.discount", 690]
+      - eq: ["response.json.flags.has_free_shipping", true]
+teardown:
+  - sql:
+      datasource: mysql.main
+      sql: "delete from orders where customer_email = 'lookup.order@example.com'"
