@@ -14,14 +14,14 @@ const base =
 export default defineConfig({
   base,
   title: 'test-runner',
-  description: '面向 HTTP 服务的 Rust 集成测试 CLI 文档',
+  description: '面向内部 AI / Agent 生成与执行闭环的 HTTP 集成测试 CLI 文档',
   lang: 'zh-CN',
   lastUpdated: true,
   themeConfig: {
     nav: [
       { text: '快速开始', link: '/guide/getting-started' },
       { text: '命令行', link: '/guide/cli' },
-      { text: 'Schema', link: '/guide/schema' },
+      { text: 'AI / Agent', link: '/guide/schema' },
       { text: 'DSL', link: '/guide/dsl' },
       {
         text: '专题',
@@ -40,7 +40,7 @@ export default defineConfig({
           items: [
             { text: '快速开始', link: '/guide/getting-started' },
             { text: '命令行使用', link: '/guide/cli' },
-            { text: 'Schema 与 Agent 校验', link: '/guide/schema' },
+            { text: '面向 AI / Agent 的生成与校验', link: '/guide/schema' },
             { text: '项目结构', link: '/guide/project-structure' },
             { text: '配置文件', link: '/guide/configuration' },
             { text: '环境 DSL', link: '/guide/environment-dsl' },

@@ -13,6 +13,15 @@ test-runner test workflow <WORKFLOW_ID>
 test-runner test workflow --all
 ```
 
+如果你的主要场景是 **AI / Agent 自动生成 DSL**，最常用的一组命令通常不是单独某一条，而是这四步：
+
+1. `test-runner schema ...`
+2. 本地 schema 校验
+3. `test-runner test ... --dry-run`
+4. `test-runner test ... --report-format json`
+
+也就是说，CLI 在这里不仅负责“执行测试”，也负责给 Agent 提供**结构约束、执行计划和结构化反馈**。
+
 ## `init`
 
 ```bash

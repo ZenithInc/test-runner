@@ -4,6 +4,18 @@ workflow 是 `test-runner` 在 case 之上增加的一层编排能力。
 
 如果 case 解决的是“如何验证一个接口/一组步骤”，那么 workflow 解决的是“如何把多个 case 串成一个完整业务流程”。
 
+从 **AI / Agent-first** 的角度看，workflow 还有一个很重要的作用：把跨 case 的依赖关系显式写出来，而不是让 Agent 靠隐式上下文去猜。
+
+这也是为什么 workflow 只暴露少量稳定概念：
+
+- `run_case`
+- `inputs`
+- `exports`
+- `cleanup`
+- `workflow.steps.<id>.*`
+
+对 Agent 来说，这些字段比“直接读取前一个 case 的全部内部状态”更容易生成，也更容易在失败后修复。
+
 典型场景：
 
 - 先注册，再登录，再下单

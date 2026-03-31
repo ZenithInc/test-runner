@@ -2,6 +2,13 @@
 
 `test-runner` 是一个用 Rust 编写的 CLI，目标是为以 HTTP 接口为核心的服务提供统一的集成测试入口。
 
+这个项目默认按 **AI / Agent-first** 的方式设计：YAML DSL 并不主要面向“人手写”，而是面向内部 Agent 去**生成、验证、执行、回看报告并继续修复**。
+
+所以阅读这份文档时，推荐把它理解成两层：
+
+- 对人：帮助你理解目录结构、运行语义和排错方式
+- 对 Agent：提供稳定的 schema、示例和执行反馈闭环
+
 文档里的命令默认写成 `test-runner ...`。如果你当前是在仓库里开发它，可以直接替换成：
 
 ```bash
@@ -148,15 +155,18 @@ test-runner test workflow register-login-create-order --root sample-projects --e
 - `--jobs N` 可以单独使用；它本身就会请求并行调度，不一定非要再显式写一个 `--parallel`
 - 如果应用通过容器环境变量读取 mock / provider URL，把占位地址显式写到 `runtime.services[*].env`；并行 + 内嵌 mock 时，运行器会自动改写到当前 slot 的实际端口
 
-## 一个推荐的接入顺序
+## 一个推荐的 Agent-first 接入顺序
 
-如果你是第一次给项目接入 `test-runner`，可以按这个顺序推进：
+如果你是第一次给项目接入 `test-runner`，而且希望 DSL 主要由 Agent 生成，推荐按这个顺序推进：
 
 1. 用 `init` 生成基础结构。
-2. 先只保留一个最小的健康检查 API 和 smoke case。
-3. 用 `test all --dry-run` 确认用例选择结果。
-4. 跑通单 API 的 smoke case。
-5. 再逐步补上数据库、Redis、Mock 和更复杂的断言。
+2. 立即导出 `schema`，把结构约束提供给 Agent。
+3. 先只保留一个最小的健康检查 API 和 smoke case。
+4. 用 `test all --dry-run` 确认用例选择结果。
+5. 跑通单 API 的 smoke case。
+6. 再逐步补上数据库、Redis、Mock、workflow 和更复杂的断言。
+
+如果你是人工辅助 Agent 迭代，一般不要一开始就让它直接生成复杂 workflow；先从单 case 跑通，再逐步引入 `extract`、`inputs`、`exports` 和 `cleanup`。
 
 ## 下一步推荐阅读
 

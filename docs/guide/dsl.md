@@ -6,6 +6,14 @@
 .testrunner/cases/**/*.yaml
 ```
 
+这套 DSL 的目标不是“追求人手敲起来最省事”，而是追求：
+
+- **形状稳定**，方便 Agent 按 schema 生成
+- **语义明确**，方便 Agent 从错误信息里自修
+- **上下文可预测**，避免 workflow / case 之间出现隐式耦合
+
+如果你当前的主要使用方式是让 Agent 自动生成 YAML，推荐把这一页和 [面向 AI / Agent 的生成与校验](/guide/schema) 一起看。
+
 ## Case 顶层结构
 
 ```yaml

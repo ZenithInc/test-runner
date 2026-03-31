@@ -2,6 +2,14 @@
 
 这一页用仓库里已经存在的 `sample-projects/` 作为参考，展示一条最小链路、一条偏 DSL 表达式的下单链路、一条更完整的登录链路，以及一条跨 case 的 workflow。
 
+如果你的主要场景是让 AI / Agent 自动生成 DSL，那么这页不只是“示例”，也是一份可以直接被检索、few-shot 或 prompt 复用的**参考语料库**。
+
+推荐做法：
+
+1. 先让 Agent 读取对应的 schema
+2. 再把这一页或 `sample-projects/.testrunner/` 里最相近的样例片段提供给它
+3. 最后再附上当前项目自己的 API / env / datasource 约束
+
 ## 最小健康检查示例
 
 API 定义：

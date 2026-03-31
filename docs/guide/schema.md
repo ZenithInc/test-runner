@@ -1,6 +1,14 @@
-# Schema 与 Agent 校验
+# 面向 AI / Agent 的生成与校验
 
-如果你的用例、workflow 或配置文件主要由 AI Agent 生成，推荐把 **JSON Schema 校验** 放到真正执行之前。
+如果你的用例、workflow 或配置文件主要由 AI Agent 生成，这一页应该被当成**第一入口**，而不是补充材料。
+
+`test-runner` 的一个核心定位是：
+
+- **YAML DSL 主要给 Agent 生成**
+- **CLI 负责执行、报告和纠错反馈**
+- **文档和样例负责给 Agent 提供稳定约束与参考语料**
+
+因此，推荐把 **JSON Schema 校验** 放到真正执行之前。
 
 `test-runner` 现在提供了一个一等命令：
 
@@ -67,6 +75,13 @@ test-runner schema all --output .testrunner/schema
 
 这样 Agent 会先拿到**结构约束**，再拿到**选择计划**，最后拿到**运行结果**，比直接靠自然语言猜 DSL 可靠得多。
 
+如果你在做提示词或编排层，推荐把下面几类信息一起喂给 Agent：
+
+1. 对应的 schema 文档
+2. `sample-projects/.testrunner/` 里的相近样例
+3. 当前失败报告里的 JSON / 错误信息
+4. 少量项目级约定，例如命名、目录组织和环境切换方式
+
 ## Schema 覆盖什么，不覆盖什么
 
 JSON Schema 主要负责：
@@ -86,3 +101,4 @@ JSON Schema **不负责** 完整表达运行期语义，例如：
 
 - [DSL 语法](/guide/dsl)
 - [工作流使用说明](/workflow/)
+- [示例与最佳实践](/guide/examples)
