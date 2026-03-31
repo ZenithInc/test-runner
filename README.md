@@ -179,6 +179,7 @@ CLI 当前的顶层命令如下：
 
 ```text
 test-runner init
+test-runner schema [KIND]
 test-runner web
 test-runner test api <API_ID>
 test-runner test dir <DIR>
@@ -201,7 +202,20 @@ test-runner init [OPTIONS]
 - `--with-mock <true|false>`：是否生成 Mock 服务模板，默认 `true`。
 
 
-### 2.2 `web`
+### 2.2 `schema`
+
+```bash
+test-runner schema [KIND] [--output <PATH>]
+```
+
+语义：
+
+- 生成 `.testrunner` DSL / 配置文件对应的 JSON Schema，适合给 AI Agent、编辑器插件或外部校验器使用。
+- `KIND` 支持 `all`（默认）、`project`、`environment`、`datasources`、`api`、`case`、`workflow`、`mock-route`。
+- 不传 `--output` 时输出到 stdout；`schema all --output <DIR>` 会批量写出 `*.schema.json` 文件。
+
+
+### 2.3 `web`
 
 ```bash
 test-runner web [OPTIONS]
@@ -219,7 +233,7 @@ test-runner web [OPTIONS]
 - 执行日志会以流的方式实时显示在页面上。
 
 
-### 2.3 `test api`
+### 2.4 `test api`
 
 ```bash
 test-runner test api [OPTIONS] <API_ID>
@@ -230,7 +244,7 @@ test-runner test api [OPTIONS] <API_ID>
 - 运行所有 `case.api == <API_ID>` 的测试用例。
 
 
-### 2.4 `test dir`
+### 2.5 `test dir`
 
 ```bash
 test-runner test dir [OPTIONS] <DIR>
@@ -243,7 +257,7 @@ test-runner test dir [OPTIONS] <DIR>
   - 用例文件相对路径以 `<DIR>` 开头
 
 
-### 2.5 `test all`
+### 2.6 `test all`
 
 ```bash
 test-runner test all [OPTIONS]
@@ -255,7 +269,7 @@ test-runner test all [OPTIONS]
 - **V1 中不包含工作流（workflow）**；工作流需要通过 `test workflow` 单独触发。
 
 
-### 2.6 `test workflow`
+### 2.7 `test workflow`
 
 ```bash
 test-runner test workflow [OPTIONS] <WORKFLOW_ID>
@@ -280,7 +294,7 @@ test-runner test workflow auth-flow --dry-run --root /path/to/your-project
 ```
 
 
-### 2.7 `test` 共有参数
+### 2.8 `test` 共有参数
 
 下面这些参数适用于 `test api` / `test dir` / `test all` / `test workflow`：
 

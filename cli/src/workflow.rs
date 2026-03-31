@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use serde_yaml::{Mapping, Value as YamlValue};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct WorkflowFile {
     pub name: String,
     #[serde(default)]
@@ -22,7 +22,7 @@ pub enum WorkflowStep {
     Conditional(WorkflowConditionalStep),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct RunCaseStep {
     pub id: String,
     #[serde(rename = "case")]
@@ -35,7 +35,7 @@ pub struct RunCaseStep {
     pub cleanup: CleanupPolicy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupPolicy {
     #[default]
@@ -43,6 +43,8 @@ pub enum CleanupPolicy {
     Defer,
     Skip,
 }
+
+const WORKFLOW_STEP_KEYS: &[&str] = &["run_case", "if"];
 
 #[derive(Debug, Clone)]
 pub struct WorkflowConditionalStep {
@@ -89,11 +91,23 @@ fn validate_steps(steps: &[WorkflowStep], ids: &mut IndexSet<String>) -> Result<
     Ok(())
 }
 
- 
 fn parse_workflow_step(value: YamlValue) -> Result<WorkflowStep> {
     let mapping = value
         .as_mapping()
         .ok_or_else(|| anyhow::anyhow!("workflow step entries must be YAML mappings"))?;
+
+    let present_keys = WORKFLOW_STEP_KEYS
+        .iter()
+        .filter(|key| get_value(mapping, key).is_some())
+        .map(|key| (*key).to_string())
+        .collect::<Vec<_>>();
+    if present_keys.len() > 1 {
+        bail!(
+            "workflow step entries must contain exactly one primary key, found [{}]; supported keys: [{}]",
+            present_keys.join(", "),
+            WORKFLOW_STEP_KEYS.join(", ")
+        );
+    }
 
     if let Some(raw) = get_value(mapping, "run_case") {
         let step: RunCaseStep = serde_yaml::from_value(raw.clone())?;
@@ -107,7 +121,7 @@ fn parse_workflow_step(value: YamlValue) -> Result<WorkflowStep> {
     // 如果 hash 不一样,就在 .case_versions 下创建一个新的版本,版本号递增
     // 但是这样会带到版本冲突的问题
     // 多人合作中,你不知道两个不同的 case 的修改时间, 就不知道哪一个 case 版本更早
-    
+
     // 关于探针的问题, 在 Rust 这一侧是好做的,但是 PHP 呢?
     // 比如数据库中的变化, Event 如记录?
     // Database 可以在 ORM 的 Hook 中加入日志
@@ -128,7 +142,19 @@ fn parse_workflow_step(value: YamlValue) -> Result<WorkflowStep> {
         }));
     }
 
-    bail!("unsupported workflow step shape: {value:?}")
+    let keys = mapping
+        .keys()
+        .filter_map(|key| key.as_str().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    let key_summary = if keys.is_empty() {
+        "no keys found".to_string()
+    } else {
+        format!("found keys [{}]", keys.join(", "))
+    };
+    bail!(
+        "unsupported workflow step shape ({key_summary}); expected exactly one of [{}]. `if` uses `then` / `else`",
+        WORKFLOW_STEP_KEYS.join(", ")
+    )
 }
 
 fn get_value<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a YamlValue> {

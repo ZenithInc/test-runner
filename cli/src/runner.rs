@@ -1060,7 +1060,9 @@ impl Runner {
         };
         for (key, value) in &workflow.definition.vars {
             let workflow_runtime = build_workflow_runtime(&self.project, &state)?;
-            let resolved = workflow_runtime.resolve_value(value)?;
+            let resolved = workflow_runtime
+                .resolve_value(value)
+                .with_context(|| format!("failed to resolve workflow var `{key}`"))?;
             state.vars.insert(key.clone(), resolved);
         }
 
@@ -1173,7 +1175,17 @@ impl Runner {
                         let resolved_inputs: IndexMap<String, Value> = run_case
                             .inputs
                             .iter()
-                            .map(|(key, value)| Ok((key.clone(), wf_runtime.resolve_value(value)?)))
+                            .map(|(key, value)| {
+                                Ok((
+                                    key.clone(),
+                                    wf_runtime.resolve_value(value).with_context(|| {
+                                        format!(
+                                            "workflow step `{}` failed to resolve input `{key}`",
+                                            run_case.id
+                                        )
+                                    })?,
+                                ))
+                            })
                             .collect::<Result<_>>()?;
 
                         let case = self
@@ -1232,7 +1244,14 @@ impl Runner {
                     }
                     WorkflowStep::Conditional(cond) => {
                         let wf_runtime = build_workflow_runtime(&self.project, state)?;
-                        let condition = wf_runtime.evaluate_condition(&cond.condition)?;
+                        let condition = wf_runtime
+                            .evaluate_condition(&cond.condition)
+                            .with_context(|| {
+                                format!(
+                                    "workflow conditional step failed to evaluate `{}`",
+                                    cond.condition
+                                )
+                            })?;
                         let branch = if condition {
                             &cond.then_steps
                         } else {
@@ -1348,7 +1367,14 @@ impl Runner {
         let exports = if case_error.is_none() {
             match export_specs
                 .iter()
-                .map(|(name, path)| Ok((name.clone(), context.evaluate_expr_value(path)?)))
+                .map(|(name, path)| {
+                    Ok((
+                        name.clone(),
+                        context.evaluate_expr_value(path).with_context(|| {
+                            format!("failed to resolve workflow export `{name}` from `{path}`")
+                        })?,
+                    ))
+                })
                 .collect::<Result<serde_json::Map<_, _>>>()
             {
                 Ok(exports) => exports,
@@ -1649,8 +1675,10 @@ impl Runner {
         let response = self.execute_request(&step.request, context).await?;
         context.set_response(response.clone());
         context.set_result(response.clone());
-        context.apply_extracts(&step.extract)?;
-        apply_assertions(&step.assertions, context)?;
+        context
+            .apply_extracts(&step.extract)
+            .context("request extract failed")?;
+        apply_assertions(&step.assertions, context).context("request assertions failed")?;
         reports.push(StepReport {
             kind: "request".to_string(),
             status: "passed".to_string(),
@@ -1726,8 +1754,10 @@ impl Runner {
             .query_database(&step.query.datasource, &rendered)
             .await?;
         context.set_result(result.clone());
-        context.apply_extracts(&step.extract)?;
-        apply_assertions(&step.assertions, context)?;
+        context
+            .apply_extracts(&step.extract)
+            .context("query_db extract failed")?;
+        apply_assertions(&step.assertions, context).context("query_db assertions failed")?;
         reports.push(StepReport {
             kind: "query_db".to_string(),
             status: "passed".to_string(),
@@ -1750,8 +1780,10 @@ impl Runner {
             .execute_redis_command(&step.query.datasource, &step.query.command, &args)
             .await?;
         context.set_result(json!({ "value": result.clone() }));
-        context.apply_extracts(&step.extract)?;
-        apply_assertions(&step.assertions, context)?;
+        context
+            .apply_extracts(&step.extract)
+            .context("query_redis extract failed")?;
+        apply_assertions(&step.assertions, context).context("query_redis assertions failed")?;
         reports.push(StepReport {
             kind: "query_redis".to_string(),
             status: "passed".to_string(),
@@ -1769,7 +1801,9 @@ impl Runner {
         reports: &mut Vec<StepReport>,
     ) -> Result<()> {
         let started = Instant::now();
-        let condition = context.evaluate_condition(&step.condition)?;
+        let condition = context
+            .evaluate_condition(&step.condition)
+            .with_context(|| format!("failed to evaluate if condition `{}`", step.condition))?;
         reports.push(StepReport {
             kind: "if".to_string(),
             status: "passed".to_string(),
@@ -1794,7 +1828,14 @@ impl Runner {
         reports: &mut Vec<StepReport>,
     ) -> Result<()> {
         let started = Instant::now();
-        let values = context.resolve_value(&Value::String(step.expression.clone()))?;
+        let values = context
+            .resolve_value(&Value::String(step.expression.clone()))
+            .with_context(|| {
+                format!(
+                    "failed to evaluate foreach expression `{}`",
+                    step.expression
+                )
+            })?;
         let Some(items) = values.as_array().cloned() else {
             bail!(
                 "foreach expression {} did not resolve to an array",

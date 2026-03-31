@@ -171,6 +171,13 @@ inputs:
 - if: "${workflow.steps.login.passed}"
 ```
 
+### workflow 变量的求值与可见性
+
+- `workflow.vars` 会在 workflow 开始时按声明顺序依次求值。
+- 后定义的 workflow 变量可以引用前面已经成功解析的 `workflow.vars.*`。
+- `workflow.steps.<id>.*` 只有在对应 `run_case` 执行完成后才可见；在那之前不能引用它的 `exports` 或 `passed`。
+- workflow 运行时可访问的根对象只有 `workflow`、`env`、`project`、`data`；它不会直接暴露某个 case 的内部 `vars.*`。
+
 ## `inputs` 和 `exports` 怎么配合
 
 推荐把 workflow 当成“显式传值”的编排层，而不是直接依赖某个 case 的内部细节。
@@ -198,6 +205,16 @@ inputs:
 ```
 
 这样 workflow 只依赖导出的公共契约，而不是直接耦合前一个 case 的全部运行时上下文。
+
+### `inputs` 覆盖 case `vars` 的规则
+
+`run_case.inputs` 会先在 workflow 上下文里求值，然后在 case 启动前注入到该 case 的 `vars.*`。
+
+这意味着：
+
+- `inputs` 的优先级高于 case 文件顶层的 `vars`
+- case 顶层 `vars` 只会补齐“还没有被 `inputs` 提供”的变量
+- 如果你希望 workflow 显式控制某个变量，优先通过 `inputs` 传入，不要依赖 case 内部默认值
 
 ## cleanup 策略
 

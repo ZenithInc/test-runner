@@ -57,6 +57,16 @@ teardown: []
 - `result.rows[0].status`
 - `result.value`
 
+### 作用域与覆盖顺序
+
+- `env`、`project`、`case`、`api`、`data`、`response`、`result` 是运行时根对象。
+- 路径解析时，会先找这些根对象，再回退到 `vars.*`。如果你把变量名起成 `response`、`result` 这类保留名，根对象会优先生效。
+- case 顶层 `vars` 会在 `setup` 之前解析并写入 `vars.*`。
+- `set` 和 `extract` 会覆盖同名 `vars.*`。
+- `response` 只代表**最近一次** `request` 的结果；新的 `request` 会覆盖旧值。
+- `result` 只代表**最近一次** `sql`、`redis`、`query_db`、`query_redis`、`request`、`callback` 或 `sleep` 的结果；新的相关 step 也会覆盖旧值。
+- `foreach` 会把 `as` 绑定名临时写进 `vars.*`，循环结束后恢复原值。
+
 ## 值解析规则
 
 ### `${expr}`：整个值就是表达式
@@ -99,6 +109,23 @@ assert:
 ::: tip 建议
 为了减少歧义，整值求值优先用 `${...}`，字符串拼接用 <code v-pre>{{ ... }}</code>，断言和 `extract` 里再使用裸表达式。
 :::
+
+### 表达式求值顺序
+
+在 `${...}`、条件分支和“会被自动识别为裸表达式”的位置里，当前求值顺序是：
+
+1. 比较表达式：`==` `!=` `>=` `<=` `>` `<`
+2. `len(...)`
+3. 布尔 / 空值字面量：`true` `false` `null`
+4. 引号字符串：`"ok"`、`'ok'`
+5. 数字：整数或浮点数
+6. 路径查找：例如 `response.json.name`
+7. 如果以上都不命中，就保留为原始字符串
+
+需要注意：
+
+- 当前只支持**单个比较表达式**，不支持 `&&` / `||`、算术表达式或通用括号优先级。
+- 裸表达式只有在“像路径访问”或“刚好命中已存在上下文对象 / 变量”时才会自动求值；否则仍然按普通字符串处理。
 
 ### `if` 的 truthy 规则
 
@@ -406,7 +433,7 @@ extract:
 提取后的值会写入运行时变量，可以在后续步骤里直接使用。
 
 ::: warning
-`extract` 里的右值应当写原始表达式，例如 `response.status`。当前实现不会自动去掉 `${...}` 外层包装。
+`extract` 里的右值应当写原始表达式，例如 `response.status`。不要写成 `${response.status}` 或 <code v-pre>{{ response.status }}</code>；当前实现会直接把这类写法当成错误拒绝。
 :::
 
 ## `assert`

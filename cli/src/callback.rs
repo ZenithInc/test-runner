@@ -100,7 +100,11 @@ fn prepare_request(
         .with_context(|| format!("unknown API `{api_id}`"))?;
     let method = Method::from_bytes(api.definition.method.as_bytes())?;
     let base_url = match &request.base_url {
-        Some(base_url) => value_to_string(runtime.resolve_value(&Value::String(base_url.clone()))?),
+        Some(base_url) => value_to_string(
+            runtime
+                .resolve_value(&Value::String(base_url.clone()))
+                .context("failed to resolve request.base_url")?,
+        ),
         None => api
             .definition
             .base_url
@@ -120,21 +124,31 @@ fn prepare_request(
     if !query.is_empty() {
         let mut query_pairs = url.query_pairs_mut();
         for (key, value) in query {
-            query_pairs.append_pair(&key, &value_to_string(runtime.resolve_value(&value)?));
+            let resolved = runtime
+                .resolve_value(&value)
+                .with_context(|| format!("failed to resolve request.query.{key}"))?;
+            query_pairs.append_pair(&key, &value_to_string(resolved));
         }
     }
 
     let mut headers = request_context.environment_headers.clone();
     headers.extend(api.definition.headers.clone());
     for (key, value) in &request.headers {
-        headers.insert(key.clone(), value_to_string(runtime.resolve_value(value)?));
+        let resolved = runtime
+            .resolve_value(value)
+            .with_context(|| format!("failed to resolve request.headers.{key}"))?;
+        headers.insert(key.clone(), value_to_string(resolved));
     }
 
     let body = request
         .body
         .clone()
         .or_else(|| api.definition.body.clone())
-        .map(|value| runtime.resolve_value(&value))
+        .map(|value| {
+            runtime
+                .resolve_value(&value)
+                .context("failed to resolve request.body")
+        })
         .transpose()?
         .map(|value| {
             if value.is_string() {
@@ -160,10 +174,16 @@ pub fn render_api_path(
 ) -> Result<String> {
     let mut rendered = path.to_string();
     for (key, value) in path_params {
-        let replacement = value_to_string(runtime.resolve_value(value)?);
+        let replacement = value_to_string(
+            runtime
+                .resolve_value(value)
+                .with_context(|| format!("failed to resolve request.path_params.{key}"))?,
+        );
         rendered = rendered.replace(&format!("{{{key}}}"), &replacement);
     }
-    runtime.render_string(&rendered)
+    runtime
+        .render_string(&rendered)
+        .with_context(|| format!("failed to render request path `{path}`"))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -194,8 +214,14 @@ impl CallbackSummaryReport {
     pub fn from_reports(reports: &[CallbackReport]) -> Self {
         Self {
             total: reports.len(),
-            passed: reports.iter().filter(|report| report.status == "passed").count(),
-            failed: reports.iter().filter(|report| report.status == "failed").count(),
+            passed: reports
+                .iter()
+                .filter(|report| report.status == "passed")
+                .count(),
+            failed: reports
+                .iter()
+                .filter(|report| report.status == "failed")
+                .count(),
         }
     }
 }
@@ -401,7 +427,11 @@ mod tests {
     use std::net::SocketAddr;
     use tokio::net::TcpListener;
 
-    async fn start_callback_target() -> (SocketAddr, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<Value>>>) {
+    async fn start_callback_target() -> (
+        SocketAddr,
+        tokio::task::JoinHandle<()>,
+        Arc<Mutex<Vec<Value>>>,
+    ) {
         let received = Arc::new(Mutex::new(Vec::new()));
         let state = received.clone();
         let app = Router::new().route(
@@ -417,7 +447,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
         let addr = listener.local_addr().expect("local addr");
         let join = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve callback target");
+            axum::serve(listener, app)
+                .await
+                .expect("serve callback target");
         });
         (addr, join, received)
     }

@@ -16,6 +16,8 @@ pub struct Cli {
 pub enum Commands {
     /// Initialize the .testrunner scaffold inside a target project
     Init(InitArgs),
+    /// Generate JSON Schema documents for DSL and config files
+    Schema(SchemaArgs),
     /// Run test cases for one API, one directory, or the whole project
     Test {
         #[command(subcommand)]
@@ -49,6 +51,28 @@ pub struct WebArgs {
     /// TCP port for the local Web server
     #[arg(long, default_value_t = 7919)]
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SchemaArgs {
+    /// Which schema document to generate
+    #[arg(value_enum, default_value_t = SchemaKind::All)]
+    pub kind: SchemaKind,
+    /// Output file (single schema) or directory (all schemas); stdout is used when omitted
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum SchemaKind {
+    All,
+    Project,
+    Environment,
+    Datasources,
+    Api,
+    Case,
+    Workflow,
+    MockRoute,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -185,6 +209,18 @@ mod tests {
             Commands::Web(args) => {
                 assert_eq!(args.host, "127.0.0.1");
                 assert_eq!(args.port, 7919);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn schema_args_parse_defaults() {
+        let cli = Cli::parse_from(["test-runner", "schema"]);
+        match cli.command {
+            Commands::Schema(args) => {
+                assert_eq!(args.kind, SchemaKind::All);
+                assert_eq!(args.output, None);
             }
             other => panic!("unexpected command: {other:?}"),
         }

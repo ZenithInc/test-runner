@@ -11,6 +11,7 @@ Test Runner 是一个基于 Rust 编写的 HTTP 集成测试框架 CLI 工具。
 ### 1. CLI 命令系统
 
 - **`init`** — 初始化测试项目脚手架，在目标项目中生成 `.testrunner/` 目录结构及示例文件
+- **`schema [KIND]`** — 生成 project / env / api / case / workflow / mock-route 的 JSON Schema，方便 AI Agent 或外部校验器做结构校验
 - **`test api <API_ID>`** — 运行指定 API 的测试用例
 - **`test dir <DIR>`** — 运行指定目录下的所有测试用例
 - **`test all`** — 运行项目中的全部测试用例

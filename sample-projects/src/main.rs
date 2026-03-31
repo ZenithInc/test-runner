@@ -359,8 +359,14 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/orders", get(list_orders).post(create_order))
         .route("/orders/:order_id", get(get_order).patch(update_order))
-        .route("/payments/provider/create", post(create_payment_via_provider))
-        .route("/callbacks/payments/status", post(receive_payment_status_callback))
+        .route(
+            "/payments/provider/create",
+            post(create_payment_via_provider),
+        )
+        .route(
+            "/callbacks/payments/status",
+            post(receive_payment_status_callback),
+        )
         .route("/register", post(register))
         .route("/login", post(login))
         .route("/send-sms-code", post(send_sms_code))
@@ -433,15 +439,18 @@ async fn list_orders(
         ));
     };
 
-    let customer_email = query
-        .customer_email
-        .map(normalize_email)
-        .transpose()?;
+    let customer_email = query.customer_email.map(normalize_email).transpose()?;
     let status = query.status.map(normalize_order_status).transpose()?;
     let limit = normalize_list_limit(query.limit)?;
     let offset = u64::from(query.offset.unwrap_or(0));
-    let (orders, total) =
-        find_orders(pool, customer_email.as_deref(), status.as_deref(), limit, offset).await?;
+    let (orders, total) = find_orders(
+        pool,
+        customer_email.as_deref(),
+        status.as_deref(),
+        limit,
+        offset,
+    )
+    .await?;
     let has_more = offset + (orders.len() as u64) < total;
 
     Ok((
@@ -481,10 +490,15 @@ async fn get_order(
     let order_id = normalize_order_no(order_id)?;
     let projection = parse_order_detail_projection(query.include.as_deref())?;
     let Some(order) = find_order_by_id(pool, &order_id).await? else {
-        return Err(ApiError::not_found(format!("order `{order_id}` was not found")));
+        return Err(ApiError::not_found(format!(
+            "order `{order_id}` was not found"
+        )));
     };
 
-    Ok((StatusCode::OK, Json(build_order_lookup_response(order, projection))))
+    Ok((
+        StatusCode::OK,
+        Json(build_order_lookup_response(order, projection)),
+    ))
 }
 
 async fn update_order(
@@ -653,7 +667,9 @@ async fn create_payment_via_provider(
         call_payment_provider(&state.http_client, &provider_base_url, &order_no).await?;
 
     if !provider_response.accepted {
-        return Err(ApiError::bad_gateway("payment provider rejected the request"));
+        return Err(ApiError::bad_gateway(
+            "payment provider rejected the request",
+        ));
     }
 
     store_payment_status(redis, &order_no, "PENDING").await?;
@@ -949,7 +965,10 @@ async fn persist_order(pool: &MySqlPool, order: &StoredOrder) -> Result<(), ApiE
     Ok(())
 }
 
-async fn find_order_by_id(pool: &MySqlPool, order_id: &str) -> Result<Option<StoredOrder>, ApiError> {
+async fn find_order_by_id(
+    pool: &MySqlPool,
+    order_id: &str,
+) -> Result<Option<StoredOrder>, ApiError> {
     let row = sqlx::query(
         r#"
         SELECT
@@ -997,9 +1016,9 @@ async fn find_order_by_id(pool: &MySqlPool, order_id: &str) -> Result<Option<Sto
         .into_iter()
         .map(|item| {
             Ok(OrderItemResponse {
-                sku: item
-                    .try_get("sku")
-                    .map_err(|error| ApiError::internal(format!("failed to read order sku: {error}")))?,
+                sku: item.try_get("sku").map_err(|error| {
+                    ApiError::internal(format!("failed to read order sku: {error}"))
+                })?,
                 quantity: item.try_get("quantity").map_err(|error| {
                     ApiError::internal(format!("failed to read order quantity: {error}"))
                 })?,
@@ -1020,9 +1039,9 @@ async fn find_order_by_id(pool: &MySqlPool, order_id: &str) -> Result<Option<Sto
         status: row
             .try_get("status")
             .map_err(|error| ApiError::internal(format!("failed to read order status: {error}")))?,
-        version: row
-            .try_get("version")
-            .map_err(|error| ApiError::internal(format!("failed to read order version: {error}")))?,
+        version: row.try_get("version").map_err(|error| {
+            ApiError::internal(format!("failed to read order version: {error}"))
+        })?,
         customer: OrderCustomerResponse {
             name: row.try_get("customer_name").map_err(|error| {
                 ApiError::internal(format!("failed to read order customer_name: {error}"))
@@ -1036,18 +1055,18 @@ async fn find_order_by_id(pool: &MySqlPool, order_id: &str) -> Result<Option<Sto
         },
         items,
         pricing: OrderPricingResponse {
-            sku_count: row
-                .try_get("sku_count")
-                .map_err(|error| ApiError::internal(format!("failed to read order sku_count: {error}")))?,
+            sku_count: row.try_get("sku_count").map_err(|error| {
+                ApiError::internal(format!("failed to read order sku_count: {error}"))
+            })?,
             item_count: row.try_get("item_count").map_err(|error| {
                 ApiError::internal(format!("failed to read order item_count: {error}"))
             })?,
-            subtotal: row
-                .try_get("subtotal")
-                .map_err(|error| ApiError::internal(format!("failed to read order subtotal: {error}")))?,
-            discount: row
-                .try_get("discount")
-                .map_err(|error| ApiError::internal(format!("failed to read order discount: {error}")))?,
+            subtotal: row.try_get("subtotal").map_err(|error| {
+                ApiError::internal(format!("failed to read order subtotal: {error}"))
+            })?,
+            discount: row.try_get("discount").map_err(|error| {
+                ApiError::internal(format!("failed to read order discount: {error}"))
+            })?,
             shipping_fee: row.try_get("shipping_fee").map_err(|error| {
                 ApiError::internal(format!("failed to read order shipping_fee: {error}"))
             })?,
@@ -1059,9 +1078,9 @@ async fn find_order_by_id(pool: &MySqlPool, order_id: &str) -> Result<Option<Sto
             coupon_code: row.try_get("coupon_code").map_err(|error| {
                 ApiError::internal(format!("failed to read order coupon_code: {error}"))
             })?,
-            note: row
-                .try_get("note")
-                .map_err(|error| ApiError::internal(format!("failed to read order note: {error}")))?,
+            note: row.try_get("note").map_err(|error| {
+                ApiError::internal(format!("failed to read order note: {error}"))
+            })?,
         },
     }))
 }
@@ -1128,9 +1147,9 @@ async fn find_orders(
         .into_iter()
         .map(|row| {
             Ok(StoredOrder {
-                order_id: row
-                    .try_get("id")
-                    .map_err(|error| ApiError::internal(format!("failed to read order id: {error}")))?,
+                order_id: row.try_get("id").map_err(|error| {
+                    ApiError::internal(format!("failed to read order id: {error}"))
+                })?,
                 status: row.try_get("status").map_err(|error| {
                     ApiError::internal(format!("failed to read order status: {error}"))
                 })?,
@@ -1196,7 +1215,9 @@ async fn update_order_record(
     }
 
     let Some(current_order) = find_order_by_id(pool, order_id).await? else {
-        return Err(ApiError::not_found(format!("order `{order_id}` was not found")));
+        return Err(ApiError::not_found(format!(
+            "order `{order_id}` was not found"
+        )));
     };
 
     if payload.version != current_order.version {
@@ -1318,7 +1339,11 @@ fn parse_order_detail_projection(include: Option<&str>) -> Result<OrderDetailPro
         include_pricing: false,
     };
 
-    for field in include.split(',').map(str::trim).filter(|field| !field.is_empty()) {
+    for field in include
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+    {
         match field {
             "all" => {
                 projection.include_items = true;
@@ -1329,7 +1354,7 @@ fn parse_order_detail_projection(include: Option<&str>) -> Result<OrderDetailPro
             other => {
                 return Err(ApiError::bad_request(format!(
                     "unsupported include field `{other}`; expected items, pricing, or all"
-                )))
+                )));
             }
         }
     }
@@ -1563,7 +1588,10 @@ async fn call_payment_provider(
     provider_base_url: &str,
     order_no: &str,
 ) -> Result<PaymentProviderResponse, ApiError> {
-    let url = format!("{}/payments/create", provider_base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/payments/create",
+        provider_base_url.trim_end_matches('/')
+    );
     let response = http_client
         .post(&url)
         .json(&PaymentProviderRequest {
@@ -1586,7 +1614,9 @@ async fn call_payment_provider(
         .json::<PaymentProviderResponse>()
         .await
         .map_err(|error| {
-            ApiError::bad_gateway(format!("failed to parse payment provider response: {error}"))
+            ApiError::bad_gateway(format!(
+                "failed to parse payment provider response: {error}"
+            ))
         })
 }
 

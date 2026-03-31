@@ -4,6 +4,7 @@
 
 ```text
 test-runner init
+test-runner schema [KIND]
 test-runner web
 test-runner test api <API_ID>
 test-runner test dir <DIR>
@@ -53,6 +54,45 @@ test-runner web [OPTIONS]
 它适合本机单用户调试场景，不带认证，也不会替换现有 CLI 行为；页面背后仍然是当前的 `test-runner test ...` 命令。
 
 默认地址是 `127.0.0.1`，也就是只监听本机回环地址；如果你需要从别的机器访问，再显式改成 `0.0.0.0` 或其他网卡地址。
+
+## `schema`
+
+```bash
+test-runner schema [KIND] [--output <PATH>]
+```
+
+`schema` 用来生成 DSL / 配置文件的 JSON Schema，适合给 AI Agent、编辑器插件或外部校验器使用。
+
+支持的 `KIND`：
+
+- `all`（默认）
+- `project`
+- `environment`
+- `datasources`
+- `api`
+- `case`
+- `workflow`
+- `mock-route`
+
+常见用法：
+
+```bash
+# 输出全部 schema 的 JSON 对象到 stdout
+test-runner schema
+
+# 只输出 case schema
+test-runner schema case
+
+# 批量写入一个目录
+test-runner schema all --output .testrunner/schema
+```
+
+行为细节：
+
+- 不传 `--output` 时，结果打印到 stdout。
+- `schema all --output <DIR>` 会把每种 schema 写成单独的 `*.schema.json` 文件。
+- `schema <kind> --output <FILE>` 会写单个 schema 文件；如果 `--output` 指向目录，则会自动使用 `<kind>.schema.json`。
+- JSON Schema 只描述“文件结构”和“字段约束”；表达式、作用域和运行时语义还要配合 [Schema 与 Agent 校验](/guide/schema)、[DSL 语法](/guide/dsl) 和 [工作流](/workflow/) 文档一起看。
 
 ## `test api`
 

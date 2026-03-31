@@ -2,8 +2,8 @@
   "project": "health-service",
   "environment": "docker",
   "target": "api `system/health`",
-  "started_at": "2026-03-30T09:49:03.769552+00:00",
-  "finished_at": "2026-03-30T09:49:03.771366+00:00",
+  "started_at": "2026-03-31T02:50:12.183567+00:00",
+  "finished_at": "2026-03-31T02:50:12.185297+00:00",
   "summary": {
     "total": 1,
     "passed": 1,
@@ -24,7 +24,7 @@
         "docker-compose.yml"
       ],
       "startup_status": "passed",
-      "startup_duration_ms": 13153,
+      "startup_duration_ms": 12203,
       "startup_command": [
         "docker",
         "compose",
@@ -38,7 +38,7 @@
         "--wait"
       ],
       "shutdown_status": "passed",
-      "shutdown_duration_ms": 11144,
+      "shutdown_duration_ms": 11259,
       "shutdown_command": [
         "docker",
         "compose",
@@ -82,7 +82,7 @@
         "source_path": "/var/lib/mysql/general.log",
         "output": "env/mysql-query.log",
         "status": "passed",
-        "size_bytes": 13265395
+        "size_bytes": 13269063
       },
       {
         "kind": "redis_monitor",

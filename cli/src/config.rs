@@ -12,7 +12,7 @@ use crate::workflow::{WorkflowFile, validate_workflow_definition};
 
 pub const TESTRUNNER_DIR: &str = ".testrunner";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProjectConfig {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -23,13 +23,13 @@ pub struct ProjectConfig {
     pub mock: MockServerConfig,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProjectMetadata {
     #[serde(default = "default_project_name")]
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ProjectDefaults {
     #[serde(default = "default_env_name")]
     pub env: String,
@@ -49,7 +49,7 @@ impl Default for ProjectDefaults {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MockServerConfig {
     #[serde(default = "default_mock_enabled")]
     pub enabled: bool,
@@ -69,7 +69,7 @@ impl Default for MockServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EnvironmentConfig {
     #[serde(default)]
     pub name: Option<String>,
@@ -87,7 +87,7 @@ pub struct EnvironmentConfig {
     pub logs: Vec<EnvironmentLogSource>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EnvironmentRuntimeConfig {
     #[serde(default)]
     pub kind: EnvironmentRuntimeKind,
@@ -111,12 +111,14 @@ pub struct EnvironmentRuntimeConfig {
     pub parallel: Option<EnvironmentRuntimeParallelConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EnvironmentRuntimeParallelConfig {
     pub slots: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentRuntimeKind {
     #[default]
@@ -124,7 +126,9 @@ pub enum EnvironmentRuntimeKind {
     Containers,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentRuntimeCleanupPolicy {
     #[default]
@@ -133,7 +137,7 @@ pub enum EnvironmentRuntimeCleanupPolicy {
     Never,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContainerServiceConfig {
     pub name: String,
     #[serde(default)]
@@ -154,14 +158,14 @@ pub struct ContainerServiceConfig {
     pub wait_for: Option<ContainerWaitFor>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContainerBuildConfig {
     pub context: String,
     #[serde(default)]
     pub dockerfile: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ContainerWaitFor {
     LogMessage {
@@ -189,7 +193,7 @@ pub enum ContainerWaitFor {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EnvironmentReadinessCheck {
     Http {
@@ -211,7 +215,7 @@ pub enum EnvironmentReadinessCheck {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EnvironmentLogSource {
     ComposeService {
@@ -231,7 +235,9 @@ pub enum EnvironmentLogSource {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ComposeLogStream {
     Stdout,
@@ -240,13 +246,13 @@ pub enum ComposeLogStream {
     Combined,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DatasourceCatalog {
     #[serde(default)]
     pub datasources: IndexMap<String, DatasourceDefinition>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DatasourceDefinition {
     Mysql(SqlDatasource),
@@ -254,19 +260,19 @@ pub enum DatasourceDefinition {
     Redis(RedisDatasource),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SqlDatasource {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RedisDatasource {
     pub url: String,
     #[serde(default)]
     pub key_prefix: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ApiDefinition {
     pub name: String,
     pub method: String,
@@ -283,7 +289,7 @@ pub struct ApiDefinition {
     pub timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct MockRouteDefinition {
     pub method: String,
     pub path: String,
@@ -307,7 +313,7 @@ pub struct MockRouteDefinition {
     pub body_file: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 pub struct MockResponseDefinition {
     #[serde(default)]
     pub status: Option<Value>,
@@ -591,7 +597,10 @@ fn validate_mock_steps(steps: &[Step]) -> Result<()> {
                 validate_mock_steps(then_steps)?;
                 validate_mock_steps(else_steps)?;
             }
-            _ => bail!("mock route steps currently support only `set`, `callback` and `if`"),
+            _ => bail!(
+                "mock route step `{}` is not supported; mock route steps currently support only `set`, `callback` and `if`",
+                crate::dsl::step_kind_name(step)
+            ),
         }
     }
     Ok(())
@@ -844,7 +853,8 @@ fn read_yaml<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T> 
     let path = path.as_ref();
     let raw =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_yaml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+    serde_path_to_error::deserialize(serde_yaml::Deserializer::from_str(&raw))
+        .with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn default_version() -> u32 {

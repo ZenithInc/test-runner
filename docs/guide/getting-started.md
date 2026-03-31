@@ -65,6 +65,14 @@ test-runner init --root /path/to/your-project --force
 
 初始化后会生成 `project.yaml`、环境文件、数据源配置、API 定义、样例用例、数据文件和可选的 Mock 模板。
 
+如果你的 YAML 主要是由 AI Agent 生成，建议马上再执行一次：
+
+```bash
+test-runner schema all --output /path/to/your-project/.testrunner/schema
+```
+
+这样 Agent 在真正生成 case / workflow / config 之前，就能先拿到机器可读的结构约束。
+
 如果你希望控制初始化内容，还可以补充：
 
 ```bash
@@ -91,6 +99,13 @@ test-runner test all --root /path/to/your-project --dry-run
 ```
 
 它只会打印用例选择结果，不会真正发请求，也不会生成执行报告。
+
+如果你是走 Agent 自动生成链路，一个常见顺序是：
+
+1. `test-runner schema ...` 获取结构约束
+2. 本地做 JSON Schema 校验
+3. `test-runner test ... --dry-run` 看选择计划
+4. 再执行真实测试
 
 ## 执行测试
 

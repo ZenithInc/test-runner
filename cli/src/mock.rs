@@ -213,7 +213,9 @@ fn execute_mock_steps(
         match step {
             Step::Set { values } => {
                 for (key, value) in values {
-                    let resolved = context.resolve_value(value)?;
+                    let resolved = context
+                        .resolve_value(value)
+                        .with_context(|| format!("failed to resolve mock set value `{key}`"))?;
                     context.set_var(key, resolved);
                 }
             }
@@ -236,7 +238,10 @@ fn execute_conditional_step(
     callback_runtime: &CallbackRuntime,
     source: &str,
 ) -> Result<()> {
-    let branch = if context.evaluate_condition(&step.condition)? {
+    let branch = if context
+        .evaluate_condition(&step.condition)
+        .with_context(|| format!("failed to evaluate mock condition `{}`", step.condition))?
+    {
         &step.then_steps
     } else {
         &step.else_steps

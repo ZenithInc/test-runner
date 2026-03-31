@@ -7,6 +7,7 @@ pub mod init;
 pub mod mock;
 pub mod runner;
 pub mod runtime;
+pub mod schema;
 pub mod url_rewrite;
 pub mod web;
 pub mod workflow;
@@ -21,6 +22,7 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         Commands::Init(args) => init::run(args).await,
+        Commands::Schema(args) => schema::run(args),
         Commands::Test { target } => runner::run(target).await,
         Commands::Web(args) => web::run(args).await,
     }

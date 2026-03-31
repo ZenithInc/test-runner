@@ -15,8 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap},
     convert::Infallible,
-    env,
-    fs,
+    env, fs,
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
@@ -83,7 +82,11 @@ impl RunHandle {
 
     fn snapshot_and_subscribe(&self) -> (Vec<RunEvent>, broadcast::Receiver<RunEvent>) {
         let receiver = self.tx.subscribe();
-        let events = self.events.lock().expect("run event mutex poisoned").clone();
+        let events = self
+            .events
+            .lock()
+            .expect("run event mutex poisoned")
+            .clone();
         (events, receiver)
     }
 }
@@ -216,7 +219,6 @@ impl ApiError {
             message: message.into(),
         }
     }
-
 }
 
 impl IntoResponse for ApiError {
@@ -289,9 +291,11 @@ async fn browse_children(
         )));
     }
 
-    let directories =
-        list_directory_entries(&canonical).map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let parent_path = canonical.parent().map(|parent| parent.display().to_string());
+    let directories = list_directory_entries(&canonical)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let parent_path = canonical
+        .parent()
+        .map(|parent| parent.display().to_string());
     Ok(Json(BrowsePathResponse {
         current_path: canonical.display().to_string(),
         parent_path,
@@ -306,8 +310,8 @@ async fn project_metadata(
     let root = resolve_project_root(&query.root, &state.working_dir)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let requested_env = trimmed_option(query.env.as_deref());
-    let project =
-        load_project(&root, requested_env).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let project = load_project(&root, requested_env)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let envs = list_environment_names(&project.root)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let apis = project
@@ -475,7 +479,10 @@ async fn execute_child_run(executable: PathBuf, args: Vec<String>, run: Arc<RunH
         Ok(status) if status.success() => {
             run.push_event(
                 "finished",
-                format!("Run completed successfully ({})", describe_exit_status(&status)),
+                format!(
+                    "Run completed successfully ({})",
+                    describe_exit_status(&status)
+                ),
             );
         }
         Ok(status) => {
@@ -485,7 +492,10 @@ async fn execute_child_run(executable: PathBuf, args: Vec<String>, run: Arc<RunH
             );
         }
         Err(error) => {
-            run.push_event("error", format!("failed while waiting for child process: {error}"));
+            run.push_event(
+                "error",
+                format!("failed while waiting for child process: {error}"),
+            );
             run.push_event("finished", "Run ended with an internal error");
         }
     }
@@ -551,7 +561,10 @@ fn build_test_command_args(request: &StartRunRequest, working_dir: &Path) -> Res
         }
         WebTarget::Dir => {
             args.push("dir".to_string());
-            args.push(required_value(request.target_value.as_deref(), "directory prefix")?);
+            args.push(required_value(
+                request.target_value.as_deref(),
+                "directory prefix",
+            )?);
         }
         WebTarget::All => args.push("all".to_string()),
         WebTarget::Workflow => {
@@ -730,7 +743,10 @@ fn insert_path_prefixes(path: &Path, dirs: &mut BTreeSet<String>) {
 
 fn insert_slash_prefixes(value: &str, dirs: &mut BTreeSet<String>) {
     let mut current = String::new();
-    for segment in value.split('/').filter(|segment| !segment.trim().is_empty()) {
+    for segment in value
+        .split('/')
+        .filter(|segment| !segment.trim().is_empty())
+    {
         if !current.is_empty() {
             current.push('/');
         }
@@ -917,7 +933,10 @@ mod tests {
         fs::write(root.path().join("README.txt"), "hello").expect("create file");
 
         let entries = list_directory_entries(root.path()).expect("entries should load");
-        let names = entries.into_iter().map(|entry| entry.name).collect::<Vec<_>>();
+        let names = entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
         assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
     }
 }

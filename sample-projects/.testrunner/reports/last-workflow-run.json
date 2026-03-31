@@ -3,14 +3,14 @@
   "environment": "docker",
   "workflow_id": "register-login-create-order",
   "workflow_name": "register login create order",
-  "started_at": "2026-03-30T09:49:22.068829+00:00",
-  "finished_at": "2026-03-30T09:49:22.134140+00:00",
+  "started_at": "2026-03-31T02:50:30.599032+00:00",
+  "finished_at": "2026-03-31T02:50:30.674460+00:00",
   "status": "passed",
   "summary": {
-    "executed_steps": 4,
-    "passed_steps": 4,
+    "executed_steps": 7,
+    "passed_steps": 7,
     "failed_steps": 0,
-    "duration_ms": 65
+    "duration_ms": 75
   },
   "callback_summary": {
     "total": 0,
@@ -26,7 +26,7 @@
         "docker-compose.yml"
       ],
       "startup_status": "passed",
-      "startup_duration_ms": 6616,
+      "startup_duration_ms": 6672,
       "startup_command": [
         "docker",
         "compose",
@@ -40,7 +40,7 @@
         "--wait"
       ],
       "shutdown_status": "passed",
-      "shutdown_duration_ms": 11202,
+      "shutdown_duration_ms": 11913,
       "shutdown_command": [
         "docker",
         "compose",
@@ -84,14 +84,14 @@
         "source_path": "/var/lib/mysql/general.log",
         "output": "env/mysql-query.log",
         "status": "passed",
-        "size_bytes": 13266807
+        "size_bytes": 13275225
       },
       {
         "kind": "redis_monitor",
         "service": "redis",
         "output": "env/redis-monitor.log",
         "status": "passed",
-        "size_bytes": 1635
+        "size_bytes": 1660
       }
     ]
   },
@@ -101,13 +101,13 @@
       "case_id": "user/register/happy-path",
       "status": "passed",
       "passed": true,
-      "duration_ms": 28,
+      "duration_ms": 23,
       "exports": {},
       "case_steps": [
         {
           "kind": "sql",
           "status": "passed",
-          "duration_ms": 8,
+          "duration_ms": 7,
           "details": {
             "datasource": "mysql.main",
             "result": {
@@ -119,7 +119,7 @@
         {
           "kind": "request",
           "status": "passed",
-          "duration_ms": 17,
+          "duration_ms": 14,
           "details": {
             "api": "user/register",
             "status": 201
@@ -129,7 +129,7 @@
         {
           "kind": "query_db",
           "status": "passed",
-          "duration_ms": 1,
+          "duration_ms": 0,
           "details": {
             "datasource": "mysql.main",
             "sql": "select name, email, password_hash from users where email = 'smoke.register@example.com'"
@@ -141,7 +141,7 @@
         {
           "kind": "sql",
           "status": "passed",
-          "duration_ms": 2,
+          "duration_ms": 1,
           "details": {
             "datasource": "mysql.main",
             "result": {
@@ -157,9 +157,9 @@
       "case_id": "user/send-sms-code/happy-path",
       "status": "passed",
       "passed": true,
-      "duration_ms": 6,
+      "duration_ms": 5,
       "exports": {
-        "sms_code": "162100"
+        "sms_code": "430625"
       },
       "case_steps": [
         {
@@ -176,7 +176,7 @@
         {
           "kind": "request",
           "status": "passed",
-          "duration_ms": 4,
+          "duration_ms": 3,
           "details": {
             "api": "user/send-sms-code",
             "status": 200
@@ -216,9 +216,9 @@
       "case_id": "workflow/user/login-after-register",
       "status": "passed",
       "passed": true,
-      "duration_ms": 19,
+      "duration_ms": 23,
       "exports": {
-        "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3NDg2Nzc2MiwiaWF0IjoxNzc0ODY0MTYyfQ.HgRv5OJa5lEQV4bI9BQ5JVJddb92oLBRRgN6rHHXAxU",
+        "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3NDkyOTAzMCwiaWF0IjoxNzc0OTI1NDMwfQ.kjGUfaBPTOXoSNzPCEIaCIeJT9BDFv8QW0LeBfM__PQ",
         "buyer_email": "smoke.register@example.com"
       },
       "case_steps": [
@@ -245,7 +245,7 @@
         {
           "kind": "request",
           "status": "passed",
-          "duration_ms": 16,
+          "duration_ms": 20,
           "details": {
             "api": "workflow/user/login-after-register",
             "status": 200
@@ -258,7 +258,7 @@
           "duration_ms": 1,
           "details": {
             "args": [
-              "auth:token:eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3NDg2Nzc2MiwiaWF0IjoxNzc0ODY0MTYyfQ.HgRv5OJa5lEQV4bI9BQ5JVJddb92oLBRRgN6rHHXAxU"
+              "auth:token:eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3NDkyOTAzMCwiaWF0IjoxNzc0OTI1NDMwfQ.kjGUfaBPTOXoSNzPCEIaCIeJT9BDFv8QW0LeBfM__PQ"
             ],
             "command": "GET",
             "datasource": "redis.main"
@@ -268,7 +268,7 @@
         {
           "kind": "query_redis",
           "status": "passed",
-          "duration_ms": 1,
+          "duration_ms": 0,
           "details": {
             "args": [
               "sms:code:13800000000"
@@ -283,7 +283,7 @@
         {
           "kind": "redis",
           "status": "passed",
-          "duration_ms": 0,
+          "duration_ms": 1,
           "details": {
             "command": "DEL",
             "datasource": "redis.main",
@@ -314,12 +314,76 @@
       ]
     },
     {
-      "id": "create-order",
-      "case_id": "workflow/order/create-after-login",
+      "id": "current-profile",
+      "case_id": "workflow/user/me-after-login",
       "status": "passed",
       "passed": true,
       "duration_ms": 2,
       "exports": {},
+      "case_steps": [
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_user == true}",
+            "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_token == true}",
+            "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "api": "user/me",
+            "status": 200
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_token == true}",
+            "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_user == true}",
+            "value": false
+          },
+          "error": null
+        }
+      ],
+      "deferred_teardown_steps": []
+    },
+    {
+      "id": "create-order",
+      "case_id": "workflow/order/create-after-login",
+      "status": "passed",
+      "passed": true,
+      "duration_ms": 4,
+      "exports": {
+        "order_id": "ORD-1774925430658612176",
+        "order_version": 1
+      },
       "case_steps": [
         {
           "kind": "if",
@@ -334,10 +398,10 @@
         {
           "kind": "query_redis",
           "status": "passed",
-          "duration_ms": 0,
+          "duration_ms": 1,
           "details": {
             "args": [
-              "auth:token:eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3NDg2Nzc2MiwiaWF0IjoxNzc0ODY0MTYyfQ.HgRv5OJa5lEQV4bI9BQ5JVJddb92oLBRRgN6rHHXAxU"
+              "auth:token:eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwiZW1haWwiOiJzbW9rZS5yZWdpc3RlckBleGFtcGxlLmNvbSIsImV4cCI6MTc3NDkyOTAzMCwiaWF0IjoxNzc0OTI1NDMwfQ.kjGUfaBPTOXoSNzPCEIaCIeJT9BDFv8QW0LeBfM__PQ"
             ],
             "command": "GET",
             "datasource": "redis.main"
@@ -347,7 +411,7 @@
         {
           "kind": "request",
           "status": "passed",
-          "duration_ms": 0,
+          "duration_ms": 3,
           "details": {
             "api": "workflow/order/create-after-login",
             "status": 201
@@ -360,6 +424,88 @@
           "duration_ms": 0,
           "details": {
             "condition": "${seed_token == true}",
+            "value": false
+          },
+          "error": null
+        }
+      ],
+      "deferred_teardown_steps": []
+    },
+    {
+      "id": "get-order",
+      "case_id": "workflow/order/get-created-order",
+      "status": "passed",
+      "passed": true,
+      "duration_ms": 1,
+      "exports": {},
+      "case_steps": [
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_order == true}",
+            "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 1,
+          "details": {
+            "api": "order/get",
+            "status": 200
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_order == true}",
+            "value": false
+          },
+          "error": null
+        }
+      ],
+      "deferred_teardown_steps": []
+    },
+    {
+      "id": "update-order",
+      "case_id": "workflow/order/update-created-order",
+      "status": "passed",
+      "passed": true,
+      "duration_ms": 3,
+      "exports": {},
+      "case_steps": [
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_order == true}",
+            "value": false
+          },
+          "error": null
+        },
+        {
+          "kind": "request",
+          "status": "passed",
+          "duration_ms": 3,
+          "details": {
+            "api": "order/update",
+            "status": 200
+          },
+          "error": null
+        },
+        {
+          "kind": "if",
+          "status": "passed",
+          "duration_ms": 0,
+          "details": {
+            "condition": "${seed_order == true}",
             "value": false
           },
           "error": null

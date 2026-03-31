@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use indexmap::IndexMap;
 use regex::Regex;
 use serde_json::{Map, Value, json};
@@ -63,7 +63,10 @@ impl RuntimeContext {
 
     pub fn apply_extracts(&mut self, extract: &IndexMap<String, String>) -> Result<()> {
         for (key, expression) in extract {
-            self.set_var(key, self.evaluate_expr_value(expression)?);
+            let value = self.evaluate_expr_value(expression).with_context(|| {
+                format!("failed to resolve extract `{key}` from `{expression}`")
+            })?;
+            self.set_var(key, value);
         }
         Ok(())
     }
@@ -74,13 +77,21 @@ impl RuntimeContext {
             Value::Array(items) => Ok(Value::Array(
                 items
                     .iter()
-                    .map(|item| self.resolve_value(item))
+                    .enumerate()
+                    .map(|(index, item)| {
+                        self.resolve_value(item)
+                            .with_context(|| format!("failed to resolve array item [{index}]"))
+                    })
                     .collect::<Result<Vec<_>>>()?,
             )),
             Value::Object(map) => {
                 let mut resolved = Map::new();
                 for (key, value) in map {
-                    resolved.insert(key.clone(), self.resolve_value(value)?);
+                    resolved.insert(
+                        key.clone(),
+                        self.resolve_value(value)
+                            .with_context(|| format!("failed to resolve object field `{key}`"))?,
+                    );
                 }
                 Ok(Value::Object(resolved))
             }
@@ -95,7 +106,14 @@ impl RuntimeContext {
             let whole = captures.get(0).expect("whole match");
             let expression = captures.get(1).expect("expression match");
             rendered.push_str(&raw[last..whole.start()]);
-            let value = self.evaluate_expr_value(expression.as_str())?;
+            let value = self
+                .evaluate_expr_value(expression.as_str())
+                .with_context(|| {
+                    format!(
+                        "failed to evaluate template expression `{{{{ {} }}}}`",
+                        expression.as_str().trim()
+                    )
+                })?;
             rendered.push_str(&value_to_string(value));
             last = whole.end();
         }
@@ -104,9 +122,12 @@ impl RuntimeContext {
     }
 
     pub fn evaluate_condition(&self, expression: &str) -> Result<bool> {
-        Ok(truthy(&self.evaluate_expr_value(
-            strip_wrapped(expression, "${", "}").unwrap_or(expression),
-        )?))
+        let raw_expression = expression.trim();
+        let expression = strip_wrapped(raw_expression, "${", "}").unwrap_or(raw_expression);
+        let value = self
+            .evaluate_expr_value(expression)
+            .with_context(|| format!("failed to evaluate condition `{raw_expression}`"))?;
+        Ok(truthy(&value))
     }
 
     pub fn evaluate_expr_value(&self, expression: &str) -> Result<Value> {
@@ -117,9 +138,14 @@ impl RuntimeContext {
 
         for operator in ["==", "!=", ">=", "<=", ">", "<"] {
             if let Some((left, right)) = split_comparison(expression, operator) {
-                let left = self.evaluate_expr_value(left)?;
-                let right = self.evaluate_expr_value(right)?;
-                let result = compare_values(&left, &right, operator)?;
+                let left = self.evaluate_expr_value(left).with_context(|| {
+                    format!("failed to resolve the left side of `{expression}`")
+                })?;
+                let right = self.evaluate_expr_value(right).with_context(|| {
+                    format!("failed to resolve the right side of `{expression}`")
+                })?;
+                let result = compare_values(&left, &right, operator)
+                    .with_context(|| format!("failed to compare `{expression}`"))?;
                 return Ok(Value::Bool(result));
             }
         }
@@ -128,7 +154,9 @@ impl RuntimeContext {
             .strip_prefix("len(")
             .and_then(|value| value.strip_suffix(')'))
         {
-            let value = self.evaluate_expr_value(inner)?;
+            let value = self
+                .evaluate_expr_value(inner)
+                .with_context(|| format!("failed to evaluate len() argument `{inner}`"))?;
             let length = match value {
                 Value::Array(items) => items.len(),
                 Value::Object(map) => map.len(),
@@ -283,8 +311,14 @@ fn first_failed_assertion(
     assertions: &[Assertion],
     context: &RuntimeContext,
 ) -> Result<Option<String>> {
-    for assertion in assertions {
-        if let Some(message) = evaluate_assertion(assertion, context)? {
+    for (index, assertion) in assertions.iter().enumerate() {
+        if let Some(message) = evaluate_assertion(assertion, context).with_context(|| {
+            format!(
+                "failed to evaluate assertion #{} `{}`",
+                index + 1,
+                describe_assertion(assertion)
+            )
+        })? {
             return Ok(Some(message));
         }
     }
@@ -331,14 +365,24 @@ where
     F: Fn(Value) -> bool,
 {
     if assertion.args.len() != 1 {
-        bail!("{name} expects exactly one argument");
+        bail!(
+            "{name} expects exactly one argument, got {}",
+            assertion.args.len()
+        );
     }
-    let value = context.resolve_value(&assertion.args[0])?;
+    let raw = &assertion.args[0];
+    let value = context.resolve_value(raw).with_context(|| {
+        format!(
+            "assert `{name}` could not resolve argument `{}`",
+            format_assertion_arg(raw)
+        )
+    })?;
     if predicate(value.clone()) {
         Ok(None)
     } else {
         Ok(Some(format!(
-            "assert {name} failed: actual={}",
+            "assert `{name}` failed: argument `{}` resolved to {}",
+            format_assertion_arg(raw),
             serde_json::to_string(&value)?
         )))
     }
@@ -354,16 +398,33 @@ where
     F: Fn(Value, Value) -> Result<bool>,
 {
     if assertion.args.len() != 2 {
-        bail!("{name} expects exactly two arguments");
+        bail!(
+            "{name} expects exactly two arguments, got {}",
+            assertion.args.len()
+        );
     }
-    let left = context.resolve_value(&assertion.args[0])?;
-    let right = context.resolve_value(&assertion.args[1])?;
+    let left_raw = &assertion.args[0];
+    let right_raw = &assertion.args[1];
+    let left = context.resolve_value(left_raw).with_context(|| {
+        format!(
+            "assert `{name}` could not resolve the left argument `{}`",
+            format_assertion_arg(left_raw)
+        )
+    })?;
+    let right = context.resolve_value(right_raw).with_context(|| {
+        format!(
+            "assert `{name}` could not resolve the right argument `{}`",
+            format_assertion_arg(right_raw)
+        )
+    })?;
     if predicate(left.clone(), right.clone())? {
         Ok(None)
     } else {
         Ok(Some(format!(
-            "assert {name} failed: left={} right={}",
+            "assert `{name}` failed: left `{}` -> {}, right `{}` -> {}",
+            format_assertion_arg(left_raw),
             serde_json::to_string(&left)?,
+            format_assertion_arg(right_raw),
             serde_json::to_string(&right)?
         )))
     }
@@ -453,6 +514,34 @@ fn strip_wrapped<'a>(raw: &'a str, prefix: &str, suffix: &str) -> Option<&'a str
         .strip_prefix(prefix)?
         .strip_suffix(suffix)
         .map(str::trim)
+}
+
+fn describe_assertion(assertion: &Assertion) -> String {
+    let name = match assertion.kind {
+        AssertionKind::Eq => "eq",
+        AssertionKind::Ne => "ne",
+        AssertionKind::Contains => "contains",
+        AssertionKind::NotEmpty => "not_empty",
+        AssertionKind::Exists => "exists",
+        AssertionKind::Gt => "gt",
+        AssertionKind::Ge => "ge",
+        AssertionKind::Lt => "lt",
+        AssertionKind::Le => "le",
+    };
+    let args = assertion
+        .args
+        .iter()
+        .map(format_assertion_arg)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{name}({args})")
+}
+
+fn format_assertion_arg(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "<invalid-json>".to_string()),
+    }
 }
 
 fn parse_path(path: &str) -> Option<Vec<PathSegment>> {
@@ -563,5 +652,29 @@ mod tests {
             Some(("'vip>standard'", "'vip>standard'"))
         );
         assert_eq!(split_comparison("'vip>standard'", ">"), None);
+    }
+
+    #[test]
+    fn assertion_failures_include_raw_and_resolved_values() {
+        let mut root = Map::new();
+        root.insert(
+            "response".to_string(),
+            json!({
+                "status": 201
+            }),
+        );
+        let context = RuntimeContext::new(root).expect("context");
+        let assertion = Assertion {
+            kind: AssertionKind::Eq,
+            args: vec![Value::String("response.status".to_string()), json!(200)],
+        };
+
+        let message = first_failed_assertion(&[assertion], &context)
+            .expect("assertion evaluation")
+            .expect("assertion should fail");
+
+        assert!(message.contains("response.status"));
+        assert!(message.contains("201"));
+        assert!(message.contains("200"));
     }
 }
