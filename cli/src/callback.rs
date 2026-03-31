@@ -13,7 +13,7 @@ use url::Url;
 
 use crate::config::{LoadedApi, LoadedProject};
 use crate::dsl::RequestSpec;
-use crate::runtime::{RuntimeContext, value_to_string};
+use crate::runtime::{RuntimeContext, format_error_chain, value_to_string};
 
 #[derive(Debug, Clone)]
 pub struct RequestPreparationContext {
@@ -388,7 +388,7 @@ async fn execute_callback(
             status: "failed".to_string(),
             duration_ms: started.elapsed().as_millis(),
             response_status: None,
-            error: Some(error.to_string()),
+            error: Some(format_error_chain(&error)),
         },
     }
 }

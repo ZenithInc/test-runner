@@ -6,6 +6,7 @@ use serde_json::Value;
 use serde_yaml::{Mapping, Value as YamlValue};
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CaseFile {
     pub name: String,
     #[serde(default)]
@@ -39,6 +40,7 @@ pub enum Step {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SqlExecStep {
     pub datasource: String,
     #[serde(default)]
@@ -48,6 +50,7 @@ pub struct SqlExecStep {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RedisCommandStep {
     pub datasource: String,
     pub command: String,
@@ -56,6 +59,7 @@ pub struct RedisCommandStep {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RequestSpec {
     #[serde(default)]
     pub api: Option<String>,
@@ -79,6 +83,7 @@ pub struct RequestStep {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CallbackStep {
     #[serde(default)]
     pub after_ms: u64,
@@ -86,11 +91,13 @@ pub struct CallbackStep {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SleepStep {
     pub ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QueryDbSpec {
     pub datasource: String,
     #[serde(default)]
@@ -107,6 +114,7 @@ pub struct QueryDbStep {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct QueryRedisSpec {
     pub datasource: String,
     pub command: String,
@@ -215,29 +223,34 @@ fn parse_step(value: YamlValue) -> Result<Step> {
     }
 
     if let Some(raw) = get_value(mapping, "use_data") {
+        validate_allowed_step_keys(mapping, &["use_data"], "use_data")?;
         return Ok(Step::UseData {
             path: serde_yaml::from_value(raw.clone())?,
         });
     }
 
     if let Some(raw) = get_value(mapping, "set") {
+        validate_allowed_step_keys(mapping, &["set"], "set")?;
         return Ok(Step::Set {
             values: serde_yaml::from_value(raw.clone())?,
         });
     }
 
     if let Some(raw) = get_value(mapping, "sql") {
+        validate_allowed_step_keys(mapping, &["sql"], "sql")?;
         let step: SqlExecStep = serde_yaml::from_value(raw.clone())?;
         validate_sqlish(step.sql.as_ref(), step.file.as_ref(), "sql")?;
         return Ok(Step::Sql(step));
     }
 
     if let Some(raw) = get_value(mapping, "redis") {
+        validate_allowed_step_keys(mapping, &["redis"], "redis")?;
         let step: RedisCommandStep = serde_yaml::from_value(raw.clone())?;
         return Ok(Step::Redis(step));
     }
 
     if let Some(raw) = get_value(mapping, "request") {
+        validate_allowed_step_keys(mapping, &["request", "extract", "assert"], "request")?;
         let request = serde_yaml::from_value(raw.clone())?;
         return Ok(Step::Request(RequestStep {
             request,
@@ -247,14 +260,19 @@ fn parse_step(value: YamlValue) -> Result<Step> {
     }
 
     if let Some(raw) = get_value(mapping, "callback") {
-        return Ok(Step::Callback(serde_yaml::from_value(raw.clone())?));
+        validate_allowed_step_keys(mapping, &["callback"], "callback")?;
+        let step: CallbackStep = serde_yaml::from_value(raw.clone())?;
+        validate_callback_request(&step)?;
+        return Ok(Step::Callback(step));
     }
 
     if let Some(raw) = get_value(mapping, "sleep") {
+        validate_allowed_step_keys(mapping, &["sleep"], "sleep")?;
         return Ok(Step::Sleep(serde_yaml::from_value(raw.clone())?));
     }
 
     if let Some(raw) = get_value(mapping, "query_db") {
+        validate_allowed_step_keys(mapping, &["query_db", "extract", "assert"], "query_db")?;
         let query: QueryDbSpec = serde_yaml::from_value(raw.clone())?;
         validate_sqlish(query.sql.as_ref(), query.file.as_ref(), "query_db")?;
         return Ok(Step::QueryDb(QueryDbStep {
@@ -265,6 +283,11 @@ fn parse_step(value: YamlValue) -> Result<Step> {
     }
 
     if let Some(raw) = get_value(mapping, "query_redis") {
+        validate_allowed_step_keys(
+            mapping,
+            &["query_redis", "extract", "assert"],
+            "query_redis",
+        )?;
         let query = serde_yaml::from_value(raw.clone())?;
         return Ok(Step::QueryRedis(QueryRedisStep {
             query,
@@ -277,6 +300,7 @@ fn parse_step(value: YamlValue) -> Result<Step> {
         let then_steps = get_value(mapping, "then")
             .ok_or_else(|| anyhow::anyhow!("conditional steps require a then block"))?;
         let else_steps = get_value(mapping, "else");
+        validate_allowed_step_keys(mapping, &["if", "then", "else"], "if")?;
         return Ok(Step::Conditional(ConditionalStep {
             condition: serde_yaml::from_value(condition.clone())?,
             then_steps: serde_yaml::from_value(then_steps.clone())?,
@@ -292,6 +316,7 @@ fn parse_step(value: YamlValue) -> Result<Step> {
             .ok_or_else(|| anyhow::anyhow!("foreach steps require a steps block"))?;
         let binding = get_value(mapping, "as")
             .ok_or_else(|| anyhow::anyhow!("foreach steps require an `as` binding"))?;
+        validate_allowed_step_keys(mapping, &["foreach", "as", "steps"], "foreach")?;
         return Ok(Step::Foreach(ForeachStep {
             expression: serde_yaml::from_value(expression.clone())?,
             binding: serde_yaml::from_value(binding.clone())?,
@@ -391,6 +416,27 @@ fn mapping_keys(mapping: &Mapping) -> Vec<String> {
         .collect()
 }
 
+fn validate_allowed_step_keys(
+    mapping: &Mapping,
+    allowed_keys: &[&str],
+    step_name: &str,
+) -> Result<()> {
+    let extras = mapping_keys(mapping)
+        .into_iter()
+        .filter(|key| !allowed_keys.iter().any(|allowed| allowed == &key.as_str()))
+        .collect::<Vec<_>>();
+
+    if extras.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "{step_name} step contains unsupported key(s) [{}]; allowed keys: [{}]",
+            extras.join(", "),
+            allowed_keys.join(", ")
+        )
+    }
+}
+
 fn validate_assertion_arity(kind: AssertionKind, arg_count: usize) -> Result<()> {
     let (expected, name) = match kind {
         AssertionKind::Eq => (2, "eq"),
@@ -432,10 +478,20 @@ fn validate_extract_map(extract: &IndexMap<String, String>) -> Result<()> {
 }
 
 fn validate_sqlish(sql: Option<&String>, file: Option<&String>, step_name: &str) -> Result<()> {
-    if sql.is_some() || file.is_some() {
-        Ok(())
-    } else {
-        bail!("{step_name} requires either `sql` or `file`")
+    match (sql, file) {
+        (Some(_), Some(_)) => {
+            bail!("{step_name} must define exactly one of `sql` or `file`, not both")
+        }
+        (None, None) => bail!("{step_name} requires exactly one of `sql` or `file`"),
+        _ => Ok(()),
+    }
+}
+
+fn validate_callback_request(step: &CallbackStep) -> Result<()> {
+    match step.request.api.as_deref().map(str::trim) {
+        Some("") => bail!("callback.request.api cannot be empty"),
+        Some(_) => Ok(()),
+        None => bail!("callback.request.api is required"),
     }
 }
 

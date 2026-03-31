@@ -5,10 +5,20 @@ use serde_json::{Map, Value, json};
 
 use crate::dsl::{Assertion, AssertionKind};
 
+const RESERVED_ROOT_KEYS: &[&str] = &[
+    "env", "project", "case", "api", "data", "vars", "response", "result", "request", "workflow",
+];
+
 #[derive(Debug, Clone)]
 pub struct RuntimeContext {
     root: Map<String, Value>,
     template_regex: Regex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpressionMode {
+    Lenient,
+    Explicit,
 }
 
 impl RuntimeContext {
@@ -63,9 +73,11 @@ impl RuntimeContext {
 
     pub fn apply_extracts(&mut self, extract: &IndexMap<String, String>) -> Result<()> {
         for (key, expression) in extract {
-            let value = self.evaluate_expr_value(expression).with_context(|| {
-                format!("failed to resolve extract `{key}` from `{expression}`")
-            })?;
+            let value = self
+                .evaluate_explicit_expr_value(expression)
+                .with_context(|| {
+                    format!("failed to resolve extract `{key}` from `{expression}`")
+                })?;
             self.set_var(key, value);
         }
         Ok(())
@@ -107,7 +119,7 @@ impl RuntimeContext {
             let expression = captures.get(1).expect("expression match");
             rendered.push_str(&raw[last..whole.start()]);
             let value = self
-                .evaluate_expr_value(expression.as_str())
+                .evaluate_explicit_expr_value(expression.as_str())
                 .with_context(|| {
                     format!(
                         "failed to evaluate template expression `{{{{ {} }}}}`",
@@ -125,12 +137,24 @@ impl RuntimeContext {
         let raw_expression = expression.trim();
         let expression = strip_wrapped(raw_expression, "${", "}").unwrap_or(raw_expression);
         let value = self
-            .evaluate_expr_value(expression)
+            .evaluate_explicit_expr_value(expression)
             .with_context(|| format!("failed to evaluate condition `{raw_expression}`"))?;
         Ok(truthy(&value))
     }
 
     pub fn evaluate_expr_value(&self, expression: &str) -> Result<Value> {
+        self.evaluate_expr_value_with_mode(expression, ExpressionMode::Lenient)
+    }
+
+    pub fn evaluate_explicit_expr_value(&self, expression: &str) -> Result<Value> {
+        self.evaluate_expr_value_with_mode(expression, ExpressionMode::Explicit)
+    }
+
+    fn evaluate_expr_value_with_mode(
+        &self,
+        expression: &str,
+        mode: ExpressionMode,
+    ) -> Result<Value> {
         let expression = expression.trim();
         if expression.is_empty() {
             return Ok(Value::Null);
@@ -138,12 +162,16 @@ impl RuntimeContext {
 
         for operator in ["==", "!=", ">=", "<=", ">", "<"] {
             if let Some((left, right)) = split_comparison(expression, operator) {
-                let left = self.evaluate_expr_value(left).with_context(|| {
-                    format!("failed to resolve the left side of `{expression}`")
-                })?;
-                let right = self.evaluate_expr_value(right).with_context(|| {
-                    format!("failed to resolve the right side of `{expression}`")
-                })?;
+                let left = self
+                    .evaluate_expr_value_with_mode(left, mode)
+                    .with_context(|| {
+                        format!("failed to resolve the left side of `{expression}`")
+                    })?;
+                let right = self
+                    .evaluate_expr_value_with_mode(right, mode)
+                    .with_context(|| {
+                        format!("failed to resolve the right side of `{expression}`")
+                    })?;
                 let result = compare_values(&left, &right, operator)
                     .with_context(|| format!("failed to compare `{expression}`"))?;
                 return Ok(Value::Bool(result));
@@ -155,7 +183,7 @@ impl RuntimeContext {
             .and_then(|value| value.strip_suffix(')'))
         {
             let value = self
-                .evaluate_expr_value(inner)
+                .evaluate_expr_value_with_mode(inner, mode)
                 .with_context(|| format!("failed to evaluate len() argument `{inner}`"))?;
             let length = match value {
                 Value::Array(items) => items.len(),
@@ -197,16 +225,25 @@ impl RuntimeContext {
         if let Some(value) = self.lookup_path(expression) {
             return Ok(value);
         }
+
+        if mode == ExpressionMode::Explicit {
+            return self.lookup_path_strict(expression);
+        }
+
         Ok(Value::String(expression.to_string()))
     }
 
     fn resolve_string(&self, raw: &str) -> Result<Value> {
         if let Some(expression) = strip_wrapped(raw, "${", "}") {
-            return self.evaluate_expr_value(expression);
+            return self.evaluate_explicit_expr_value(expression);
         }
 
         if self.template_regex.is_match(raw) {
             return Ok(Value::String(self.render_string(raw)?));
+        }
+
+        if self.should_require_strict_bare_reference(raw) {
+            return self.lookup_path_strict(raw);
         }
 
         if self.should_resolve_bare_expression(raw) {
@@ -248,12 +285,143 @@ impl RuntimeContext {
         Some(current)
     }
 
+    fn lookup_path_strict(&self, raw: &str) -> Result<Value> {
+        let path = raw.trim();
+        if path.is_empty() {
+            bail!("expression cannot be empty");
+        }
+
+        let segments = parse_path(path)
+            .ok_or_else(|| anyhow::anyhow!("expression `{path}` is not a valid path"))?;
+        let first = match segments.first() {
+            Some(PathSegment::Key(value)) => value.clone(),
+            Some(PathSegment::Index(index)) => {
+                bail!("expression `{path}` cannot start with array index [{index}]")
+            }
+            None => bail!("expression cannot be empty"),
+        };
+
+        let mut current_path = first.clone();
+        let mut current = if let Some(value) = self.root.get(&first).cloned() {
+            value
+        } else if let Some(value) = self.lookup_var(&first) {
+            value
+        } else {
+            let available_roots = self.available_root_keys();
+            let available_vars = self.available_var_keys();
+            let mut message = format!("expression `{path}` could not resolve `{first}`");
+            if !available_roots.is_empty() {
+                message.push_str(&format!(
+                    "; available roots: [{}]",
+                    available_roots.join(", ")
+                ));
+            }
+            if !available_vars.is_empty() {
+                message.push_str(&format!(
+                    "; available vars: [{}]",
+                    available_vars.join(", ")
+                ));
+            }
+            bail!(message);
+        };
+
+        for segment in segments.iter().skip(1) {
+            match segment {
+                PathSegment::Key(key) => {
+                    let Some(map) = current.as_object() else {
+                        bail!(
+                            "expression `{path}` tried to read key `{key}` from `{current_path}`, but `{current_path}` resolved to {}",
+                            describe_value_for_error(&current)
+                        );
+                    };
+                    let Some(next) = map.get(key) else {
+                        let available_keys = map.keys().take(10).cloned().collect::<Vec<_>>();
+                        if available_keys.is_empty() {
+                            bail!(
+                                "expression `{path}` could not find key `{key}` under `{current_path}`; `{current_path}` is an empty object"
+                            );
+                        }
+                        bail!(
+                            "expression `{path}` could not find key `{key}` under `{current_path}`; available keys: [{}]",
+                            available_keys.join(", ")
+                        );
+                    };
+                    current = next.clone();
+                    current_path.push('.');
+                    current_path.push_str(key);
+                }
+                PathSegment::Index(index) => {
+                    let Some(items) = current.as_array() else {
+                        bail!(
+                            "expression `{path}` tried to read index [{index}] from `{current_path}`, but `{current_path}` resolved to {}",
+                            describe_value_for_error(&current)
+                        );
+                    };
+                    let Some(next) = items.get(*index) else {
+                        bail!(
+                            "expression `{path}` tried to read index [{index}] from `{current_path}`, but the array length is {}",
+                            items.len()
+                        );
+                    };
+                    current = next.clone();
+                    current_path = format!("{current_path}[{index}]");
+                }
+            }
+        }
+
+        Ok(current)
+    }
+
     fn should_resolve_bare_expression(&self, raw: &str) -> bool {
         let trimmed = raw.trim();
         trimmed.contains('.')
             || trimmed.contains('[')
             || self.root.contains_key(trimmed)
             || self.lookup_var(trimmed).is_some()
+    }
+
+    fn should_require_strict_bare_reference(&self, raw: &str) -> bool {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || (!trimmed.contains('.') && !trimmed.contains('[')) {
+            return false;
+        }
+
+        let Some(segments) = parse_path(trimmed) else {
+            return false;
+        };
+        let Some(PathSegment::Key(first)) = segments.first() else {
+            return false;
+        };
+
+        RESERVED_ROOT_KEYS.iter().any(|key| key == &first.as_str())
+            || self.root.contains_key(first)
+            || self.lookup_var(first).is_some()
+    }
+
+    fn available_root_keys(&self) -> Vec<String> {
+        let mut keys = self
+            .root
+            .keys()
+            .map(|key| key.to_string())
+            .collect::<Vec<_>>();
+        for reserved in RESERVED_ROOT_KEYS {
+            if !keys.iter().any(|key| key == reserved) {
+                keys.push((*reserved).to_string());
+            }
+        }
+        keys.sort();
+        keys
+    }
+
+    fn available_var_keys(&self) -> Vec<String> {
+        let mut keys = self
+            .root
+            .get("vars")
+            .and_then(Value::as_object)
+            .map(|vars| vars.keys().map(|key| key.to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        keys.sort();
+        keys
     }
 }
 
@@ -371,12 +539,7 @@ where
         );
     }
     let raw = &assertion.args[0];
-    let value = context.resolve_value(raw).with_context(|| {
-        format!(
-            "assert `{name}` could not resolve argument `{}`",
-            format_assertion_arg(raw)
-        )
-    })?;
+    let value = resolve_assertion_subject(raw, context, name, "argument")?;
     if predicate(value.clone()) {
         Ok(None)
     } else {
@@ -405,12 +568,7 @@ where
     }
     let left_raw = &assertion.args[0];
     let right_raw = &assertion.args[1];
-    let left = context.resolve_value(left_raw).with_context(|| {
-        format!(
-            "assert `{name}` could not resolve the left argument `{}`",
-            format_assertion_arg(left_raw)
-        )
-    })?;
+    let left = resolve_assertion_subject(left_raw, context, name, "the left argument")?;
     let right = context.resolve_value(right_raw).with_context(|| {
         format!(
             "assert `{name}` could not resolve the right argument `{}`",
@@ -542,6 +700,64 @@ fn format_assertion_arg(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => serde_json::to_string(other).unwrap_or_else(|_| "<invalid-json>".to_string()),
     }
+}
+
+fn resolve_assertion_subject(
+    raw: &Value,
+    context: &RuntimeContext,
+    name: &str,
+    label: &str,
+) -> Result<Value> {
+    match raw {
+        Value::String(text) => context.evaluate_explicit_expr_value(text).with_context(|| {
+            format!(
+                "assert `{name}` could not resolve {label} `{}`",
+                format_assertion_arg(raw)
+            )
+        }),
+        _ => context.resolve_value(raw).with_context(|| {
+            format!(
+                "assert `{name}` could not resolve {label} `{}`",
+                format_assertion_arg(raw)
+            )
+        }),
+    }
+}
+
+pub(crate) fn describe_value_for_error(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(boolean) => format!("boolean {}", boolean),
+        Value::Number(number) => format!("number {}", number),
+        Value::String(text) => format!("string {:?}", truncate_for_error(text, 80)),
+        Value::Array(items) => format!("array(len={})", items.len()),
+        Value::Object(map) => {
+            let keys = map.keys().take(6).cloned().collect::<Vec<_>>();
+            if keys.is_empty() {
+                "empty object".to_string()
+            } else {
+                format!("object(keys=[{}])", keys.join(", "))
+            }
+        }
+    }
+}
+
+fn truncate_for_error(raw: &str, max_chars: usize) -> String {
+    let mut chars = raw.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+pub(crate) fn format_error_chain(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 fn parse_path(path: &str) -> Option<Vec<PathSegment>> {
@@ -676,5 +892,86 @@ mod tests {
         assert!(message.contains("response.status"));
         assert!(message.contains("201"));
         assert!(message.contains("200"));
+    }
+
+    #[test]
+    fn explicit_expression_reports_available_context_for_unknown_identifier() {
+        let context = RuntimeContext::new(Map::new()).expect("context");
+
+        let error = context
+            .evaluate_explicit_expr_value("missing_flag")
+            .expect_err("missing identifier must fail");
+
+        let message = format_error_chain(&error);
+        assert!(message.contains("expression `missing_flag` could not resolve `missing_flag`"));
+        assert!(message.contains("available roots:"));
+    }
+
+    #[test]
+    fn explicit_expression_reports_missing_key_and_index_details() {
+        let mut root = Map::new();
+        root.insert(
+            "response".to_string(),
+            json!({
+                "json": {
+                    "items": [ { "sku": "SKU-1" } ]
+                }
+            }),
+        );
+        let context = RuntimeContext::new(root).expect("context");
+
+        let missing_key = context
+            .evaluate_explicit_expr_value("response.json.order_id")
+            .expect_err("missing key must fail");
+        let missing_key_message = format_error_chain(&missing_key);
+        assert!(
+            missing_key_message.contains("could not find key `order_id` under `response.json`")
+        );
+        assert!(missing_key_message.contains("available keys: [items]"));
+
+        let missing_index = context
+            .evaluate_explicit_expr_value("response.json.items[3]")
+            .expect_err("missing index must fail");
+        let missing_index_message = format_error_chain(&missing_index);
+        assert!(
+            missing_index_message.contains("tried to read index [3] from `response.json.items`")
+        );
+        assert!(missing_index_message.contains("array length is 1"));
+    }
+
+    #[test]
+    fn unary_assertions_fail_when_subject_is_unresolved() {
+        let context = RuntimeContext::new(Map::new()).expect("context");
+        let assertion = Assertion {
+            kind: AssertionKind::NotEmpty,
+            args: vec![Value::String("order_id".to_string())],
+        };
+
+        let error = first_failed_assertion(&[assertion], &context)
+            .expect_err("unresolved assertion subject must fail");
+        let message = format_error_chain(&error);
+
+        assert!(message.contains("failed to evaluate assertion #1 `not_empty(order_id)`"));
+        assert!(message.contains("assert `not_empty` could not resolve argument `order_id`"));
+        assert!(message.contains("expression `order_id` could not resolve `order_id`"));
+    }
+
+    #[test]
+    fn binary_assertions_fail_when_left_subject_is_unresolved() {
+        let context = RuntimeContext::new(Map::new()).expect("context");
+        let assertion = Assertion {
+            kind: AssertionKind::Eq,
+            args: vec![Value::String("response.status".to_string()), json!(200)],
+        };
+
+        let error = first_failed_assertion(&[assertion], &context)
+            .expect_err("unresolved left subject must fail");
+        let message = format_error_chain(&error);
+
+        assert!(message.contains("failed to evaluate assertion #1 `eq(response.status, 200)`"));
+        assert!(
+            message.contains("assert `eq` could not resolve the left argument `response.status`")
+        );
+        assert!(message.contains("expression `response.status` could not resolve `response`"));
     }
 }

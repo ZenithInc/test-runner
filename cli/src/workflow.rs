@@ -6,6 +6,7 @@ use serde_json::Value;
 use serde_yaml::{Mapping, Value as YamlValue};
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowFile {
     pub name: String,
     #[serde(default)]
@@ -23,6 +24,7 @@ pub enum WorkflowStep {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RunCaseStep {
     pub id: String,
     #[serde(rename = "case")]
@@ -110,6 +112,7 @@ fn parse_workflow_step(value: YamlValue) -> Result<WorkflowStep> {
     }
 
     if let Some(raw) = get_value(mapping, "run_case") {
+        validate_allowed_workflow_keys(mapping, &["run_case"], "run_case")?;
         let step: RunCaseStep = serde_yaml::from_value(raw.clone())?;
         return Ok(WorkflowStep::RunCase(step));
     }
@@ -132,6 +135,7 @@ fn parse_workflow_step(value: YamlValue) -> Result<WorkflowStep> {
         let then_steps = get_value(mapping, "then")
             .ok_or_else(|| anyhow::anyhow!("workflow conditional steps require a then block"))?;
         let else_steps = get_value(mapping, "else");
+        validate_allowed_workflow_keys(mapping, &["if", "then", "else"], "if")?;
         return Ok(WorkflowStep::Conditional(WorkflowConditionalStep {
             condition: serde_yaml::from_value(condition.clone())?,
             then_steps: serde_yaml::from_value(then_steps.clone())?,
@@ -159,6 +163,28 @@ fn parse_workflow_step(value: YamlValue) -> Result<WorkflowStep> {
 
 fn get_value<'a>(mapping: &'a Mapping, key: &str) -> Option<&'a YamlValue> {
     mapping.get(YamlValue::String(key.to_string()))
+}
+
+fn validate_allowed_workflow_keys(
+    mapping: &Mapping,
+    allowed_keys: &[&str],
+    step_name: &str,
+) -> Result<()> {
+    let extras = mapping
+        .keys()
+        .filter_map(|key| key.as_str().map(ToOwned::to_owned))
+        .filter(|key| !allowed_keys.iter().any(|allowed| allowed == &key.as_str()))
+        .collect::<Vec<_>>();
+
+    if extras.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "workflow {step_name} step contains unsupported key(s) [{}]; allowed keys: [{}]",
+            extras.join(", "),
+            allowed_keys.join(", ")
+        )
+    }
 }
 
 #[cfg(test)]

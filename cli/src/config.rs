@@ -13,6 +13,7 @@ use crate::workflow::{WorkflowFile, validate_workflow_definition};
 pub const TESTRUNNER_DIR: &str = ".testrunner";
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -24,12 +25,14 @@ pub struct ProjectConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectMetadata {
     #[serde(default = "default_project_name")]
     pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectDefaults {
     #[serde(default = "default_env_name")]
     pub env: String,
@@ -50,6 +53,7 @@ impl Default for ProjectDefaults {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MockServerConfig {
     #[serde(default = "default_mock_enabled")]
     pub enabled: bool,
@@ -70,6 +74,7 @@ impl Default for MockServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
     #[serde(default)]
     pub name: Option<String>,
@@ -88,6 +93,7 @@ pub struct EnvironmentConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentRuntimeConfig {
     #[serde(default)]
     pub kind: EnvironmentRuntimeKind,
@@ -112,6 +118,7 @@ pub struct EnvironmentRuntimeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentRuntimeParallelConfig {
     pub slots: usize,
 }
@@ -138,6 +145,7 @@ pub enum EnvironmentRuntimeCleanupPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ContainerServiceConfig {
     pub name: String,
     #[serde(default)]
@@ -159,6 +167,7 @@ pub struct ContainerServiceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ContainerBuildConfig {
     pub context: String,
     #[serde(default)]
@@ -166,7 +175,7 @@ pub struct ContainerBuildConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContainerWaitFor {
     LogMessage {
         pattern: String,
@@ -194,7 +203,7 @@ pub enum ContainerWaitFor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EnvironmentReadinessCheck {
     Http {
         url: String,
@@ -216,7 +225,7 @@ pub enum EnvironmentReadinessCheck {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EnvironmentLogSource {
     ComposeService {
         service: String,
@@ -247,6 +256,7 @@ pub enum ComposeLogStream {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DatasourceCatalog {
     #[serde(default)]
     pub datasources: IndexMap<String, DatasourceDefinition>,
@@ -261,11 +271,13 @@ pub enum DatasourceDefinition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SqlDatasource {
     pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RedisDatasource {
     pub url: String,
     #[serde(default)]
@@ -273,6 +285,7 @@ pub struct RedisDatasource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ApiDefinition {
     pub name: String,
     pub method: String,
@@ -290,6 +303,7 @@ pub struct ApiDefinition {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MockRouteDefinition {
     pub method: String,
     pub path: String,
@@ -314,6 +328,7 @@ pub struct MockRouteDefinition {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct MockResponseDefinition {
     #[serde(default)]
     pub status: Option<Value>,
@@ -391,9 +406,13 @@ pub fn load_project(root: &Path, env_override: Option<&str>) -> Result<LoadedPro
 
     let datasources = load_datasources(&runner_root.join("datasources"))?;
     let apis = load_apis(&runner_root.join("apis"))?;
-    let cases = load_cases(&runner_root.join("cases"))?;
-    let workflows = load_workflows(&runner_root.join("workflows"))?;
-    let mock_routes = load_mock_routes(&runner_root.join("mocks").join("routes"))?;
+    let cases_root = runner_root.join("cases");
+    let workflows_root = runner_root.join("workflows");
+    let mock_routes_root = runner_root.join("mocks").join("routes");
+    let cases = load_cases(&cases_root)?;
+    validate_case_definitions(&cases, &apis, &datasources, &cases_root)?;
+    let workflows = load_workflows(&workflows_root, &cases)?;
+    let mock_routes = load_mock_routes(&mock_routes_root, &apis)?;
 
     if apis.is_empty() {
         bail!(
@@ -527,7 +546,7 @@ fn load_cases(root: &Path) -> Result<Vec<LoadedCase>> {
     Ok(cases)
 }
 
-fn load_workflows(root: &Path) -> Result<IndexMap<String, LoadedWorkflow>> {
+fn load_workflows(root: &Path, cases: &[LoadedCase]) -> Result<IndexMap<String, LoadedWorkflow>> {
     let mut workflows = IndexMap::new();
     for path in discover_yaml_files(root)? {
         let definition: WorkflowFile = read_yaml(&path)?;
@@ -535,19 +554,22 @@ fn load_workflows(root: &Path) -> Result<IndexMap<String, LoadedWorkflow>> {
             .with_context(|| format!("invalid workflow definition in {}", path.display()))?;
         let relative = path.strip_prefix(root)?.to_path_buf();
         let id = file_id_from_relative(&relative);
-        workflows.insert(
-            id.clone(),
-            LoadedWorkflow {
-                id,
-                relative_path: relative,
-                definition,
-            },
-        );
+        let workflow = LoadedWorkflow {
+            id,
+            relative_path: relative,
+            definition,
+        };
+        validate_workflow_references(&workflow, cases)
+            .with_context(|| format!("invalid workflow definition in {}", path.display()))?;
+        workflows.insert(workflow.id.clone(), workflow);
     }
     Ok(workflows)
 }
 
-fn load_mock_routes(root: &Path) -> Result<Vec<MockRouteDefinition>> {
+fn load_mock_routes(
+    root: &Path,
+    apis: &IndexMap<String, LoadedApi>,
+) -> Result<Vec<MockRouteDefinition>> {
     if !root.exists() {
         return Ok(Vec::new());
     }
@@ -556,6 +578,8 @@ fn load_mock_routes(root: &Path) -> Result<Vec<MockRouteDefinition>> {
     for path in discover_yaml_files(root)? {
         let route = read_yaml::<MockRouteDefinition>(&path)?;
         validate_mock_route(&route)
+            .with_context(|| format!("invalid mock route definition in {}", path.display()))?;
+        validate_mock_route_references(&route, apis)
             .with_context(|| format!("invalid mock route definition in {}", path.display()))?;
         routes.push(route);
     }
@@ -604,6 +628,244 @@ fn validate_mock_steps(steps: &[Step]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_case_definitions(
+    cases: &[LoadedCase],
+    apis: &IndexMap<String, LoadedApi>,
+    datasources: &IndexMap<String, DatasourceDefinition>,
+    cases_root: &Path,
+) -> Result<()> {
+    for case in cases {
+        validate_case_definition(case, apis, datasources).with_context(|| {
+            format!(
+                "invalid case definition in {}",
+                cases_root.join(&case.relative_path).display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_case_definition(
+    case: &LoadedCase,
+    apis: &IndexMap<String, LoadedApi>,
+    datasources: &IndexMap<String, DatasourceDefinition>,
+) -> Result<()> {
+    ensure_known_api(&case.definition.api, apis, "case.api")?;
+    validate_case_steps(
+        &case.definition.setup,
+        &case.definition.api,
+        apis,
+        datasources,
+        "setup",
+    )?;
+    validate_case_steps(
+        &case.definition.steps,
+        &case.definition.api,
+        apis,
+        datasources,
+        "steps",
+    )?;
+    validate_case_steps(
+        &case.definition.teardown,
+        &case.definition.api,
+        apis,
+        datasources,
+        "teardown",
+    )?;
+    Ok(())
+}
+
+fn validate_case_steps(
+    steps: &[Step],
+    default_api_id: &str,
+    apis: &IndexMap<String, LoadedApi>,
+    datasources: &IndexMap<String, DatasourceDefinition>,
+    location: &str,
+) -> Result<()> {
+    for (index, step) in steps.iter().enumerate() {
+        let step_location = format!("{location}[{index}]");
+        match step {
+            Step::UseData { .. } | Step::Set { .. } | Step::Sleep(_) => {}
+            Step::Sql(step) => ensure_sql_datasource(
+                &step.datasource,
+                datasources,
+                &format!("{step_location}.sql.datasource"),
+            )?,
+            Step::Redis(step) => ensure_redis_datasource(
+                &step.datasource,
+                datasources,
+                &format!("{step_location}.redis.datasource"),
+            )?,
+            Step::Request(step) => {
+                let api_id = step.request.api.as_deref().unwrap_or(default_api_id);
+                ensure_known_api(api_id, apis, &format!("{step_location}.request.api"))?;
+            }
+            Step::Callback(step) => ensure_known_api(
+                step.request.api.as_deref().unwrap_or_default(),
+                apis,
+                &format!("{step_location}.callback.request.api"),
+            )?,
+            Step::QueryDb(step) => ensure_sql_datasource(
+                &step.query.datasource,
+                datasources,
+                &format!("{step_location}.query_db.datasource"),
+            )?,
+            Step::QueryRedis(step) => ensure_redis_datasource(
+                &step.query.datasource,
+                datasources,
+                &format!("{step_location}.query_redis.datasource"),
+            )?,
+            Step::Conditional(step) => {
+                validate_case_steps(
+                    &step.then_steps,
+                    default_api_id,
+                    apis,
+                    datasources,
+                    &format!("{step_location}.then"),
+                )?;
+                validate_case_steps(
+                    &step.else_steps,
+                    default_api_id,
+                    apis,
+                    datasources,
+                    &format!("{step_location}.else"),
+                )?;
+            }
+            Step::Foreach(step) => validate_case_steps(
+                &step.steps,
+                default_api_id,
+                apis,
+                datasources,
+                &format!("{step_location}.steps"),
+            )?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_workflow_references(workflow: &LoadedWorkflow, cases: &[LoadedCase]) -> Result<()> {
+    validate_workflow_steps(&workflow.definition.steps, cases, "steps")
+}
+
+fn validate_workflow_steps(
+    steps: &[crate::workflow::WorkflowStep],
+    cases: &[LoadedCase],
+    location: &str,
+) -> Result<()> {
+    for (index, step) in steps.iter().enumerate() {
+        let step_location = format!("{location}[{index}]");
+        match step {
+            crate::workflow::WorkflowStep::RunCase(step) => {
+                if !cases.iter().any(|case| case.id == step.case_id) {
+                    bail!(
+                        "{step_location}.run_case.case references unknown case `{}`",
+                        step.case_id
+                    );
+                }
+            }
+            crate::workflow::WorkflowStep::Conditional(step) => {
+                validate_workflow_steps(&step.then_steps, cases, &format!("{step_location}.then"))?;
+                validate_workflow_steps(&step.else_steps, cases, &format!("{step_location}.else"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_mock_route_references(
+    route: &MockRouteDefinition,
+    apis: &IndexMap<String, LoadedApi>,
+) -> Result<()> {
+    validate_mock_route_steps(&route.steps, apis, "steps")
+}
+
+fn validate_mock_route_steps(
+    steps: &[Step],
+    apis: &IndexMap<String, LoadedApi>,
+    location: &str,
+) -> Result<()> {
+    for (index, step) in steps.iter().enumerate() {
+        let step_location = format!("{location}[{index}]");
+        match step {
+            Step::Set { .. } => {}
+            Step::Callback(step) => ensure_known_api(
+                step.request.api.as_deref().unwrap_or_default(),
+                apis,
+                &format!("{step_location}.callback.request.api"),
+            )?,
+            Step::Conditional(step) => {
+                validate_mock_route_steps(
+                    &step.then_steps,
+                    apis,
+                    &format!("{step_location}.then"),
+                )?;
+                validate_mock_route_steps(
+                    &step.else_steps,
+                    apis,
+                    &format!("{step_location}.else"),
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn ensure_known_api(
+    api_id: &str,
+    apis: &IndexMap<String, LoadedApi>,
+    reference: &str,
+) -> Result<()> {
+    let api_id = api_id.trim();
+    if api_id.is_empty() {
+        bail!("{reference} cannot be empty");
+    }
+    if !apis.contains_key(api_id) {
+        bail!("{reference} references unknown API `{api_id}`");
+    }
+    Ok(())
+}
+
+fn ensure_sql_datasource(
+    datasource: &str,
+    datasources: &IndexMap<String, DatasourceDefinition>,
+    reference: &str,
+) -> Result<()> {
+    let datasource = datasource.trim();
+    if datasource.is_empty() {
+        bail!("{reference} cannot be empty");
+    }
+    match datasources.get(datasource) {
+        Some(DatasourceDefinition::Mysql(_) | DatasourceDefinition::Postgres(_)) => Ok(()),
+        Some(DatasourceDefinition::Redis(_)) => {
+            bail!(
+                "{reference} references Redis datasource `{datasource}`, but this step requires a SQL datasource"
+            )
+        }
+        None => bail!("{reference} references unknown datasource `{datasource}`"),
+    }
+}
+
+fn ensure_redis_datasource(
+    datasource: &str,
+    datasources: &IndexMap<String, DatasourceDefinition>,
+    reference: &str,
+) -> Result<()> {
+    let datasource = datasource.trim();
+    if datasource.is_empty() {
+        bail!("{reference} cannot be empty");
+    }
+    match datasources.get(datasource) {
+        Some(DatasourceDefinition::Redis(_)) => Ok(()),
+        Some(DatasourceDefinition::Mysql(_) | DatasourceDefinition::Postgres(_)) => {
+            bail!(
+                "{reference} references SQL datasource `{datasource}`, but this step requires a Redis datasource"
+            )
+        }
+        None => bail!("{reference} references unknown datasource `{datasource}`"),
+    }
 }
 
 fn validate_environment_config(environment: &EnvironmentConfig) -> Result<()> {

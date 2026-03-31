@@ -35,11 +35,13 @@ use crate::config::{
 };
 use crate::dsl::{
     CallbackStep, ConditionalStep, ForeachStep, QueryDbStep, QueryRedisStep, RedisCommandStep,
-    RequestSpec, RequestStep, SleepStep, SqlExecStep, Step,
+    RequestSpec, RequestStep, SleepStep, SqlExecStep, Step, step_kind_name,
 };
 use crate::environment::{EnvironmentArtifactsReport, EnvironmentSession};
 use crate::mock;
-use crate::runtime::{RuntimeContext, apply_assertions, value_to_string};
+use crate::runtime::{
+    RuntimeContext, apply_assertions, describe_value_for_error, format_error_chain, value_to_string,
+};
 use crate::url_rewrite::{rewrite_url_base_in_place, rewrite_value_url_bases};
 use crate::workflow::{CleanupPolicy, WorkflowStep};
 
@@ -1081,6 +1083,7 @@ impl Runner {
             options.fail_fast,
             &mut stop_execution,
             &mut executed_run_case_steps,
+            "steps".to_string(),
         )
         .await?;
 
@@ -1095,9 +1098,7 @@ impl Runner {
                     report.passed = false;
                     report.status = "failed".to_string();
                     report.error = Some(match report.error.take() {
-                        Some(existing) => {
-                            format!("{existing}; deferred teardown failed: {error}")
-                        }
+                        Some(existing) => format!("{existing}; deferred teardown failed: {error}"),
                         None => format!("deferred teardown failed: {error}"),
                     });
                 }
@@ -1163,12 +1164,14 @@ impl Runner {
         fail_fast: bool,
         stop_execution: &'a mut bool,
         executed_run_case_steps: &'a mut usize,
+        scope: String,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            for step in steps {
+            for (index, step) in steps.iter().enumerate() {
                 if *stop_execution {
                     break;
                 }
+                let step_location = format!("{scope}[{index}]");
                 match step {
                     WorkflowStep::RunCase(run_case) => {
                         let wf_runtime = build_workflow_runtime(&self.project, state)?;
@@ -1186,7 +1189,8 @@ impl Runner {
                                     })?,
                                 ))
                             })
-                            .collect::<Result<_>>()?;
+                            .collect::<Result<_>>()
+                            .with_context(|| format!("{step_location}.run_case.inputs"))?;
 
                         let case = self
                             .project
@@ -1195,7 +1199,7 @@ impl Runner {
                             .find(|case| case.id == run_case.case_id)
                             .with_context(|| {
                                 format!(
-                                    "workflow step `{}`: case `{}` not found",
+                                    "{step_location}.run_case.case: workflow step `{}`: case `{}` not found",
                                     run_case.id, run_case.case_id
                                 )
                             })?
@@ -1251,11 +1255,17 @@ impl Runner {
                                     "workflow conditional step failed to evaluate `{}`",
                                     cond.condition
                                 )
-                            })?;
+                            })
+                            .with_context(|| format!("{step_location}.if"))?;
                         let branch = if condition {
                             &cond.then_steps
                         } else {
                             &cond.else_steps
+                        };
+                        let branch_scope = if condition {
+                            format!("{step_location}.then")
+                        } else {
+                            format!("{step_location}.else")
                         };
                         self.execute_workflow_steps(
                             branch,
@@ -1266,6 +1276,7 @@ impl Runner {
                             fail_fast,
                             stop_execution,
                             executed_run_case_steps,
+                            branch_scope,
                         )
                         .await?;
                     }
@@ -1312,7 +1323,7 @@ impl Runner {
                         status: "failed".to_string(),
                         passed: false,
                         duration_ms: started.elapsed().as_millis(),
-                        error: Some(error.to_string()),
+                        error: Some(format_error_chain(&error)),
                         exports: serde_json::Map::new(),
                         case_steps: Vec::new(),
                         deferred_teardown_steps: Vec::new(),
@@ -1337,7 +1348,8 @@ impl Runner {
             match context.resolve_value(value) {
                 Ok(resolved) => context.set_var(name, resolved),
                 Err(error) => {
-                    case_error = Some(format!("failed to resolve var `{name}`: {error}"));
+                    let error = error.context(format!("failed to resolve var `{name}`"));
+                    case_error = Some(format_error_chain(&error));
                     break;
                 }
             }
@@ -1345,20 +1357,30 @@ impl Runner {
 
         if case_error.is_none() {
             if let Err(error) = self
-                .execute_step_list(&case.definition.setup, &mut context, &mut case_steps)
+                .execute_step_list(
+                    &case.definition.setup,
+                    &mut context,
+                    &mut case_steps,
+                    "setup".to_string(),
+                )
                 .await
             {
-                case_error = Some(format!("setup failed: {error}"));
+                case_error = Some(format_error_chain(&error.context("setup failed")));
             }
         }
 
         if case_error.is_none() {
             should_run_cleanup = true;
             if let Err(error) = self
-                .execute_step_list(&case.definition.steps, &mut context, &mut case_steps)
+                .execute_step_list(
+                    &case.definition.steps,
+                    &mut context,
+                    &mut case_steps,
+                    "steps".to_string(),
+                )
                 .await
             {
-                case_error = Some(format!("steps failed: {error}"));
+                case_error = Some(format_error_chain(&error.context("steps failed")));
             }
         }
 
@@ -1370,16 +1392,20 @@ impl Runner {
                 .map(|(name, path)| {
                     Ok((
                         name.clone(),
-                        context.evaluate_expr_value(path).with_context(|| {
-                            format!("failed to resolve workflow export `{name}` from `{path}`")
-                        })?,
+                        context
+                            .evaluate_explicit_expr_value(path)
+                            .with_context(|| {
+                                format!("failed to resolve workflow export `{name}` from `{path}`")
+                            })?,
                     ))
                 })
                 .collect::<Result<serde_json::Map<_, _>>>()
             {
                 Ok(exports) => exports,
                 Err(error) => {
-                    case_error = Some(format!("failed to evaluate workflow exports: {error}"));
+                    case_error = Some(format_error_chain(
+                        &error.context("failed to evaluate workflow exports"),
+                    ));
                     serde_json::Map::new()
                 }
             }
@@ -1391,10 +1417,16 @@ impl Runner {
             match cleanup {
                 CleanupPolicy::Immediate => {
                     if let Err(teardown_error) = self
-                        .execute_step_list(&case.definition.teardown, &mut context, &mut case_steps)
+                        .execute_step_list(
+                            &case.definition.teardown,
+                            &mut context,
+                            &mut case_steps,
+                            "teardown".to_string(),
+                        )
                         .await
                     {
-                        let message = format!("teardown failed: {teardown_error}");
+                        let message =
+                            format_error_chain(&teardown_error.context("teardown failed"));
                         match &mut case_error {
                             Some(existing) => *existing = format!("{existing}; {message}"),
                             None => case_error = Some(message),
@@ -1448,17 +1480,22 @@ impl Runner {
                     return (
                         deferred.step_id.clone(),
                         Vec::new(),
-                        Some(format!("context init failed: {error}")),
+                        Some(format_error_chain(&error.context("context init failed"))),
                     );
                 }
             };
 
         let mut reports = Vec::new();
         let error = self
-            .execute_step_list(&deferred.teardown_steps, &mut context, &mut reports)
+            .execute_step_list(
+                &deferred.teardown_steps,
+                &mut context,
+                &mut reports,
+                "teardown".to_string(),
+            )
             .await
             .err()
-            .map(|error| error.to_string());
+            .map(|error| format_error_chain(&error));
 
         (deferred.step_id.clone(), reports, error)
     }
@@ -1499,7 +1536,7 @@ impl Runner {
                 slot_id: self.slot_id,
                 status: "failed".to_string(),
                 duration_ms: started.elapsed().as_millis(),
-                error: Some(error.to_string()),
+                error: Some(format_error_chain(&error)),
                 steps,
             },
         }
@@ -1529,17 +1566,32 @@ impl Runner {
         }
 
         if let Err(error) = self
-            .execute_step_list(&case.definition.setup, &mut context, &mut reports)
+            .execute_step_list(
+                &case.definition.setup,
+                &mut context,
+                &mut reports,
+                "setup".to_string(),
+            )
             .await
         {
             return Err((reports, error.context("setup failed")));
         }
         if let Err(error) = self
-            .execute_step_list(&case.definition.steps, &mut context, &mut reports)
+            .execute_step_list(
+                &case.definition.steps,
+                &mut context,
+                &mut reports,
+                "steps".to_string(),
+            )
             .await
         {
             let teardown_result = self
-                .execute_step_list(&case.definition.teardown, &mut context, &mut reports)
+                .execute_step_list(
+                    &case.definition.teardown,
+                    &mut context,
+                    &mut reports,
+                    "teardown".to_string(),
+                )
                 .await;
             if let Err(teardown_error) = teardown_result {
                 return Err((
@@ -1552,7 +1604,12 @@ impl Runner {
             return Err((reports, error.context("steps failed")));
         }
         if let Err(error) = self
-            .execute_step_list(&case.definition.teardown, &mut context, &mut reports)
+            .execute_step_list(
+                &case.definition.teardown,
+                &mut context,
+                &mut reports,
+                "teardown".to_string(),
+            )
             .await
         {
             return Err((reports, error.context("teardown failed")));
@@ -1566,10 +1623,16 @@ impl Runner {
         steps: &'a [Step],
         context: &'a mut ExecutionContext<'_>,
         reports: &'a mut Vec<StepReport>,
+        scope: String,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            for step in steps {
-                self.execute_single_step(step, context, reports).await?;
+            for (index, step) in steps.iter().enumerate() {
+                let step_location = format!("{scope}[{index}]");
+                self.execute_single_step(step, context, reports, &step_location)
+                    .await
+                    .with_context(|| {
+                        format!("{step_location} `{}` step failed", step_kind_name(step))
+                    })?;
             }
             Ok(())
         })
@@ -1580,6 +1643,7 @@ impl Runner {
         step: &Step,
         context: &mut ExecutionContext<'_>,
         reports: &mut Vec<StepReport>,
+        location: &str,
     ) -> Result<()> {
         match step {
             Step::UseData { path } => {
@@ -1617,8 +1681,14 @@ impl Runner {
             Step::Sleep(step) => self.run_sleep_step(step, context, reports).await,
             Step::QueryDb(step) => self.run_query_db_step(step, context, reports).await,
             Step::QueryRedis(step) => self.run_query_redis_step(step, context, reports).await,
-            Step::Conditional(step) => self.run_conditional_step(step, context, reports).await,
-            Step::Foreach(step) => self.run_foreach_step(step, context, reports).await,
+            Step::Conditional(step) => {
+                self.run_conditional_step(step, context, reports, location)
+                    .await
+            }
+            Step::Foreach(step) => {
+                self.run_foreach_step(step, context, reports, location)
+                    .await
+            }
         }
     }
 
@@ -1799,6 +1869,7 @@ impl Runner {
         step: &ConditionalStep,
         context: &mut ExecutionContext<'_>,
         reports: &mut Vec<StepReport>,
+        location: &str,
     ) -> Result<()> {
         let started = Instant::now();
         let condition = context
@@ -1812,10 +1883,12 @@ impl Runner {
             error: None,
         });
         if condition {
-            self.execute_step_list(&step.then_steps, context, reports)
+            let branch_scope = format!("{location}.then");
+            self.execute_step_list(&step.then_steps, context, reports, branch_scope)
                 .await?;
         } else {
-            self.execute_step_list(&step.else_steps, context, reports)
+            let branch_scope = format!("{location}.else");
+            self.execute_step_list(&step.else_steps, context, reports, branch_scope)
                 .await?;
         }
         Ok(())
@@ -1826,10 +1899,11 @@ impl Runner {
         step: &ForeachStep,
         context: &mut ExecutionContext<'_>,
         reports: &mut Vec<StepReport>,
+        location: &str,
     ) -> Result<()> {
         let started = Instant::now();
         let values = context
-            .resolve_value(&Value::String(step.expression.clone()))
+            .evaluate_explicit_expr_value(&step.expression)
             .with_context(|| {
                 format!(
                     "failed to evaluate foreach expression `{}`",
@@ -1838,8 +1912,9 @@ impl Runner {
             })?;
         let Some(items) = values.as_array().cloned() else {
             bail!(
-                "foreach expression {} did not resolve to an array",
-                step.expression
+                "foreach expression `{}` resolved to {}, expected an array",
+                step.expression,
+                describe_value_for_error(&values)
             );
         };
 
@@ -1852,9 +1927,10 @@ impl Runner {
         });
 
         let previous = context.lookup_var(&step.binding);
-        for item in items {
+        for (iteration_index, item) in items.into_iter().enumerate() {
             context.set_var(&step.binding, item);
-            self.execute_step_list(&step.steps, context, reports)
+            let iteration_scope = format!("{location}.foreach[{iteration_index}]");
+            self.execute_step_list(&step.steps, context, reports, iteration_scope)
                 .await?;
         }
         context.restore_var(&step.binding, previous);
@@ -3357,7 +3433,7 @@ steps:
 steps:
   - run_case:
       id: login
-      case: user/login/happy-path
+      case: user/get-user/smoke
       cleanup: immediate
 "#,
         )
