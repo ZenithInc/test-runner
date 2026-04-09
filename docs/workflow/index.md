@@ -8,6 +8,7 @@ workflow 是 `test-runner` 在 case 之上增加的一层编排能力。
 
 这也是为什么 workflow 只暴露少量稳定概念：
 
+- `setup / teardown`
 - `run_case`
 - `inputs`
 - `exports`
@@ -29,7 +30,7 @@ workflow 是 `test-runner` 在 case 之上增加的一层编排能力。
 通常可以这样划分职责：
 
 - **case**：负责一个明确测试单元，内部可以有 `setup / steps / teardown`
-- **workflow**：负责多个 case 的顺序、分支、输入输出衔接和 cleanup 策略
+- **workflow**：负责多个 case 的顺序、分支、共享前后置逻辑、输入输出衔接和 cleanup 策略
 
 如果一个测试场景需要跨多个 case 共享副作用，或者你希望在成功/失败后走不同路径，就应该考虑 workflow。
 
@@ -66,6 +67,9 @@ name: register login create order
 description: optional
 vars:
   phone: "13800000000"
+setup:
+  - set:
+      tenant: cn
 steps:
   - run_case:
       id: register
@@ -89,6 +93,10 @@ steps:
             seed_sms: false
             sms_code: "${workflow.steps.send-sms.exports.sms_code}"
           cleanup: defer
+teardown:
+  - exec:
+      service: app
+      shell: "php artisan orders:cleanup --phone='{{ workflow.vars.phone }}'"
 ```
 
 ### 顶层字段
@@ -98,11 +106,44 @@ steps:
 | `name` | string | workflow 名称 |
 | `description` | string? | 可选描述 |
 | `vars` | object | workflow 级变量 |
+| `setup` | array | workflow 前置步骤，复用 case 风格 step |
 | `steps` | array | workflow 步骤列表 |
+| `teardown` | array | workflow 收尾步骤，复用 case 风格 step |
 
-## Step 类型
+## `setup / teardown`
 
-V1 只支持两类 workflow step：
+workflow 的 `setup` / `teardown` 复用 case 风格 step，可以放：
+
+- `set`
+- `use_data`
+- `exec`
+- `request` / `callback`
+- `sql` / `redis` / `query_db` / `query_redis`
+- `if` / `foreach`
+
+例如：
+
+```yaml
+setup:
+  - set:
+      seed_phone: "13800000000"
+  - exec:
+      service: app
+      shell: "php artisan user:seed --phone='{{ workflow.vars.seed_phone }}'"
+  - request:
+      api: system/health/check
+```
+
+需要注意：
+
+- hook 里的 `request.api` 必填，因为 workflow 本身没有 case 顶层 `api`
+- hook 执行时，`set` / `extract` 写入的变量会同步回 `workflow.vars.*`
+- 如果当前环境没有 `runtime`，`exec` 会明确标记为 `skipped`
+- `teardown` 会在 workflow 主体和 deferred case teardown 之后执行；如果 `setup` 本身失败，则不会继续进入主体和 `teardown`
+
+## 主体 Step 类型
+
+V1 的 workflow 主体 `steps` 仍然只支持两类 orchestration step：
 
 - `run_case`
 - `if / then / else`
@@ -165,7 +206,7 @@ workflow 运行时可以访问下面这些对象：
 
 | 路径 | 类型 | 说明 |
 | --- | --- | --- |
-| `workflow.vars.*` | any | workflow 顶层 `vars` |
+| `workflow.vars.*` | any | workflow 顶层 `vars`，以及 setup / teardown 期间同步回写的变量 |
 | `workflow.steps.<id>.status` | string | step 状态，例如 `passed` / `failed` |
 | `workflow.steps.<id>.passed` | bool | step 是否通过 |
 | `workflow.steps.<id>.error` | string \| null | 失败时的错误信息 |
@@ -186,6 +227,7 @@ inputs:
 ### workflow 变量的求值与可见性
 
 - `workflow.vars` 会在 workflow 开始时按声明顺序依次求值。
+- `setup / teardown` 里的 `set`、`extract`、`foreach as` 变量变化会同步回 `workflow.vars.*`。
 - 后定义的 workflow 变量可以引用前面已经成功解析的 `workflow.vars.*`。
 - `workflow.steps.<id>.*` 只有在对应 `run_case` 执行完成后才可见；在那之前不能引用它的 `exports` 或 `passed`。
 - workflow 运行时可访问的根对象只有 `workflow`、`env`、`project`、`data`；它不会直接暴露某个 case 的内部 `vars.*`。

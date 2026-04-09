@@ -410,8 +410,14 @@ pub fn load_project(root: &Path, env_override: Option<&str>) -> Result<LoadedPro
     let workflows_root = runner_root.join("workflows");
     let mock_routes_root = runner_root.join("mocks").join("routes");
     let cases = load_cases(&cases_root)?;
-    validate_case_definitions(&cases, &apis, &datasources, &cases_root)?;
-    let workflows = load_workflows(&workflows_root, &cases)?;
+    validate_case_definitions(&cases, &apis, &datasources, &environment, &cases_root)?;
+    let workflows = load_workflows(
+        &workflows_root,
+        &cases,
+        &apis,
+        &datasources,
+        &environment,
+    )?;
     let mock_routes = load_mock_routes(&mock_routes_root, &apis)?;
 
     if apis.is_empty() {
@@ -546,7 +552,13 @@ fn load_cases(root: &Path) -> Result<Vec<LoadedCase>> {
     Ok(cases)
 }
 
-fn load_workflows(root: &Path, cases: &[LoadedCase]) -> Result<IndexMap<String, LoadedWorkflow>> {
+fn load_workflows(
+    root: &Path,
+    cases: &[LoadedCase],
+    apis: &IndexMap<String, LoadedApi>,
+    datasources: &IndexMap<String, DatasourceDefinition>,
+    environment: &EnvironmentConfig,
+) -> Result<IndexMap<String, LoadedWorkflow>> {
     let mut workflows = IndexMap::new();
     for path in discover_yaml_files(root)? {
         let definition: WorkflowFile = read_yaml(&path)?;
@@ -559,7 +571,7 @@ fn load_workflows(root: &Path, cases: &[LoadedCase]) -> Result<IndexMap<String, 
             relative_path: relative,
             definition,
         };
-        validate_workflow_references(&workflow, cases)
+        validate_workflow_references(&workflow, cases, apis, datasources, environment)
             .with_context(|| format!("invalid workflow definition in {}", path.display()))?;
         workflows.insert(workflow.id.clone(), workflow);
     }
@@ -634,10 +646,11 @@ fn validate_case_definitions(
     cases: &[LoadedCase],
     apis: &IndexMap<String, LoadedApi>,
     datasources: &IndexMap<String, DatasourceDefinition>,
+    environment: &EnvironmentConfig,
     cases_root: &Path,
 ) -> Result<()> {
     for case in cases {
-        validate_case_definition(case, apis, datasources).with_context(|| {
+        validate_case_definition(case, apis, datasources, environment).with_context(|| {
             format!(
                 "invalid case definition in {}",
                 cases_root.join(&case.relative_path).display()
@@ -651,27 +664,31 @@ fn validate_case_definition(
     case: &LoadedCase,
     apis: &IndexMap<String, LoadedApi>,
     datasources: &IndexMap<String, DatasourceDefinition>,
+    environment: &EnvironmentConfig,
 ) -> Result<()> {
     ensure_known_api(&case.definition.api, apis, "case.api")?;
     validate_case_steps(
         &case.definition.setup,
-        &case.definition.api,
+        Some(&case.definition.api),
         apis,
         datasources,
+        environment,
         "setup",
     )?;
     validate_case_steps(
         &case.definition.steps,
-        &case.definition.api,
+        Some(&case.definition.api),
         apis,
         datasources,
+        environment,
         "steps",
     )?;
     validate_case_steps(
         &case.definition.teardown,
-        &case.definition.api,
+        Some(&case.definition.api),
         apis,
         datasources,
+        environment,
         "teardown",
     )?;
     Ok(())
@@ -679,9 +696,10 @@ fn validate_case_definition(
 
 fn validate_case_steps(
     steps: &[Step],
-    default_api_id: &str,
+    default_api_id: Option<&str>,
     apis: &IndexMap<String, LoadedApi>,
     datasources: &IndexMap<String, DatasourceDefinition>,
+    environment: &EnvironmentConfig,
     location: &str,
 ) -> Result<()> {
     for (index, step) in steps.iter().enumerate() {
@@ -699,13 +717,23 @@ fn validate_case_steps(
                 &format!("{step_location}.redis.datasource"),
             )?,
             Step::Request(step) => {
-                let api_id = step.request.api.as_deref().unwrap_or(default_api_id);
-                ensure_known_api(api_id, apis, &format!("{step_location}.request.api"))?;
+                let reference = format!("{step_location}.request.api");
+                match step.request.api.as_deref().or(default_api_id) {
+                    Some(api_id) => ensure_known_api(api_id, apis, &reference)?,
+                    None => bail!(
+                        "{reference} is required in workflow hooks because there is no default case API"
+                    ),
+                }
             }
             Step::Callback(step) => ensure_known_api(
                 step.request.api.as_deref().unwrap_or_default(),
                 apis,
                 &format!("{step_location}.callback.request.api"),
+            )?,
+            Step::Exec(step) => ensure_exec_service(
+                &step.exec.service,
+                environment,
+                &format!("{step_location}.exec.service"),
             )?,
             Step::QueryDb(step) => ensure_sql_datasource(
                 &step.query.datasource,
@@ -723,6 +751,7 @@ fn validate_case_steps(
                     default_api_id,
                     apis,
                     datasources,
+                    environment,
                     &format!("{step_location}.then"),
                 )?;
                 validate_case_steps(
@@ -730,6 +759,7 @@ fn validate_case_steps(
                     default_api_id,
                     apis,
                     datasources,
+                    environment,
                     &format!("{step_location}.else"),
                 )?;
             }
@@ -738,6 +768,7 @@ fn validate_case_steps(
                 default_api_id,
                 apis,
                 datasources,
+                environment,
                 &format!("{step_location}.steps"),
             )?,
         }
@@ -745,8 +776,32 @@ fn validate_case_steps(
     Ok(())
 }
 
-fn validate_workflow_references(workflow: &LoadedWorkflow, cases: &[LoadedCase]) -> Result<()> {
+fn validate_workflow_references(
+    workflow: &LoadedWorkflow,
+    cases: &[LoadedCase],
+    apis: &IndexMap<String, LoadedApi>,
+    datasources: &IndexMap<String, DatasourceDefinition>,
+    environment: &EnvironmentConfig,
+) -> Result<()> {
+    validate_case_steps(
+        &workflow.definition.setup,
+        None,
+        apis,
+        datasources,
+        environment,
+        "setup",
+    )?;
     validate_workflow_steps(&workflow.definition.steps, cases, "steps")
+        .and_then(|_| {
+            validate_case_steps(
+                &workflow.definition.teardown,
+                None,
+                apis,
+                datasources,
+                environment,
+                "teardown",
+            )
+        })
 }
 
 fn validate_workflow_steps(
@@ -866,6 +921,29 @@ fn ensure_redis_datasource(
         }
         None => bail!("{reference} references unknown datasource `{datasource}`"),
     }
+}
+
+fn ensure_exec_service(
+    service: &str,
+    environment: &EnvironmentConfig,
+    reference: &str,
+) -> Result<()> {
+    let service = service.trim();
+    if service.is_empty() {
+        bail!("{reference} cannot be empty");
+    }
+
+    let Some(runtime) = environment.runtime.as_ref() else {
+        return Ok(());
+    };
+
+    if runtime.kind == EnvironmentRuntimeKind::Containers
+        && !runtime.services.iter().any(|candidate| candidate.name == service)
+    {
+        bail!("{reference} references unknown runtime service `{service}`");
+    }
+
+    Ok(())
 }
 
 fn validate_environment_config(environment: &EnvironmentConfig) -> Result<()> {

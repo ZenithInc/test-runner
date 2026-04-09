@@ -1,10 +1,16 @@
 use assert_cmd::Command;
 use predicates::str::contains;
+use serde_json::Value;
 use std::fs;
 use tempfile::tempdir;
 
 fn binary() -> std::path::PathBuf {
     assert_cmd::cargo::cargo_bin!("test-runner").to_path_buf()
+}
+
+fn read_json_report(path: impl AsRef<std::path::Path>) -> Value {
+    let content = fs::read_to_string(path).expect("read report");
+    serde_json::from_str(&content).expect("parse report json")
 }
 
 #[test]
@@ -103,7 +109,9 @@ steps:
         .failure()
         .stderr(contains("failed to parse"))
         .stderr(contains("steps[0]"))
-        .stderr(contains("expected exactly one of [use_data, set, sql, redis, request, callback, sleep, query_db, query_redis, if, foreach]"));
+        .stderr(contains(
+            "expected exactly one of [use_data, set, sql, redis, exec, request, callback, sleep, query_db, query_redis, if, foreach]",
+        ));
 }
 
 #[test]
@@ -225,6 +233,44 @@ steps:
 }
 
 #[test]
+fn exec_step_rejects_shell_and_command_together() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(binary())
+        .args(["init", "--root", temp.path().to_str().expect("utf8")])
+        .assert()
+        .success();
+
+    let bad_case = temp
+        .path()
+        .join(".testrunner/cases/user/get-user/smoke.yaml");
+    fs::write(
+        &bad_case,
+        r#"
+name: invalid exec
+api: user/get-user
+steps:
+  - exec:
+      service: app
+      shell: "echo hi"
+      command: ["echo", "hi"]
+"#,
+    )
+    .expect("write invalid case");
+
+    Command::new(binary())
+        .current_dir(temp.path())
+        .args(["test", "all", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(contains("failed to parse"))
+        .stderr(contains("steps[0]"))
+        .stderr(contains(
+            "exec must define exactly one of `shell` or `command`, not both",
+        ));
+}
+
+#[test]
 fn unknown_case_api_is_reported_during_load() {
     let temp = tempdir().expect("tempdir");
 
@@ -292,6 +338,200 @@ steps:
 }
 
 #[test]
+fn workflow_hook_request_requires_explicit_api() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(binary())
+        .args(["init", "--root", temp.path().to_str().expect("utf8")])
+        .assert()
+        .success();
+
+    let workflows_dir = temp.path().join(".testrunner/workflows");
+    fs::create_dir_all(&workflows_dir).expect("create workflows dir");
+    fs::write(
+        workflows_dir.join("broken.yaml"),
+        r#"
+name: broken workflow hook
+setup:
+  - request:
+      headers:
+        x-test: 1
+steps:
+  - run_case:
+      id: smoke
+      case: user/get-user/smoke
+"#,
+    )
+    .expect("write invalid workflow");
+
+    Command::new(binary())
+        .current_dir(temp.path())
+        .args(["test", "workflow", "broken", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(contains("invalid workflow definition"))
+        .stderr(contains(
+            "setup[0].request.api is required in workflow hooks because there is no default case API",
+        ));
+}
+
+#[test]
+fn exec_step_validates_known_service_for_containers_runtime() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(binary())
+        .args(["init", "--root", temp.path().to_str().expect("utf8")])
+        .assert()
+        .success();
+
+    fs::write(
+        temp.path().join(".testrunner/env/containers.yaml"),
+        r#"
+name: containers
+base_url: http://127.0.0.1:18080
+runtime:
+  kind: containers
+  services:
+    - name: app
+      image: alpine:3.20
+"#,
+    )
+    .expect("write containers env");
+    fs::write(
+        temp.path()
+            .join(".testrunner/cases/user/get-user/smoke.yaml"),
+        r#"
+name: invalid exec service
+api: user/get-user
+steps:
+  - exec:
+      service: missing
+      shell: "echo hi"
+"#,
+    )
+    .expect("write invalid exec service case");
+
+    Command::new(binary())
+        .current_dir(temp.path())
+        .args(["test", "all", "--env", "containers", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(contains("invalid case definition"))
+        .stderr(contains(
+            "steps[0].exec.service references unknown runtime service `missing`",
+        ));
+}
+
+#[test]
+fn case_exec_step_without_runtime_is_reported_as_skipped() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(binary())
+        .args(["init", "--root", temp.path().to_str().expect("utf8")])
+        .assert()
+        .success();
+
+    fs::write(
+        temp.path()
+            .join(".testrunner/cases/user/get-user/exec-skip.yaml"),
+        r#"
+name: exec skip
+api: user/get-user
+steps:
+  - exec:
+      service: app
+      shell: "echo seeded"
+"#,
+    )
+    .expect("write exec skip case");
+
+    Command::new(binary())
+        .current_dir(temp.path())
+        .args(["test", "api", "user/get-user", "--case", "exec-skip", "--no-mock"])
+        .assert()
+        .success();
+
+    let report = read_json_report(temp.path().join(".testrunner/reports/last-run.json"));
+    assert_eq!(report["summary"]["passed"], 1);
+    assert_eq!(report["cases"][0]["status"], "passed");
+    assert_eq!(report["cases"][0]["steps"][0]["kind"], "exec");
+    assert_eq!(report["cases"][0]["steps"][0]["status"], "skipped");
+    assert_eq!(report["cases"][0]["steps"][0]["details"]["service"], "app");
+    assert_eq!(
+        report["cases"][0]["steps"][0]["details"]["reason"],
+        "environment `local` has no managed runtime; exec step skipped"
+    );
+}
+
+#[test]
+fn workflow_setup_and_teardown_support_case_style_steps() {
+    let temp = tempdir().expect("tempdir");
+
+    Command::new(binary())
+        .args(["init", "--root", temp.path().to_str().expect("utf8")])
+        .assert()
+        .success();
+
+    fs::write(
+        temp.path()
+            .join(".testrunner/cases/user/get-user/echo-input.yaml"),
+        r#"
+name: echo input
+api: user/get-user
+steps:
+  - sleep:
+      ms: 1
+"#,
+    )
+    .expect("write echo case");
+
+    let workflows_dir = temp.path().join(".testrunner/workflows");
+    fs::create_dir_all(&workflows_dir).expect("create workflows dir");
+    fs::write(
+        workflows_dir.join("setup-hooks.yaml"),
+        r#"
+name: workflow hooks
+setup:
+  - set:
+      seed_value: seeded-from-setup
+  - exec:
+      service: app
+      shell: "echo seed"
+steps:
+  - run_case:
+      id: echo
+      case: user/get-user/echo-input
+      inputs:
+        seed_value: "${workflow.vars.seed_value}"
+      exports:
+        observed: vars.seed_value
+teardown:
+  - exec:
+      service: app
+      shell: "echo cleanup"
+"#,
+    )
+    .expect("write workflow hooks");
+
+    Command::new(binary())
+        .current_dir(temp.path())
+        .args(["test", "workflow", "setup-hooks", "--no-mock"])
+        .assert()
+        .success();
+
+    let report = read_json_report(temp.path().join(".testrunner/reports/last-workflow-run.json"));
+    assert_eq!(report["status"], "passed");
+    assert_eq!(report["setup_steps"][0]["kind"], "set");
+    assert_eq!(report["setup_steps"][1]["kind"], "exec");
+    assert_eq!(report["setup_steps"][1]["status"], "skipped");
+    assert_eq!(report["steps"][0]["id"], "echo");
+    assert_eq!(report["steps"][0]["status"], "passed");
+    assert_eq!(report["steps"][0]["exports"]["observed"], "seeded-from-setup");
+    assert_eq!(report["teardown_steps"][0]["kind"], "exec");
+    assert_eq!(report["teardown_steps"][0]["status"], "skipped");
+}
+
+#[test]
 fn runtime_if_condition_failure_reports_step_path_and_reason() {
     let temp = tempdir().expect("tempdir");
 
@@ -325,6 +565,7 @@ steps:
             "user/get-user",
             "--root",
             temp.path().to_str().expect("utf8"),
+            "--no-mock",
         ])
         .assert()
         .failure()

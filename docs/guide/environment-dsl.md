@@ -160,6 +160,14 @@ runtime:
 | `extra_hosts` | string[] | 额外 hosts 映射（如 `"host.docker.internal:host-gateway"`） |
 | `wait_for` | object | 容器就绪等待策略（见下文） |
 
+这里的 `name` 不只用于容器网络别名，也会成为 DSL 里 `exec.service` 的目标名：
+
+```yaml
+- exec:
+    service: app
+    shell: "php artisan user:seed"
+```
+
 **`build` 构建配置：**
 
 | 字段 | 类型 | 说明 |
@@ -181,6 +189,34 @@ services:
 ```
 
 > 如果同时指定了 `image` 和 `build`，构建完成后会以 `image` 的值作为镜像 tag；若省略 `image`，则自动命名为 `testrunner-{name}`。
+
+### 在容器内执行前置命令（`exec`）
+
+当 case / workflow 需要先通过应用自身的业务命令准备数据时，可以直接在 DSL 里写：
+
+```yaml
+setup:
+  - exec:
+      service: app
+      shell: "php artisan orders:seed --tenant='{{ env.variables.tenant }}'"
+```
+
+或：
+
+```yaml
+- exec:
+    service: app
+    command: ["php", "artisan", "orders:seed", "--tenant={{ env.variables.tenant }}"]
+```
+
+执行语义：
+
+- `service` 必须引用 runtime 里声明的服务
+- `docker_compose` runtime 会先解析 `docker compose ps -q <service>`，再进入对应容器执行
+- `containers` runtime 会直接使用当前 slot 里已启动容器的 service 映射
+- 完整 stdout / stderr 会保留在 JSON 报告里，控制台只显示摘要
+
+如果当前环境没有配置 `runtime`，`exec` 会被明确标记为 `skipped`，这样你仍然能从报告里看出“为什么没有执行”，而不是遇到静默 no-op。
 
 **`wait_for` 等待策略：**
 

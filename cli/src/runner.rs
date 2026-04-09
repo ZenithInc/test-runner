@@ -34,10 +34,13 @@ use crate::config::{
     load_project,
 };
 use crate::dsl::{
-    CallbackStep, ConditionalStep, ForeachStep, QueryDbStep, QueryRedisStep, RedisCommandStep,
-    RequestSpec, RequestStep, SleepStep, SqlExecStep, Step, step_kind_name,
+    CallbackStep, ConditionalStep, ExecStep, ForeachStep, QueryDbStep, QueryRedisStep,
+    RedisCommandStep, RequestSpec, RequestStep, SleepStep, SqlExecStep, Step, step_kind_name,
 };
-use crate::environment::{EnvironmentArtifactsReport, EnvironmentSession};
+use crate::environment::{
+    EnvironmentArtifactsReport, EnvironmentExecRequest, EnvironmentExecTarget, EnvironmentSession,
+    execute_environment_command,
+};
 use crate::mock;
 use crate::runtime::{
     RuntimeContext, apply_assertions, describe_value_for_error, format_error_chain, value_to_string,
@@ -169,6 +172,7 @@ pub async fn run(command: TestCommand) -> Result<()> {
                             options.report_format,
                             slot_context.callback_runtime,
                             None,
+                            slot_context.environment_exec_target,
                         );
                         runner.execute(&selected_cases, &options, &target).await
                     }
@@ -317,6 +321,7 @@ async fn run_workflow(args: TestWorkflowArgs) -> Result<()> {
                             options.report_format,
                             slot_context.callback_runtime,
                             None,
+                            slot_context.environment_exec_target,
                         );
                         runner
                             .execute_workflow(&workflows[0].id, &workflows[0], options)
@@ -486,6 +491,10 @@ struct WorkflowRunReport {
     callbacks: Vec<CallbackReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     environment_artifacts: Option<EnvironmentArtifactsReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    setup_steps: Vec<StepReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    teardown_steps: Vec<StepReport>,
     steps: Vec<WorkflowStepReport>,
 }
 
@@ -865,6 +874,7 @@ struct SlotExecutionContext {
     slot_id: usize,
     project: LoadedProject,
     callback_runtime: CallbackRuntime,
+    environment_exec_target: Option<EnvironmentExecTarget>,
 }
 
 struct SlotReservedMockEndpoint {
@@ -975,6 +985,7 @@ struct Runner {
     redis_clients: HashMap<String, redis::Client>,
     console: SummaryConsole,
     slot_id: Option<usize>,
+    environment_exec_target: Option<EnvironmentExecTarget>,
 }
 
 impl Runner {
@@ -983,6 +994,7 @@ impl Runner {
         report_format: ReportFormat,
         callback_runtime: CallbackRuntime,
         slot_id: Option<usize>,
+        environment_exec_target: Option<EnvironmentExecTarget>,
     ) -> Self {
         let request_context = RequestPreparationContext::from_project(&project);
         let http_client = build_http_client(&project);
@@ -995,6 +1007,7 @@ impl Runner {
             redis_clients: HashMap::new(),
             console: SummaryConsole::new(report_format),
             slot_id,
+            environment_exec_target,
         }
     }
 
@@ -1061,31 +1074,73 @@ impl Runner {
             steps: IndexMap::new(),
         };
         for (key, value) in &workflow.definition.vars {
-            let workflow_runtime = build_workflow_runtime(&self.project, &state)?;
+            let workflow_runtime =
+                build_workflow_runtime(&self.project, workflow_id, &workflow.definition.name, &state)?;
             let resolved = workflow_runtime
                 .resolve_value(value)
                 .with_context(|| format!("failed to resolve workflow var `{key}`"))?;
             state.vars.insert(key.clone(), resolved);
         }
 
+        let mut setup_steps = Vec::new();
+        let mut teardown_steps = Vec::new();
         let mut step_reports = Vec::new();
         let mut deferred_teardowns = Vec::new();
         let mut any_case_failed = false;
+        let mut workflow_error: Option<String> = None;
         let mut stop_execution = false;
         let mut executed_run_case_steps = 0usize;
+        let mut should_run_teardown = false;
 
-        self.execute_workflow_steps(
-            &workflow.definition.steps,
-            &mut state,
-            &mut step_reports,
-            &mut deferred_teardowns,
-            &mut any_case_failed,
-            options.fail_fast,
-            &mut stop_execution,
-            &mut executed_run_case_steps,
-            "steps".to_string(),
-        )
-        .await?;
+        match ExecutionContext::for_workflow(
+            &self.project,
+            workflow_id,
+            &workflow.definition.name,
+            &state,
+        ) {
+            Ok(mut context) => {
+                if let Err(error) = self
+                    .execute_step_list(
+                        &workflow.definition.setup,
+                        &mut context,
+                        &mut setup_steps,
+                        "setup".to_string(),
+                    )
+                    .await
+                {
+                    workflow_error =
+                        Some(format_error_chain(&error.context("workflow setup failed")));
+                } else {
+                    context.write_back_workflow_vars(&mut state);
+                    should_run_teardown = true;
+                }
+            }
+            Err(error) => {
+                workflow_error =
+                    Some(format_error_chain(&error.context("workflow setup context init failed")));
+            }
+        }
+
+        if workflow_error.is_none() {
+            if let Err(error) = self
+                .execute_workflow_steps(
+                    workflow_id,
+                    &workflow.definition.name,
+                    &workflow.definition.steps,
+                    &mut state,
+                    &mut step_reports,
+                    &mut deferred_teardowns,
+                    &mut any_case_failed,
+                    options.fail_fast,
+                    &mut stop_execution,
+                    &mut executed_run_case_steps,
+                    "steps".to_string(),
+                )
+                .await
+            {
+                workflow_error = Some(format_error_chain(&error));
+            }
+        }
 
         deferred_teardowns.reverse();
         for deferred in deferred_teardowns {
@@ -1105,15 +1160,60 @@ impl Runner {
             }
         }
 
+        if should_run_teardown {
+            match ExecutionContext::for_workflow(
+                &self.project,
+                workflow_id,
+                &workflow.definition.name,
+                &state,
+            ) {
+                Ok(mut context) => {
+                    if let Err(error) = self
+                        .execute_step_list(
+                            &workflow.definition.teardown,
+                            &mut context,
+                            &mut teardown_steps,
+                            "teardown".to_string(),
+                        )
+                        .await
+                    {
+                        let message =
+                            format_error_chain(&error.context("workflow teardown failed"));
+                        match &mut workflow_error {
+                            Some(existing) => *existing = format!("{existing}; {message}"),
+                            None => workflow_error = Some(message),
+                        }
+                    } else {
+                        context.write_back_workflow_vars(&mut state);
+                    }
+                }
+                Err(error) => {
+                    let message =
+                        format_error_chain(&error.context("workflow teardown context init failed"));
+                    match &mut workflow_error {
+                        Some(existing) => *existing = format!("{existing}; {message}"),
+                        None => workflow_error = Some(message),
+                    }
+                }
+            }
+        }
+
         let callbacks = self.callback_runtime.flush().await;
         let callback_summary = CallbackSummaryReport::from_reports(&callbacks);
         if callback_summary.failed > 0 {
             any_case_failed = true;
         }
-        let status = if any_case_failed { "failed" } else { "passed" };
+        let status = if workflow_error.is_some() || any_case_failed {
+            "failed"
+        } else {
+            "passed"
+        };
         let passed_steps = step_reports.iter().filter(|report| report.passed).count();
         let failed_steps = step_reports.iter().filter(|report| !report.passed).count();
         let mut error_parts = Vec::new();
+        if let Some(error) = workflow_error {
+            error_parts.push(error);
+        }
         if failed_steps > 0 {
             error_parts.push(format!(
                 "{failed_steps} of {} step(s) failed",
@@ -1150,12 +1250,16 @@ impl Runner {
             callback_summary,
             callbacks,
             environment_artifacts: None,
+            setup_steps,
+            teardown_steps,
             steps: step_reports,
         })
     }
 
     fn execute_workflow_steps<'a>(
         &'a mut self,
+        workflow_id: &'a str,
+        workflow_name: &'a str,
         steps: &'a [WorkflowStep],
         state: &'a mut WorkflowState,
         step_reports: &'a mut Vec<WorkflowStepReport>,
@@ -1174,7 +1278,8 @@ impl Runner {
                 let step_location = format!("{scope}[{index}]");
                 match step {
                     WorkflowStep::RunCase(run_case) => {
-                        let wf_runtime = build_workflow_runtime(&self.project, state)?;
+                        let wf_runtime =
+                            build_workflow_runtime(&self.project, workflow_id, workflow_name, state)?;
                         let resolved_inputs: IndexMap<String, Value> = run_case
                             .inputs
                             .iter()
@@ -1247,7 +1352,8 @@ impl Runner {
                         step_reports.push(outcome.step_report);
                     }
                     WorkflowStep::Conditional(cond) => {
-                        let wf_runtime = build_workflow_runtime(&self.project, state)?;
+                        let wf_runtime =
+                            build_workflow_runtime(&self.project, workflow_id, workflow_name, state)?;
                         let condition = wf_runtime
                             .evaluate_condition(&cond.condition)
                             .with_context(|| {
@@ -1268,6 +1374,8 @@ impl Runner {
                             format!("{step_location}.else")
                         };
                         self.execute_workflow_steps(
+                            workflow_id,
+                            workflow_name,
                             branch,
                             state,
                             step_reports,
@@ -1474,7 +1582,11 @@ impl Runner {
         deferred: DeferredTeardown,
     ) -> (String, Vec<StepReport>, Option<String>) {
         let mut context =
-            match ExecutionContext::from_saved_root(&deferred.case, deferred.saved_root) {
+            match ExecutionContext::from_saved_root(
+                Some(deferred.case.definition.api.clone()),
+                format!("case:{}", deferred.case.id),
+                deferred.saved_root,
+            ) {
                 Ok(context) => context,
                 Err(error) => {
                     return (
@@ -1621,7 +1733,7 @@ impl Runner {
     fn execute_step_list<'a>(
         &'a mut self,
         steps: &'a [Step],
-        context: &'a mut ExecutionContext<'_>,
+        context: &'a mut ExecutionContext,
         reports: &'a mut Vec<StepReport>,
         scope: String,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
@@ -1641,7 +1753,7 @@ impl Runner {
     async fn execute_single_step(
         &mut self,
         step: &Step,
-        context: &mut ExecutionContext<'_>,
+        context: &mut ExecutionContext,
         reports: &mut Vec<StepReport>,
         location: &str,
     ) -> Result<()> {
@@ -1676,6 +1788,7 @@ impl Runner {
             }
             Step::Sql(step) => self.run_sql_step(step, context, reports).await,
             Step::Redis(step) => self.run_redis_step(step, context, reports).await,
+            Step::Exec(step) => self.run_exec_step(step, context, reports).await,
             Step::Request(step) => self.run_request_step(step, context, reports).await,
             Step::Callback(step) => self.run_callback_step(step, context, reports).await,
             Step::Sleep(step) => self.run_sleep_step(step, context, reports).await,
@@ -1695,7 +1808,7 @@ impl Runner {
     async fn run_sql_step(
         &mut self,
         step: &SqlExecStep,
-        context: &mut ExecutionContext<'_>,
+        context: &mut ExecutionContext,
         reports: &mut Vec<StepReport>,
     ) -> Result<()> {
         let started = Instant::now();
@@ -1716,7 +1829,7 @@ impl Runner {
     async fn run_redis_step(
         &mut self,
         step: &RedisCommandStep,
-        context: &mut ExecutionContext<'_>,
+        context: &mut ExecutionContext,
         reports: &mut Vec<StepReport>,
     ) -> Result<()> {
         let started = Instant::now();
@@ -1735,10 +1848,94 @@ impl Runner {
         Ok(())
     }
 
+    async fn run_exec_step(
+        &mut self,
+        step: &ExecStep,
+        context: &mut ExecutionContext,
+        reports: &mut Vec<StepReport>,
+    ) -> Result<()> {
+        let started = Instant::now();
+        let command = self.resolve_exec_command(step, context)?;
+        let skipped_reason = format!(
+            "environment `{}` has no managed runtime; exec step skipped",
+            self.project.environment_name
+        );
+        let base_details = json!({
+            "service": step.exec.service,
+            "command": command.clone(),
+        });
+
+        let Some(target) = self.environment_exec_target.as_ref() else {
+            let mut details = base_details;
+            if let Some(object) = details.as_object_mut() {
+                object.insert("reason".to_string(), Value::String(skipped_reason.clone()));
+            }
+            context.set_result(details.clone());
+            reports.push(StepReport {
+                kind: "exec".to_string(),
+                status: "skipped".to_string(),
+                duration_ms: started.elapsed().as_millis(),
+                details,
+                error: Some(skipped_reason),
+            });
+            return Ok(());
+        };
+
+        let request = EnvironmentExecRequest {
+            service: step.exec.service.clone(),
+            command: command.clone(),
+        };
+        match execute_environment_command(target, &request).await {
+            Ok(output) => {
+                let result = json!({
+                    "service": output.service,
+                    "command": output.command,
+                    "exit_code": output.exit_code,
+                    "stdout": output.stdout,
+                    "stderr": output.stderr,
+                });
+                context.set_result(result.clone());
+                if output.exit_code != 0 {
+                    let message = self.format_exec_exit_error(&output);
+                    reports.push(StepReport {
+                        kind: "exec".to_string(),
+                        status: "failed".to_string(),
+                        duration_ms: started.elapsed().as_millis(),
+                        details: result,
+                        error: Some(message.clone()),
+                    });
+                    bail!("{message}");
+                }
+                context
+                    .apply_extracts(&step.extract)
+                    .context("exec extract failed")?;
+                apply_assertions(&step.assertions, context).context("exec assertions failed")?;
+                reports.push(StepReport {
+                    kind: "exec".to_string(),
+                    status: "passed".to_string(),
+                    duration_ms: started.elapsed().as_millis(),
+                    details: result,
+                    error: None,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                reports.push(StepReport {
+                    kind: "exec".to_string(),
+                    status: "failed".to_string(),
+                    duration_ms: started.elapsed().as_millis(),
+                    details: base_details,
+                    error: Some(error.to_string()),
+                });
+                Err(error)
+            }
+        }
+    }
+
     async fn run_request_step(
         &mut self,
         step: &RequestStep,
-        context: &mut ExecutionContext<'_>,
+        context: &mut ExecutionContext,
         reports: &mut Vec<StepReport>,
     ) -> Result<()> {
         let started = Instant::now();
@@ -1754,7 +1951,12 @@ impl Runner {
             status: "passed".to_string(),
             duration_ms: started.elapsed().as_millis(),
             details: json!({
-                "api": step.request.api.clone().unwrap_or_else(|| context.case.definition.api.clone()),
+                "api": step
+                    .request
+                    .api
+                    .clone()
+                    .or_else(|| context.default_api_id().map(ToOwned::to_owned))
+                    .unwrap_or_default(),
                 "status": response.get("status").cloned().unwrap_or(Value::Null)
             }),
             error: None,
@@ -1765,13 +1967,13 @@ impl Runner {
     async fn run_callback_step(
         &mut self,
         step: &CallbackStep,
-        context: &mut ExecutionContext<'_>,
+        context: &mut ExecutionContext,
         reports: &mut Vec<StepReport>,
     ) -> Result<()> {
         let started = Instant::now();
         let request = prepare_callback_request(&self.request_context, &step.request, context)?;
         let scheduled = self.callback_runtime.schedule(ScheduledCallback {
-            source: format!("case:{}", context.case.id),
+            source: context.callback_source.clone(),
             after_ms: step.after_ms,
             request,
         });
@@ -1794,7 +1996,7 @@ impl Runner {
     async fn run_sleep_step(
         &mut self,
         step: &SleepStep,
-        context: &mut ExecutionContext<'_>,
+        context: &mut ExecutionContext,
         reports: &mut Vec<StepReport>,
     ) -> Result<()> {
         let started = Instant::now();
@@ -1814,7 +2016,7 @@ impl Runner {
     async fn run_query_db_step(
         &mut self,
         step: &QueryDbStep,
-        context: &mut ExecutionContext<'_>,
+        context: &mut ExecutionContext,
         reports: &mut Vec<StepReport>,
     ) -> Result<()> {
         let started = Instant::now();
@@ -1841,7 +2043,7 @@ impl Runner {
     async fn run_query_redis_step(
         &mut self,
         step: &QueryRedisStep,
-        context: &mut ExecutionContext<'_>,
+        context: &mut ExecutionContext,
         reports: &mut Vec<StepReport>,
     ) -> Result<()> {
         let started = Instant::now();
@@ -1867,7 +2069,7 @@ impl Runner {
     async fn run_conditional_step(
         &mut self,
         step: &ConditionalStep,
-        context: &mut ExecutionContext<'_>,
+        context: &mut ExecutionContext,
         reports: &mut Vec<StepReport>,
         location: &str,
     ) -> Result<()> {
@@ -1897,7 +2099,7 @@ impl Runner {
     async fn run_foreach_step(
         &mut self,
         step: &ForeachStep,
-        context: &mut ExecutionContext<'_>,
+        context: &mut ExecutionContext,
         reports: &mut Vec<StepReport>,
         location: &str,
     ) -> Result<()> {
@@ -1946,20 +2148,52 @@ impl Runner {
             .with_context(|| format!("failed to read SQL file {file}"))
     }
 
-    fn resolve_args(&self, args: &[Value], context: &ExecutionContext<'_>) -> Result<Vec<String>> {
+    fn resolve_args(&self, args: &[Value], context: &ExecutionContext) -> Result<Vec<String>> {
         args.iter()
             .map(|value| context.resolve_value(value).map(value_to_string))
             .collect()
     }
 
+    fn resolve_exec_command(&self, step: &ExecStep, context: &ExecutionContext) -> Result<Vec<String>> {
+        if let Some(shell) = step.exec.shell.as_ref() {
+            let shell = value_to_string(
+                context
+                    .resolve_value(&Value::String(shell.clone()))
+                    .context("failed to resolve exec.shell")?,
+            );
+            return Ok(vec!["sh".to_string(), "-lc".to_string(), shell]);
+        }
+
+        self.resolve_args(&step.exec.command, context)
+    }
+
+    fn format_exec_exit_error(&self, output: &crate::environment::EnvironmentExecOutput) -> String {
+        let stderr = output.stderr.trim();
+        let stdout = output.stdout.trim();
+        let suffix = if !stderr.is_empty() {
+            format!("; stderr: {stderr}")
+        } else if !stdout.is_empty() {
+            format!("; stdout: {stdout}")
+        } else {
+            String::new()
+        };
+        format!(
+            "exec command on service `{}` exited with code {}{}",
+            output.service, output.exit_code, suffix
+        )
+    }
+
     async fn execute_request(
         &self,
         step: &RequestSpec,
-        context: &ExecutionContext<'_>,
+        context: &ExecutionContext,
     ) -> Result<Value> {
+        let default_api_id = context.default_api_id().with_context(|| {
+            "request.api is required in workflow hooks because there is no default case API"
+        })?;
         let request = prepare_case_request(
             &self.request_context,
-            &context.case.definition.api,
+            default_api_id,
             step,
             context,
         )?;
@@ -2187,6 +2421,15 @@ async fn build_slot_execution_contexts(
         };
         let callback_runtime = CallbackRuntime::new(build_http_client(&base_project));
         let mut execution_project = base_project.clone();
+        let environment_exec_target = match session.exec_target_for_slot(slot_id) {
+            Ok(target) => target,
+            Err(error) => {
+                for server in mock_servers.drain(..) {
+                    server.shutdown().await;
+                }
+                return Err(error);
+            }
+        };
 
         if should_start_mock {
             let reserved_endpoint = reserved_mock_endpoints.remove(&slot_id);
@@ -2240,6 +2483,7 @@ async fn build_slot_execution_contexts(
             slot_id,
             project: execution_project,
             callback_runtime,
+            environment_exec_target,
         });
     }
 
@@ -2482,6 +2726,7 @@ async fn spawn_case_task(
             ReportFormat::Json,
             slot.callback_runtime,
             Some(slot.slot_id),
+            slot.environment_exec_target,
         );
         let run_report = runner
             .execute(std::slice::from_ref(&case), &options, &target)
@@ -2519,6 +2764,7 @@ async fn execute_workflows_serial(
             ReportFormat::Json,
             slot_context.callback_runtime.clone(),
             None,
+            slot_context.environment_exec_target.clone(),
         );
         let report = runner
             .execute_workflow(&workflow.id, workflow, options)
@@ -2662,6 +2908,7 @@ async fn spawn_workflow_task(
             ReportFormat::Json,
             slot.callback_runtime,
             Some(slot.slot_id),
+            slot.environment_exec_target,
         );
         let report = runner
             .execute_workflow(&workflow.id, &workflow, &options)
@@ -2706,13 +2953,15 @@ impl DatabasePool {
     }
 }
 
-struct ExecutionContext<'a> {
-    case: &'a LoadedCase,
+struct ExecutionContext {
+    default_api_id: Option<String>,
+    callback_source: String,
+    sync_workflow_vars: bool,
     runtime: RuntimeContext,
 }
 
-impl<'a> ExecutionContext<'a> {
-    fn new(project: &LoadedProject, case: &'a LoadedCase) -> Result<Self> {
+impl ExecutionContext {
+    fn new(project: &LoadedProject, case: &LoadedCase) -> Result<Self> {
         let api = project
             .apis
             .get(&case.definition.api)
@@ -2747,16 +2996,59 @@ impl<'a> ExecutionContext<'a> {
         );
 
         Ok(Self {
-            case,
+            default_api_id: Some(case.definition.api.clone()),
+            callback_source: format!("case:{}", case.id),
+            sync_workflow_vars: false,
             runtime: RuntimeContext::new(root)?,
         })
     }
 
-    fn from_saved_root(case: &'a LoadedCase, root: serde_json::Map<String, Value>) -> Result<Self> {
+    fn from_saved_root(
+        default_api_id: Option<String>,
+        callback_source: String,
+        root: serde_json::Map<String, Value>,
+    ) -> Result<Self> {
         Ok(Self {
-            case,
+            default_api_id,
+            callback_source,
+            sync_workflow_vars: false,
             runtime: RuntimeContext::new(root)?,
         })
+    }
+
+    fn for_workflow(
+        project: &LoadedProject,
+        workflow_id: &str,
+        workflow_name: &str,
+        state: &WorkflowState,
+    ) -> Result<Self> {
+        let mut root = build_workflow_root(project, workflow_id, workflow_name, state)?;
+        root.insert("vars".to_string(), Value::Object(state.vars.clone()));
+        Ok(Self {
+            default_api_id: None,
+            callback_source: format!("workflow:{workflow_id}"),
+            sync_workflow_vars: true,
+            runtime: RuntimeContext::new(root)?,
+        })
+    }
+
+    fn default_api_id(&self) -> Option<&str> {
+        self.default_api_id.as_deref()
+    }
+
+    fn write_back_workflow_vars(&self, state: &mut WorkflowState) {
+        if !self.sync_workflow_vars {
+            return;
+        }
+        if let Some(vars) = self
+            .runtime
+            .root()
+            .get("vars")
+            .and_then(Value::as_object)
+            .cloned()
+        {
+            state.vars = vars;
+        }
     }
 
     fn set_response(&mut self, value: Value) {
@@ -2765,6 +3057,22 @@ impl<'a> ExecutionContext<'a> {
 
     fn set_result(&mut self, value: Value) {
         self.runtime.set_root_value("result", value);
+    }
+
+    fn set_var(&mut self, name: &str, value: Value) {
+        self.runtime.set_var(name, value);
+        self.sync_workflow_vars_root();
+    }
+
+    fn restore_var(&mut self, name: &str, previous: Option<Value>) {
+        self.runtime.restore_var(name, previous);
+        self.sync_workflow_vars_root();
+    }
+
+    fn apply_extracts(&mut self, extract: &IndexMap<String, String>) -> Result<()> {
+        self.runtime.apply_extracts(extract)?;
+        self.sync_workflow_vars_root();
+        Ok(())
     }
 
     fn insert_data_path(&mut self, relative_path: &str, value: Value) -> Result<()> {
@@ -2787,9 +3095,26 @@ impl<'a> ExecutionContext<'a> {
             .context("data tree is not available")?;
         insert_nested(data, &segments, value)
     }
+
+    fn sync_workflow_vars_root(&mut self) {
+        if !self.sync_workflow_vars {
+            return;
+        }
+        let Some(vars) = self.runtime.root().get("vars").cloned() else {
+            return;
+        };
+        if let Some(workflow) = self
+            .runtime
+            .root_mut()
+            .get_mut("workflow")
+            .and_then(Value::as_object_mut)
+        {
+            workflow.insert("vars".to_string(), vars);
+        }
+    }
 }
 
-impl Deref for ExecutionContext<'_> {
+impl Deref for ExecutionContext {
     type Target = RuntimeContext;
 
     fn deref(&self) -> &Self::Target {
@@ -2797,7 +3122,7 @@ impl Deref for ExecutionContext<'_> {
     }
 }
 
-impl DerefMut for ExecutionContext<'_> {
+impl DerefMut for ExecutionContext {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.runtime
     }
@@ -2925,8 +3250,24 @@ fn write_report(root: &Path, report: &RunReport) -> Result<PathBuf> {
 
 fn build_workflow_runtime(
     project: &LoadedProject,
+    workflow_id: &str,
+    workflow_name: &str,
     state: &WorkflowState,
 ) -> Result<RuntimeContext> {
+    RuntimeContext::new(build_workflow_root(
+        project,
+        workflow_id,
+        workflow_name,
+        state,
+    )?)
+}
+
+fn build_workflow_root(
+    project: &LoadedProject,
+    workflow_id: &str,
+    workflow_name: &str,
+    state: &WorkflowState,
+) -> Result<serde_json::Map<String, Value>> {
     let mut steps_map = serde_json::Map::new();
     for (id, step_state) in &state.steps {
         steps_map.insert(
@@ -2956,11 +3297,13 @@ fn build_workflow_runtime(
     root.insert(
         "workflow".to_string(),
         json!({
+            "id": workflow_id,
+            "name": workflow_name,
             "vars": state.vars.clone(),
             "steps": steps_map,
         }),
     );
-    RuntimeContext::new(root)
+    Ok(root)
 }
 
 fn print_workflow_dry_run(workflow: &LoadedWorkflow, env_name: &str) {

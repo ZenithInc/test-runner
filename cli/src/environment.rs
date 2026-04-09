@@ -128,6 +128,35 @@ pub struct EnvironmentSlot {
     pub port_mappings: HashMap<String, HashMap<u16, u16>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct EnvironmentExecTarget {
+    runtime: EnvironmentExecRuntime,
+}
+
+#[derive(Debug, Clone)]
+enum EnvironmentExecRuntime {
+    DockerCompose(ResolvedDockerComposeRuntime),
+    Containers {
+        slot_id: usize,
+        container_ids: Vec<(String, String)>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct EnvironmentExecRequest {
+    pub service: String,
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnvironmentExecOutput {
+    pub service: String,
+    pub command: Vec<String>,
+    pub exit_code: i64,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 pub struct EnvironmentSession {
     project: LoadedProject,
     runner_root: PathBuf,
@@ -563,6 +592,31 @@ impl EnvironmentSession {
         inject_port_mappings(&slot.port_mappings, &mut project.environment);
         apply_slot_endpoint_overrides(&mut project, runtime, slot);
         Ok(project)
+    }
+
+    pub fn exec_target_for_slot(&self, slot_id: usize) -> Result<Option<EnvironmentExecTarget>> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(None);
+        };
+
+        match runtime {
+            ResolvedRuntime::DockerCompose(runtime) => Ok(Some(EnvironmentExecTarget {
+                runtime: EnvironmentExecRuntime::DockerCompose(runtime.clone()),
+            })),
+            ResolvedRuntime::Containers(runtime) => {
+                let slot = runtime
+                    .slots
+                    .iter()
+                    .find(|slot| slot.slot_id == slot_id)
+                    .with_context(|| format!("slot `{slot_id}` is not available"))?;
+                Ok(Some(EnvironmentExecTarget {
+                    runtime: EnvironmentExecRuntime::Containers {
+                        slot_id: slot.slot_id,
+                        container_ids: slot.container_ids.clone(),
+                    },
+                }))
+            }
+        }
     }
 
     fn slot_report_id(&self, slot_id: usize) -> Option<usize> {
@@ -2900,16 +2954,20 @@ fn non_empty(value: String) -> Option<String> {
 }
 
 fn slot_container_id(slot: &ResolvedContainerSlot, service: &str) -> Result<String> {
-    slot.container_ids
+    container_id_for_service(&slot.container_ids, service).with_context(|| {
+        format!(
+            "no container found for service `{service}` in slot `{}`",
+            slot.slot_id
+        )
+    })
+}
+
+fn container_id_for_service(container_ids: &[(String, String)], service: &str) -> Result<String> {
+    container_ids
         .iter()
         .find(|(name, _)| name == service)
         .map(|(_, id)| id.clone())
-        .with_context(|| {
-            format!(
-                "no container found for service `{service}` in slot `{}`",
-                slot.slot_id
-            )
-        })
+        .with_context(|| format!("no container found for service `{service}`"))
 }
 
 fn stream_label(stream: ComposeLogStream) -> &'static str {
@@ -3013,6 +3071,97 @@ async fn docker_exec_stream(
         StartExecResults::Attached { output, .. } => Ok(output),
         StartExecResults::Detached => Err("exec session detached unexpectedly".to_string()),
     }
+}
+
+pub async fn execute_environment_command(
+    target: &EnvironmentExecTarget,
+    request: &EnvironmentExecRequest,
+) -> Result<EnvironmentExecOutput> {
+    let docker = connect_docker()?;
+    let container_id = match &target.runtime {
+        EnvironmentExecRuntime::DockerCompose(runtime) => {
+            compose_container_id(runtime, &request.service).await?
+        }
+        EnvironmentExecRuntime::Containers {
+            slot_id,
+            container_ids,
+        } => container_id_for_service(container_ids, &request.service).with_context(|| {
+            format!(
+                "failed to resolve runtime service `{}` for slot `{slot_id}`",
+                request.service
+            )
+        })?,
+    };
+
+    let output = docker_exec_capture(&docker, &container_id, request.command.clone()).await?;
+    Ok(EnvironmentExecOutput {
+        service: request.service.clone(),
+        command: request.command.clone(),
+        exit_code: output.exit_code,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+struct DockerExecCapture {
+    exit_code: i64,
+    stdout: String,
+    stderr: String,
+}
+
+async fn docker_exec_capture(
+    docker: &Docker,
+    container_id: &str,
+    command: Vec<String>,
+) -> Result<DockerExecCapture> {
+    let exec = docker
+        .create_exec(
+            container_id,
+            CreateExecOptions {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                cmd: Some(command),
+                ..Default::default()
+            },
+        )
+        .await
+        .with_context(|| format!("failed to create exec session in container `{container_id}`"))?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    match docker
+        .start_exec(&exec.id, None)
+        .await
+        .with_context(|| format!("failed to start exec session `{}`", exec.id))?
+    {
+        StartExecResults::Attached { mut output, .. } => {
+            while let Some(chunk) = output.next().await {
+                match chunk.with_context(|| {
+                    format!("failed to read exec output from container `{container_id}`")
+                })? {
+                    LogOutput::StdOut { message } | LogOutput::Console { message } => {
+                        stdout.extend_from_slice(&message);
+                    }
+                    LogOutput::StdErr { message } => stderr.extend_from_slice(&message),
+                    LogOutput::StdIn { .. } => {}
+                }
+            }
+        }
+        StartExecResults::Detached => {
+            bail!("exec session detached unexpectedly");
+        }
+    }
+
+    let exec_info = docker
+        .inspect_exec(&exec.id)
+        .await
+        .with_context(|| format!("failed to inspect exec session `{}`", exec.id))?;
+
+    Ok(DockerExecCapture {
+        exit_code: exec_info.exit_code.unwrap_or_default(),
+        stdout: String::from_utf8_lossy(&stdout).to_string(),
+        stderr: String::from_utf8_lossy(&stderr).to_string(),
+    })
 }
 
 async fn start_live_log_task(

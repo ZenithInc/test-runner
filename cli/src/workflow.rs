@@ -5,6 +5,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use serde_yaml::{Mapping, Value as YamlValue};
 
+use crate::dsl::Step;
+
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowFile {
@@ -14,7 +16,11 @@ pub struct WorkflowFile {
     #[serde(default)]
     pub vars: IndexMap<String, Value>,
     #[serde(default)]
+    pub setup: Vec<Step>,
+    #[serde(default)]
     pub steps: Vec<WorkflowStep>,
+    #[serde(default)]
+    pub teardown: Vec<Step>,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +204,9 @@ mod tests {
 name: auth flow
 vars:
   phone: "13800000000"
+setup:
+  - sleep:
+      ms: 1
 steps:
   - run_case:
       id: send-sms
@@ -216,12 +225,17 @@ steps:
       - run_case:
           id: fallback
           case: system/health/smoke
+teardown:
+  - sleep:
+      ms: 1
 "#,
         )
         .expect("workflow should deserialize");
 
         validate_workflow_definition(&workflow).expect("workflow should validate");
+        assert_eq!(workflow.setup.len(), 1);
         assert_eq!(workflow.steps.len(), 2);
+        assert_eq!(workflow.teardown.len(), 1);
         match &workflow.steps[0] {
             WorkflowStep::RunCase(step) => {
                 assert_eq!(step.id, "send-sms");

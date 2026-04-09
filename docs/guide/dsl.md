@@ -53,7 +53,7 @@ teardown: []
 | `vars` | 运行中的变量 |
 | `data` | `.testrunner/data/` 自动加载的数据树 |
 | `response` | 最近一次 `request` 的结果 |
-| `result` | 最近一次 `sql`、`redis`、`query_db`、`query_redis`、`request`、`callback` 或 `sleep` 的结果 |
+| `result` | 最近一次 `sql`、`redis`、`exec`、`query_db`、`query_redis`、`request`、`callback` 或 `sleep` 的结果 |
 
 常见路径示例：
 
@@ -72,7 +72,7 @@ teardown: []
 - case 顶层 `vars` 会在 `setup` 之前解析并写入 `vars.*`。
 - `set` 和 `extract` 会覆盖同名 `vars.*`。
 - `response` 只代表**最近一次** `request` 的结果；新的 `request` 会覆盖旧值。
-- `result` 只代表**最近一次** `sql`、`redis`、`query_db`、`query_redis`、`request`、`callback` 或 `sleep` 的结果；新的相关 step 也会覆盖旧值。
+- `result` 只代表**最近一次** `sql`、`redis`、`exec`、`query_db`、`query_redis`、`request`、`callback` 或 `sleep` 的结果；新的相关 step 也会覆盖旧值。
 - `foreach` 会把 `as` 绑定名临时写进 `vars.*`，循环结束后恢复原值。
 
 ## 值解析规则
@@ -167,7 +167,7 @@ assert:
 
 ## Step 类型
 
-> `extract` 和 `assert` 不是独立 step，只能挂在 `request`、`query_db`、`query_redis` 下。
+> `extract` 和 `assert` 不是独立 step，只能挂在 `exec`、`request`、`query_db`、`query_redis` 下。
 
 ### `use_data`
 
@@ -328,6 +328,48 @@ result:
 result:
   ms: 200
 ```
+
+### `exec`
+
+在环境 runtime 管理的容器内执行一条命令，常用于 workflow / case 的前置数据准备或收尾清理：
+
+```yaml
+- exec:
+    service: app
+    shell: "php artisan orders:seed --user='{{ user_id }}'"
+```
+
+也支持 argv 形式：
+
+```yaml
+- exec:
+    service: app
+    command: ["php", "artisan", "orders:seed", "--user={{ user_id }}"]
+```
+
+说明：
+
+- `service` 必填，指向环境 runtime 里的服务名
+- `shell` 和 `command` 二选一
+- `shell` 会以 `sh -lc "<rendered shell>"` 的形式在容器内执行
+- `command` 的每个参数都会按普通 DSL 值解析规则单独渲染
+- 默认情况下，退出码非 `0` 会直接让 step 失败
+
+成功执行后，`result` / step `details` 会包含：
+
+```yaml
+result:
+  service: app
+  command:
+    - sh
+    - -lc
+    - php artisan orders:seed --user='u-001'
+  exit_code: 0
+  stdout: "seeded 1 order\n"
+  stderr: ""
+```
+
+如果当前环境没有声明 `runtime`，`exec` 不会静默跳过，而是会被明确标记为 `skipped`，并在报告中带上原因。
 
 ### `query_db`
 

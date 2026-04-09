@@ -30,6 +30,7 @@ pub enum Step {
     Set { values: IndexMap<String, Value> },
     Sql(SqlExecStep),
     Redis(RedisCommandStep),
+    Exec(ExecStep),
     Request(RequestStep),
     Callback(CallbackStep),
     Sleep(SleepStep),
@@ -56,6 +57,23 @@ pub struct RedisCommandStep {
     pub command: String,
     #[serde(default)]
     pub args: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExecSpec {
+    pub service: String,
+    #[serde(default)]
+    pub shell: Option<String>,
+    #[serde(default)]
+    pub command: Vec<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecStep {
+    pub exec: ExecSpec,
+    pub extract: IndexMap<String, String>,
+    pub assertions: Vec<Assertion>,
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
@@ -167,6 +185,7 @@ const STEP_PRIMARY_KEYS: &[&str] = &[
     "set",
     "sql",
     "redis",
+    "exec",
     "request",
     "callback",
     "sleep",
@@ -247,6 +266,17 @@ fn parse_step(value: YamlValue) -> Result<Step> {
         validate_allowed_step_keys(mapping, &["redis"], "redis")?;
         let step: RedisCommandStep = serde_yaml::from_value(raw.clone())?;
         return Ok(Step::Redis(step));
+    }
+
+    if let Some(raw) = get_value(mapping, "exec") {
+        validate_allowed_step_keys(mapping, &["exec", "extract", "assert"], "exec")?;
+        let exec: ExecSpec = serde_yaml::from_value(raw.clone())?;
+        validate_exec_spec(&exec)?;
+        return Ok(Step::Exec(ExecStep {
+            exec,
+            extract: extract_map(mapping)?,
+            assertions: assertions(mapping)?,
+        }));
     }
 
     if let Some(raw) = get_value(mapping, "request") {
@@ -331,7 +361,7 @@ fn parse_step(value: YamlValue) -> Result<Step> {
         format!("found keys [{}]", keys.join(", "))
     };
     bail!(
-        "unsupported step shape ({key_summary}); expected exactly one of [{}]. `request`, `query_db`, and `query_redis` may also include `extract` / `assert`; `if` uses `then` / `else`; `foreach` uses `as` / `steps`",
+        "unsupported step shape ({key_summary}); expected exactly one of [{}]. `exec`, `request`, `query_db`, and `query_redis` may also include `extract` / `assert`; `if` uses `then` / `else`; `foreach` uses `as` / `steps`",
         STEP_PRIMARY_KEYS.join(", ")
     )
 }
@@ -487,6 +517,21 @@ fn validate_sqlish(sql: Option<&String>, file: Option<&String>, step_name: &str)
     }
 }
 
+fn validate_exec_spec(step: &ExecSpec) -> Result<()> {
+    if step.service.trim().is_empty() {
+        bail!("exec.service cannot be empty");
+    }
+
+    let has_shell = step.shell.as_deref().is_some_and(|shell| !shell.trim().is_empty());
+    let has_command = !step.command.is_empty();
+
+    match (has_shell, has_command) {
+        (true, true) => bail!("exec must define exactly one of `shell` or `command`, not both"),
+        (false, false) => bail!("exec requires exactly one of `shell` or `command`"),
+        _ => Ok(()),
+    }
+}
+
 fn validate_callback_request(step: &CallbackStep) -> Result<()> {
     match step.request.api.as_deref().map(str::trim) {
         Some("") => bail!("callback.request.api cannot be empty"),
@@ -501,6 +546,7 @@ pub(crate) fn step_kind_name(step: &Step) -> &'static str {
         Step::Set { .. } => "set",
         Step::Sql(_) => "sql",
         Step::Redis(_) => "redis",
+        Step::Exec(_) => "exec",
         Step::Request(_) => "request",
         Step::Callback(_) => "callback",
         Step::Sleep(_) => "sleep",
@@ -550,6 +596,36 @@ steps:
     }
 
     #[test]
+    fn parser_supports_exec_steps_with_extracts() {
+        let case: CaseFile = serde_yaml::from_str(
+            r#"
+name: exec case
+api: system/health
+setup:
+  - exec:
+      service: app
+      shell: "php artisan seed:demo"
+    extract:
+      output: result.stdout
+    assert:
+      - contains: ["result.command[2]", "seed:demo"]
+"#,
+        )
+        .expect("case should deserialize");
+
+        assert_eq!(case.setup.len(), 1);
+        match &case.setup[0] {
+            Step::Exec(step) => {
+                assert_eq!(step.exec.service, "app");
+                assert_eq!(step.exec.shell.as_deref(), Some("php artisan seed:demo"));
+                assert_eq!(step.extract.get("output").map(String::as_str), Some("result.stdout"));
+                assert_eq!(step.assertions.len(), 1);
+            }
+            other => panic!("expected exec step, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parser_reports_supported_step_keys_for_unknown_shapes() {
         let error = serde_yaml::from_str::<CaseFile>(
             r#"
@@ -565,7 +641,31 @@ steps:
         assert!(
             error
                 .to_string()
-                .contains("expected exactly one of [use_data, set, sql, redis, request, callback, sleep, query_db, query_redis, if, foreach]")
+                .contains("expected exactly one of [use_data, set, sql, redis, exec, request, callback, sleep, query_db, query_redis, if, foreach]")
+        );
+    }
+
+    #[test]
+    fn parser_rejects_exec_with_shell_and_command() {
+        let error = serde_yaml::from_str::<CaseFile>(
+            r#"
+name: invalid exec
+api: system/health
+steps:
+  - exec:
+      service: app
+      shell: "echo hi"
+      command:
+        - echo
+        - hi
+"#,
+        )
+        .expect_err("invalid exec must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("exec must define exactly one of `shell` or `command`, not both")
         );
     }
 
